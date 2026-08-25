@@ -1,9 +1,12 @@
+mod detect;
 mod manifest;
+mod packages;
 mod plan;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use manifest::Manifest;
+use packages::Packages;
 use plan::{Plan, State};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +39,8 @@ enum Command {
     },
     /// 適用したときに何が変わるかを表示する
     Diff,
+    /// 設定が参照している依存が packages.toml に宣言されているか検証する
+    Check,
     /// 配置状況を一覧する
     List {
         /// 差分のあるものだけ表示する
@@ -71,6 +76,7 @@ fn run() -> Result<()> {
             print_diff(&plan);
             Ok(())
         }
+        Command::Check => check(&root),
         Command::List { changed } => {
             print_list(&plan, changed);
             Ok(())
@@ -89,6 +95,57 @@ fn find_root() -> Result<PathBuf> {
             bail!("sennit.toml not found in any parent directory");
         }
     }
+}
+
+/// 設定ファイルが参照している外部依存が packages.toml に宣言されているかを検証する。
+///
+/// 設定だけ更新してパッケージ側が追随しない、というドリフトを CI で落とすための
+/// コマンド。フォントやエディタ拡張も対象にする。実際に踏んだドリフトのうち
+/// 半分近くが brew formula 以外だったため。
+fn check(root: &Path) -> Result<()> {
+    let packages = Packages::load(&root.join("packages.toml"))?;
+    let provided = packages.provided();
+    let required = detect::scan(root)?;
+
+    let mut missing: Vec<&detect::Requirement> = Vec::new();
+    let mut optional: Vec<&detect::Requirement> = Vec::new();
+    for req in &required {
+        match provided.get(&(req.kind, req.name.clone())) {
+            None => missing.push(req),
+            Some(true) => optional.push(req),
+            Some(false) => {}
+        }
+    }
+
+    println!(
+        "checked {} requirement(s) against {} declared name(s)",
+        required.len(),
+        provided.len()
+    );
+
+    for o in &optional {
+        println!(
+            "\x1b[33moptional\x1b[0m    {:<9} {}  (declared, not installed by setup)",
+            o.kind.label(),
+            o.name
+        );
+    }
+
+    if missing.is_empty() {
+        println!("\x1b[32mok\x1b[0m  no undeclared dependencies");
+        return Ok(());
+    }
+
+    println!();
+    for m in &missing {
+        println!(
+            "\x1b[31mundeclared\x1b[0m  {:<9} {}\n            required by {}",
+            m.kind.label(),
+            m.name,
+            m.source
+        );
+    }
+    bail!("{} undeclared dependency(ies)", missing.len());
 }
 
 fn apply(plan: &Plan, dry_run: bool) -> Result<()> {
