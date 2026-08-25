@@ -26,6 +26,7 @@ everything the same way. The live-edit loop survives for the other 90% of your c
 | Command | |
 |---|---|
 | `sennit apply` | Place symlinks. Only touches entries that need changing. |
+| `sennit sync` | Install declared packages that are missing. |
 | `sennit diff` | Show what an apply would change, before it happens. |
 | `sennit render` | Expand templates from a single source of truth. `--check` fails if the committed output is stale. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
@@ -88,9 +89,12 @@ cargo install --git https://github.com/ken109/sennit
 
 ## Status
 
-v0.1. Used daily to manage [ken109/dotfiles](https://github.com/ken109/dotfiles).
-Package installation (`sync`) is not implemented yet — `packages.toml` currently declares,
-and `check` verifies, but the installing is still done by shell.
+v0.2. Used daily to manage [ken109/dotfiles](https://github.com/ken109/dotfiles).
+
+`sync` supports Homebrew (formulae and casks) and mise. It asks each manager what is
+already installed and only installs the difference, so idempotency does not depend on the
+manager's own behaviour. Editor extensions are declared for `check` but installed by the
+editor itself.
 
 ## License
 

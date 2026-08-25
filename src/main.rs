@@ -3,6 +3,7 @@ mod manifest;
 mod packages;
 mod plan;
 mod render;
+mod sync;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -42,6 +43,12 @@ enum Command {
     Diff,
     /// 設定が参照している依存が packages.toml に宣言されているか検証する
     Check,
+    /// packages.toml の宣言をもとに未導入のパッケージを入れる
+    Sync {
+        /// 実際には入れず、何を入れるかだけ表示する
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// theme.toml からテンプレートを展開して設定ファイルを生成する
     Render {
         /// 生成せず、コミット済みの内容と一致するかだけ検証する
@@ -85,6 +92,7 @@ fn run() -> Result<()> {
         }
         Command::Check => check(&root),
         Command::Render { check } => render_all(&root, &manifest, check),
+        Command::Sync { dry_run } => sync::sync(&root, dry_run),
         Command::List { changed } => {
             print_list(&plan, changed);
             Ok(())
