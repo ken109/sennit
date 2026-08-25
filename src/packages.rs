@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn optional_packages_are_declared_but_not_installable() {
         let p = parse("[packages]\nkubectl = { optional = true }\n");
-        assert_eq!(p.provided()[&(Kind::Command, "kubectl".into())], true);
+        assert!(p.provided()[&(Kind::Command, "kubectl".into())]);
         assert!(p.installable().is_empty());
     }
 
