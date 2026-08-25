@@ -56,3 +56,42 @@ impl Manifest {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(ignore: &[&str]) -> Manifest {
+        Manifest {
+            link: Link {
+                common: vec![],
+                darwin: vec![],
+                linux: vec![],
+                ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            },
+            render: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ignores_by_extension_glob() {
+        let m = manifest(&["*.tmpl"]);
+        assert!(m.is_ignored(Path::new(".config/starship.toml.tmpl")));
+        assert!(!m.is_ignored(Path::new(".config/starship.toml")));
+    }
+
+    #[test]
+    fn ignores_by_path_prefix() {
+        let m = manifest(&[".config/secret"]);
+        assert!(m.is_ignored(Path::new(".config/secret/token")));
+        // 前方一致はディレクトリ自身にも効く
+        assert!(m.is_ignored(Path::new(".config/secret")));
+        assert!(!m.is_ignored(Path::new(".config/public/token")));
+    }
+
+    #[test]
+    fn empty_ignore_matches_nothing() {
+        let m = manifest(&[]);
+        assert!(!m.is_ignored(Path::new(".config/anything")));
+    }
+}

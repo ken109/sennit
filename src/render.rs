@@ -60,3 +60,62 @@ pub fn expand(template: &str, vars: &BTreeMap<String, String>, source: &str) -> 
     out.push_str(rest);
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars() -> BTreeMap<String, String> {
+        let mut v = BTreeMap::new();
+        v.insert("ui.bg".into(), "#1a1b26".into());
+        v.insert("normal.red".into(), "#f7768e".into());
+        v
+    }
+
+    #[test]
+    fn expands_known_variables() {
+        let out = expand("bg = \"{{ ui.bg }}\"", &vars(), "t").unwrap();
+        assert_eq!(out, "bg = \"#1a1b26\"");
+    }
+
+    #[test]
+    fn expands_multiple_occurrences() {
+        let out = expand("{{ ui.bg }}/{{ normal.red }}/{{ ui.bg }}", &vars(), "t").unwrap();
+        assert_eq!(out, "#1a1b26/#f7768e/#1a1b26");
+    }
+
+    #[test]
+    fn leaves_text_without_placeholders_untouched() {
+        let src = "no placeholders here";
+        assert_eq!(expand(src, &vars(), "t").unwrap(), src);
+    }
+
+    #[test]
+    fn tolerates_whitespace_in_placeholder() {
+        assert_eq!(expand("{{ui.bg}}", &vars(), "t").unwrap(), "#1a1b26");
+        assert_eq!(expand("{{   ui.bg   }}", &vars(), "t").unwrap(), "#1a1b26");
+    }
+
+    /// 未知の変数は黙って空文字にせず落とす。設定が壊れたまま配置されるのを防ぐ。
+    #[test]
+    fn unknown_variable_is_an_error() {
+        let err = expand("{{ nope }}", &vars(), "t.tmpl").unwrap_err();
+        assert!(err.to_string().contains("unknown template variable"));
+        assert!(err.to_string().contains("t.tmpl"));
+    }
+
+    #[test]
+    fn unterminated_placeholder_is_an_error() {
+        assert!(expand("{{ ui.bg", &vars(), "t").is_err());
+    }
+
+    #[test]
+    fn flattens_nested_tables() {
+        let toml_src = "[ui]\nbg = \"#111\"\n\n[normal]\nred = \"#f00\"\n";
+        let value: toml::Value = toml::from_str(toml_src).unwrap();
+        let mut out = BTreeMap::new();
+        flatten(&value, String::new(), &mut out);
+        assert_eq!(out.get("ui.bg").unwrap(), "#111");
+        assert_eq!(out.get("normal.red").unwrap(), "#f00");
+    }
+}
