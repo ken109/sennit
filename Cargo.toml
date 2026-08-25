@@ -1,0 +1,19 @@
+[package]
+name = "sennit"
+version = "0.1.0"
+edition = "2021"
+description = "Dotfiles manager that keeps symlink semantics and adds diffing"
+repository = "https://github.com/ken109/dotfiles"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+walkdir = "2"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
