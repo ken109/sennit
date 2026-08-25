@@ -2,6 +2,7 @@ mod detect;
 mod manifest;
 mod packages;
 mod plan;
+mod render;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -41,6 +42,12 @@ enum Command {
     Diff,
     /// 設定が参照している依存が packages.toml に宣言されているか検証する
     Check,
+    /// theme.toml からテンプレートを展開して設定ファイルを生成する
+    Render {
+        /// 生成せず、コミット済みの内容と一致するかだけ検証する
+        #[arg(long)]
+        check: bool,
+    },
     /// 配置状況を一覧する
     List {
         /// 差分のあるものだけ表示する
@@ -77,6 +84,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Check => check(&root),
+        Command::Render { check } => render_all(&root, &manifest, check),
         Command::List { changed } => {
             print_list(&plan, changed);
             Ok(())
@@ -146,6 +154,45 @@ fn check(root: &Path) -> Result<()> {
         );
     }
     bail!("{} undeclared dependency(ies)", missing.len());
+}
+
+/// theme.toml を単一ソースとして、配色を持つ設定ファイルを生成する。
+///
+/// 生成物はリポジトリにコミットする。git で差分が見え、sennit check が
+/// 生成後のファイルを読め、新規 clone でも設定が揃っているため。
+/// 代わりに「テンプレートを直したが生成し忘れる」ことが起きうるので、
+/// --check を CI に置いて食い違いを落とす。
+fn render_all(root: &Path, manifest: &Manifest, check_only: bool) -> Result<()> {
+    let vars = render::load_vars(&root.join("theme.toml"))?;
+    let mut stale = Vec::new();
+
+    for (out_rel, tmpl_rel) in &manifest.render {
+        let tmpl_path = root.join(tmpl_rel);
+        let out_path = root.join(out_rel);
+        let template = std::fs::read_to_string(&tmpl_path)
+            .with_context(|| format!("failed to read template {}", tmpl_path.display()))?;
+        let rendered = render::expand(&template, &vars, tmpl_rel)?;
+
+        let current = std::fs::read_to_string(&out_path).unwrap_or_default();
+        if current == rendered {
+            println!("  \x1b[32munchanged\x1b[0m  {out_rel}");
+            continue;
+        }
+
+        if check_only {
+            println!("  \x1b[31mstale\x1b[0m      {out_rel}");
+            stale.push(out_rel.clone());
+        } else {
+            std::fs::write(&out_path, &rendered)
+                .with_context(|| format!("failed to write {}", out_path.display()))?;
+            println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
+        }
+    }
+
+    if !stale.is_empty() {
+        bail!("{} file(s) out of date; run `sennit render`", stale.len());
+    }
+    Ok(())
 }
 
 fn apply(plan: &Plan, dry_run: bool) -> Result<()> {

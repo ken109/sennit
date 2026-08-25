@@ -6,6 +6,9 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub link: Link,
+    /// 出力パス -> テンプレートパス
+    #[serde(default)]
+    pub render: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,11 +43,16 @@ impl Manifest {
         out
     }
 
+    /// ignore のパターンは 2 種類だけ扱う。
+    /// - `*.ext` : 拡張子一致
+    /// - それ以外: パスの前方一致(同一パスも含む)
     pub fn is_ignored(&self, rel: &Path) -> bool {
-        self.link
-            .ignore
-            .iter()
-            // starts_with は同一パスでも真になるので、これだけで完全一致も覆う
-            .any(|pat| rel.starts_with(pat))
+        self.link.ignore.iter().any(|pat| {
+            if let Some(ext) = pat.strip_prefix("*.") {
+                rel.extension().is_some_and(|e| e == ext)
+            } else {
+                rel.starts_with(pat)
+            }
+        })
     }
 }

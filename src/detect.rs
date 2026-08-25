@@ -171,6 +171,10 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     };
     for entry in dir.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
+        // テンプレートは生成元。生成物の側で既に検出されるので見ない
+        if name.ends_with(".tmpl") {
+            continue;
+        }
         // starship.toml のような単一ファイル形式も拾う
         let name = name.strip_suffix(".toml").unwrap_or(&name).to_string();
         if name.starts_with('.') {
