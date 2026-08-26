@@ -101,7 +101,10 @@ fn mode_of(p: &Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
-/// --dry-run は symlink も生成物も書かない。プロバイダも復号も呼ばない。
+/// --dry-run は symlink も生成物も書かない。
+///
+/// プロバイダと復号コマンドを呼ばないことは
+/// dry_run_calls_neither_a_provider_nor_a_decryption_command で見る。
 #[test]
 fn dry_run_writes_nothing() {
     let r = Repo::new("dry-run");
@@ -1014,5 +1017,68 @@ fn rollback_does_not_claim_to_restore_a_backup_that_is_gone() {
     assert!(
         out.contains("already gone") || out.contains("nothing to put back"),
         "{out}"
+    );
+}
+
+/// ignore の前方一致は要素単位。名前の頭が同じだけの別のディレクトリを
+/// 巻き込むと、そこは配置されず、次の apply が「宣言から外れた」と読んで
+/// $HOME から消す。
+#[test]
+fn ignore_does_not_swallow_a_sibling_with_a_shared_name_prefix() {
+    let r = Repo::new("ignore-sibling");
+    r.manifest("[link]\ncommon = [\"conf\"]\nignore = [\"conf/nvim\"]\n");
+    r.write("conf/nvim/init.lua", "-- ignored\n");
+    r.write("conf/nvim-extra/x.lua", "-- kept\n");
+
+    ok(&r.run(&["apply"]));
+    assert!(
+        std::fs::symlink_metadata(r.home_path("conf/nvim-extra/x.lua")).is_ok(),
+        "a sibling sharing the prefix was ignored"
+    );
+    assert!(std::fs::symlink_metadata(r.home_path("conf/nvim/init.lua")).is_err());
+
+    // 2 回目で消されない
+    ok(&r.run(&["apply"]));
+    assert!(std::fs::symlink_metadata(r.home_path("conf/nvim-extra/x.lua")).is_ok());
+}
+
+/// --dry-run はプロバイダも復号コマンドも呼ばない。
+///
+/// どちらも人にロック解除を求めたり、任意のコマンドを走らせたりする。
+/// 「何も起きない」と言ったコマンドがそれを出すのは筋が通らない。
+#[test]
+fn dry_run_calls_neither_a_provider_nor_a_decryption_command() {
+    let r = Repo::new("dry-run-no-exec");
+    // 呼ばれたら痕跡が残るコマンドにする
+    let marker = r.home.parent().unwrap().join("called");
+    r.manifest(&format!(
+        r#"
+[link]
+common = ["gen.conf", "secret"]
+ignore = ["*.tmpl", "*.age"]
+
+[render]
+"gen.conf" = "gen.conf.tmpl"
+
+[encrypted]
+"secret" = "secret.age"
+
+[encryption]
+command = "sh -c 'echo decrypt >> {m}; cat' {{}}"
+
+[providers.fake]
+command = "sh -c 'echo provider >> {m}; echo v'"
+"#,
+        m = marker.display()
+    ));
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("gen.conf.tmpl", "t = {{ fake://a }}\n");
+    r.write("secret.age", "PLAIN\n");
+
+    ok(&r.run(&["apply", "--dry-run", "--secrets"]));
+    assert!(
+        !marker.exists(),
+        "--dry-run ran: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
     );
 }

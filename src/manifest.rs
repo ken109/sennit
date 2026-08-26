@@ -266,6 +266,26 @@ mod tests {
         assert!(!m.is_ignored(Path::new(".config/starship.toml")));
     }
 
+    /// 前方一致は要素単位。文字列としての前方一致にすると、名前の頭が
+    /// 同じだけの別のディレクトリまで巻き込む。
+    #[test]
+    fn a_prefix_matches_whole_components_not_characters() {
+        let m = manifest(&["conf/nvim"]);
+        assert!(m.is_ignored(Path::new("conf/nvim/init.lua")));
+        assert!(m.is_ignored(Path::new("conf/nvim")));
+        // 名前の頭が同じだけの別物は対象外
+        assert!(!m.is_ignored(Path::new("conf/nvim-extra/x.lua")));
+        assert!(!m.is_ignored(Path::new("conf/nvimrc")));
+    }
+
+    /// 根からの前方一致。途中の階層に同名があっても当たらない。
+    #[test]
+    fn a_prefix_is_rooted_at_the_repository() {
+        let m = manifest(&["README.md"]);
+        assert!(m.is_ignored(Path::new("README.md")));
+        assert!(!m.is_ignored(Path::new("conf/README.md")));
+    }
+
     #[test]
     fn ignores_by_path_prefix() {
         let m = manifest(&[".config/secret"]);
