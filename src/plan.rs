@@ -78,7 +78,10 @@ impl Plan {
         manifest: &Manifest,
         rel: &Path,
     ) -> Result<()> {
-        if manifest.is_ignored(rel) {
+        // テンプレートは生成の入力であって配置対象ではない。ignore の宣言に
+        // 頼ると書き忘れたときに、未展開の {{ }} を含むファイルがそのまま
+        // $HOME に置かれる。[render] の入力は自明に対象外なので自動で外す。
+        if manifest.is_template(rel) || manifest.is_ciphertext(rel) || manifest.is_ignored(rel) {
             return Ok(());
         }
         let src = root.join(rel);

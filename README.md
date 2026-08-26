@@ -55,8 +55,11 @@ In the root of your dotfiles repository:
 common = [".config", ".zshenv"]
 darwin = [".hammerspoon"]
 linux  = [".local"]
-ignore = ["*.tmpl"]
 ```
+
+Nothing is inferred from a file's name. `[link]` says what to place, `[render]` says what to
+generate, and a path declared as the input to a render or a decryption is never placed —
+so forgetting `ignore = ["*.tmpl"]` cannot put an unexpanded template in `$HOME`.
 
 ```sh
 sennit diff    # see what would change

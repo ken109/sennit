@@ -64,6 +64,16 @@ impl Manifest {
         out
     }
 
+    /// [render] の入力として宣言されているか。
+    pub fn is_template(&self, rel: &Path) -> bool {
+        self.render.values().any(|t| Path::new(t) == rel)
+    }
+
+    /// [encrypted] の入力として宣言されているか。暗号文も配置しない。
+    pub fn is_ciphertext(&self, rel: &Path) -> bool {
+        self.encrypted.values().any(|t| Path::new(t) == rel)
+    }
+
     /// このパスに宣言されたモード。前方一致で最も長いものを採る。
     pub fn mode_for(&self, rel: &Path) -> Option<u32> {
         self.modes
@@ -131,6 +141,25 @@ mod tests {
             m.modes.insert(k.to_string(), v.to_string());
         }
         m
+    }
+
+    /// [render] の入力は、ignore を書かなくても配置対象から外れる。
+    /// 書き忘れると未展開の {{ }} を含むファイルが $HOME に置かれるため。
+    #[test]
+    fn declared_templates_are_never_placed() {
+        let mut m = manifest(&[]);
+        m.render.insert("a.conf".into(), "a.conf.tmpl".into());
+        assert!(m.is_template(Path::new("a.conf.tmpl")));
+        assert!(!m.is_template(Path::new("a.conf")));
+    }
+
+    /// 暗号文も同様。平文だけが配置される。
+    #[test]
+    fn declared_ciphertexts_are_never_placed() {
+        let mut m = manifest(&[]);
+        m.encrypted.insert("c.conf".into(), "c.conf.age".into());
+        assert!(m.is_ciphertext(Path::new("c.conf.age")));
+        assert!(!m.is_ciphertext(Path::new("c.conf")));
     }
 
     #[test]
