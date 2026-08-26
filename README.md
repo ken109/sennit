@@ -77,16 +77,24 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 
 | | |
 |---|---|
-| `sennit apply` | Render templates, then place symlinks. Only touches what needs changing. `--dry-run` to preview. |
-| `sennit rollback` | Put back files that the last apply moved aside. |
+| `sennit apply` | Render templates, then place symlinks. Only touches what needs changing. `--dry-run`, `--secrets`, `--no-backup`. |
+| `sennit rollback` | Put back files that an apply moved aside. `--dry-run`. |
 | `sennit diff` | Show what an apply would change, before it happens. |
-| `sennit list` | Show the current state of every managed path. |
-| `sennit render` | Expand templates and decrypt encrypted files. |
+| `sennit list` | Show the current state of every managed path. `--changed`. |
+| `sennit render` | Expand templates and decrypt encrypted files. `--secrets`. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
-| `sennit verify` | Verify that everything declared actually resolves on this machine. |
-| `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. |
-| `sennit sync` | Install declared packages that are missing. |
+| `sennit verify` | Verify that everything declared actually resolves on this machine. `--export`. |
+| `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. `--history`. |
+| `sennit sync` | Install declared packages that are missing. `--dry-run`. |
 | `sennit compare` | Diff two `verify --export` reports, to see how two machines differ. |
+
+`--root` and `--home` override where the repository is and where files are placed; both
+default to searching upwards for `sennit.toml` and to `$HOME`. `compare` is the one
+command that does not need a repository at all.
+
+`--dry-run` writes nothing — not the symlinks, and not the generated files either. It does
+not call a secret provider or a decryption command, since both can ask a person to unlock
+something, which a command that says it changes nothing has no business doing.
 
 Every path is classified as one of four states, and only the ones that need work are
 touched:
@@ -103,12 +111,19 @@ touched:
 
 `apply` never destroys a file you wrote. When something that is not a symlink is sitting
 where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
-`sennit rollback` puts it back. `--no-backup` opts out, and is the only way to lose
-anything.
+`sennit rollback` puts it back. Directories are moved whole. The record accumulates across
+applies and is written before hooks run, so a later apply — or a hook that fails — cannot
+strand a file you can no longer find. `--no-backup` opts out, and is the only way to lose
+anything; on a directory it removes the whole tree, and says how many files that is.
 
 It also remembers what it linked. A path that was linked last time and is no longer
 declared gets its symlink removed, so dropping a config from the repository does not leave
-a dangling link behind in `$HOME`.
+a dangling link behind in `$HOME`. Only links pointing into the repository are removed: if
+you replaced one with your own, pointing elsewhere, it is left alone and reported.
+
+Declared paths are relative to the repository root, and one containing `..` or written as
+an absolute path is refused when the manifest loads — both would place files outside the
+two directories sennit is allowed to touch.
 
 ## Templating
 
@@ -151,7 +166,17 @@ produces. A block that disappears leaves the rest intact.
 
 Only what is inside `{{ }}` is interpreted, so a config containing a literal `[end]` or
 `{ if }` is left alone. An unknown variable is an error rather than an empty string, both
-in a substitution and in a condition, so a typo cannot quietly ship a broken config.
+in a substitution and in a condition, so a typo cannot quietly ship a broken config. Two
+exceptions, both because the alternative makes conditions useless:
+
+- A branch that is being dropped is not read at all — neither its substitutions nor the
+  conditions nested inside it. Guarding a Linux-only variable behind
+  `{{ if sennit.os == "linux" }}` is the point of having conditions, and evaluating the
+  inside would fail on macOS every time.
+- `{{ env.SOMETHING }}` that is not set counts as empty in a condition rather than
+  failing. Not being set is a normal state for an environment variable, and treating it as
+  an error would leave `{{ if env.WORK_LAPTOP }}` writable only for variables that are
+  always set.
 
 A template sits next to what it produces — `alacritty.toml.tmpl` beside
 `alacritty.toml` — and only the template is committed. Since the generated file is the one
@@ -194,7 +219,12 @@ Templates see the same context, alongside whatever is in your data files:
 | `{{ sennit.profile }}` | the current profile list |
 | `{{ env.ANYTHING }}` | environment variables |
 
-`[data]` in `sennit.toml` lists which files to read; it defaults to `theme.toml` alone.
+`data` in `sennit.toml` lists which files to read; it defaults to `theme.toml` alone. It
+is a top-level array, so it goes above the first table header:
+
+```toml
+data = ["theme.toml", "colors.toml"]
+```
 
 ## Running things after placing them
 
@@ -211,7 +241,9 @@ run = "bat cache --build"
 ```
 
 `apply` runs a hook after linking, and only when what it watches has changed. A hook with
-no `when-changed` runs every time.
+no `when-changed` runs every time. `cwd` sets where it runs, relative to the repository
+root; the default is the root itself. A hook that exits non-zero fails the apply — the
+links are already placed and recorded by then, so `sennit rollback` still works.
 
 ## File modes
 
@@ -225,8 +257,14 @@ notices. Declare what it should be and `apply` sets it, `verify` checks it:
 ```
 
 The longest matching prefix wins, so a directory can be declared once and one file inside
-it overridden. Rendered output containing a secret is set to 0600 even without a
-declaration, since the default umask would otherwise publish it.
+it overridden. Since the file is placed by symlink, the mode is set on the copy in your
+repository, which is the same file your `$HOME` path resolves to.
+
+Without a declaration, generated output is read-only — 0444, or 0400 when it holds a
+secret, since the default umask would otherwise publish it. Generated files are created
+with that mode rather than chmod-ed afterwards, so a token never sits in a 0644 file even
+briefly. A mode that is not valid octal is refused when the manifest loads: a restriction
+that silently does not apply is worse than one that fails loudly.
 
 ## Secrets
 
@@ -249,9 +287,11 @@ command = "security find-generic-password -s {} -w"
 
 `{}` becomes the part after `://`, passed as an argument rather than through a shell. With
 nothing declared, `op` is assumed. A reference to an undeclared scheme fails and lists the
-ones that are.
+ones that are. `trim = false` keeps the trailing newline, which is otherwise dropped since
+most CLIs add one.
 
-Any such reference is read at render time — but only when you ask for it. `apply` skips those templates and says so; `apply --secrets` renders them.
+Any such reference is read at render time — but only when you ask for it. `apply` skips
+those templates and names the providers they need; `apply --secrets` renders them.
 
 That split is not a convenience. 1Password needs a person to sign in, enable the CLI
 integration, and unlock the app, none of which can happen partway through an unattended
@@ -289,8 +329,8 @@ first install, this can. The two cover different halves of the problem.
 
 If the declared `identity` is absent, the file is deferred rather than failed: not having
 put the key on this machine yet is a different thing from being broken. Decrypted output
-is written 0600 unless `[modes]` says otherwise, and is gitignored like everything else
-that gets generated.
+is written 0400 unless `[modes]` says otherwise. sennit does not touch `.gitignore`;
+add the generated paths to it yourself.
 
 ## Installing packages
 
@@ -311,6 +351,14 @@ idempotency does not depend on the manager's own behaviour.
 | `brew-cask` | macOS only, except font casks which install on Linux as well |
 | `mise` | runtimes |
 | `apt` / `yay` | Linux; selected automatically from what the machine has |
+| `zed-extension` | declared so `check` knows about it; the editor installs it |
+| `none` | declared, but sennit does not install it |
+
+A `manager` outside that list is refused when `packages.toml` loads, rather than dropping
+the package from `sync` while `verify` goes on reporting it as missing.
+
+`kind` says what sort of thing it is — `command` (the default), `font`, `extension`, or
+`library` — which is how `verify` knows what it can judge.
 
 Package names differ between distributions, so declare them where they do:
 
@@ -353,8 +401,9 @@ evidence:
 `check` is static and machine-independent, so it can gate CI. `verify` catches a
 declaration that names something wrong — Homebrew's formula is `gnupg`, not `gpg`, and the
 difference is invisible until you look at the machine. It only judges what can be judged:
-commands on `PATH` and installed font families. GUI applications and libraries are counted
-and skipped, because their absence from `PATH` means nothing.
+commands on `PATH` and installed font families. GUI applications, libraries, editor
+extensions, and anything managed by `mise` are counted and skipped, because their absence
+from `PATH` means nothing.
 
 `audit` covers the gap the other two cannot see: tools you only ever type. `rg` and `fd`
 appear in no config file, so removing their declarations breaks nothing that `check` can
@@ -418,7 +467,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.6. Minimum supported Rust version is 1.90.
+v0.12. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`
