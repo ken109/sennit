@@ -55,7 +55,12 @@ impl Plan {
                 continue;
             }
 
-            for e in WalkDir::new(&abs).into_iter().filter_map(Result::ok) {
+            // 読めなかったディレクトリを黙って飛ばさない。飛ばすとその下の
+            // パスが「今回の対象」から丸ごと落ち、apply は前回の記録と
+            // 突き合わせて $HOME 側のリンクを prune しにかかる。権限を
+            // 1 つ間違えただけで利用者の設定が外れる。
+            for e in WalkDir::new(&abs) {
+                let e = e.with_context(|| format!("failed to read {}", abs.display()))?;
                 if !e.file_type().is_file() {
                     continue;
                 }

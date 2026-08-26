@@ -41,8 +41,9 @@ Most dotfiles managers make you choose between two models, and both cost somethi
 
 sennit takes the position that this is a false choice. **Templating and symlinking are only
 in tension for the files that actually need templating** — usually a handful that carry a
-color palette. So sennit renders those into your repository, commits the result, and
-symlinks everything the same way. The live-edit loop survives for every other config.
+color palette. So sennit renders those into your repository — not committed, rebuilt on
+every apply — and symlinks everything the same way. The live-edit loop survives for every
+other config.
 
 ## Quick start
 
@@ -71,6 +72,15 @@ from anywhere inside your repository.
 
 Directories are linked file by file rather than as a whole, so that a tool writing into
 `~/.config/something/` does not make untracked files appear inside your repository.
+
+`ignore` takes two kinds of pattern: `*.ext` matches by extension, anything else matches a
+path prefix. Declared `[render]` templates and `[encrypted]` ciphertexts are excluded
+whether or not you list them, so forgetting `ignore = ["*.tmpl"]` cannot put an unexpanded
+template in `$HOME`.
+
+`packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
+and `sync`; `apply` does not read it. What was linked is recorded in
+`<home>/.local/state/sennit/state.json`, which follows `--home`.
 
 ## Commands
 
@@ -256,9 +266,12 @@ notices. Declare what it should be and `apply` sets it, `verify` checks it:
 ".npmrc" = "600"
 ```
 
-The longest matching prefix wins, so a directory can be declared once and one file inside
-it overridden. Since the file is placed by symlink, the mode is set on the copy in your
-repository, which is the same file your `$HOME` path resolves to.
+A declaration applies to the path it names and nothing else — a directory declaration sets
+the directory's own mode, not the modes of the files inside it. (It used to descend, which
+made `".ssh" = "700"` produce an executable `known_hosts` while leaving the directory
+untouched, so `verify` failed on it forever.) Since files are placed by symlink, the mode
+is set on the copy in your repository, which is the same file your `$HOME` path resolves
+to. Three octal digits; `verify` compares the same three.
 
 Without a declaration, generated output is read-only — 0444, or 0400 when it holds a
 secret, since the default umask would otherwise publish it. Generated files are created
@@ -467,7 +480,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.12. Minimum supported Rust version is 1.90.
+v0.13. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

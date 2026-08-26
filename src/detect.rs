@@ -168,11 +168,20 @@ fn zsh(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     Ok(())
 }
 
-/// {{ op://... }} を含むテンプレートは 1Password CLI を要求する。
+/// 秘密を参照するテンプレートは、そのプロバイダのコマンドを要求する。
 ///
-/// テンプレートに書いた瞬間に op への依存が生まれるが、それはどの設定
-/// ファイルにも現れない。宣言し忘れると、秘密を使うマシンでだけ失敗する。
+/// テンプレートに書いた瞬間に依存が生まれるが、それはどの設定ファイルにも
+/// 現れない。宣言し忘れると、秘密を使うマシンでだけ失敗する。
+///
+/// どのコマンドが要るかは scheme ごとに違う。`{{ pass://... }}` しか
+/// 使っていない repo に op を要求するのは、プロバイダを宣言で足せる
+/// という設計と噛み合わない。
 fn secret_templates(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
+    // 宣言があればそこから、無ければ既定の op から、scheme -> コマンド名を引く
+    let providers = match crate::manifest::Manifest::load(&root.join("sennit.toml")) {
+        Ok(m) if !m.providers.is_empty() => m.providers,
+        _ => crate::render::default_providers(),
+    };
     // テンプレートは .config の外にも置ける(.npmrc.tmpl)。リポジトリ全体から
     // 拡張子で拾う。
     let mut files = Vec::new();
@@ -185,17 +194,26 @@ fn secret_templates(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if !crate::render::needs_secrets(&text) {
-            continue;
+        for scheme in crate::render::schemes_used(&text) {
+            let Some(provider) = providers.get(&scheme) else {
+                // 宣言の無い scheme は render が名指しで落とす。ここでは黙る。
+                continue;
+            };
+            let Some(bin) = crate::render::shell_words(&provider.command)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            out.push(Requirement {
+                kind: Kind::Command,
+                name: bin,
+                source: format!(
+                    "{} ({scheme}:// reference)",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                ),
+            });
         }
-        out.push(Requirement {
-            kind: Kind::Command,
-            name: "op".to_string(),
-            source: format!(
-                "{} (op:// reference)",
-                path.strip_prefix(root).unwrap_or(&path).display()
-            ),
-        });
     }
     Ok(())
 }
@@ -323,9 +341,18 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
             }
             None => name,
         };
-        // starship.toml のような単一ファイル形式も拾う
-        let name = name.strip_suffix(".toml").unwrap_or(&name).to_string();
-        if name.starts_with('.') {
+        // starship.toml のような単一ファイル形式も拾う。拡張子は .toml とは
+        // 限らない(kitty.conf, foo.yaml)。.toml だけ剥がすと、どのパッケージ
+        // 名とも一致しない "kitty.conf" が要求として出て check が落ちる。
+        let name = if entry.path().is_dir() {
+            name
+        } else {
+            Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(name)
+        };
+        if name.starts_with('.') || name.is_empty() {
             continue;
         }
         out.push(Requirement {
@@ -358,4 +385,147 @@ fn find_all(text: &str, prefix: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 検出器を通すための最小のリポジトリを組む。
+    struct Fixture {
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("sennit-detect-{name}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(".config")).unwrap();
+            std::fs::write(root.join("sennit.toml"), "[link]\ncommon = []\n").unwrap();
+            Fixture { root }
+        }
+
+        fn file(&self, rel: &str, body: &str) -> &Self {
+            let p = self.root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+            self
+        }
+
+        fn dir(&self, rel: &str) -> &Self {
+            std::fs::create_dir_all(self.root.join(rel)).unwrap();
+            self
+        }
+
+        fn manifest(&self, body: &str) -> &Self {
+            std::fs::write(self.root.join("sennit.toml"), body).unwrap();
+            self
+        }
+
+        fn names(&self) -> Vec<String> {
+            scan(&self.root)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_config_directory_is_evidence_of_a_dependency() {
+        let f = Fixture::new("config-dir");
+        f.dir(".config/direnv");
+        assert!(f.names().contains(&"direnv".to_string()));
+    }
+
+    /// starship.toml のような単一ファイル形式。拡張子は .toml とは限らない。
+    #[test]
+    fn a_single_config_file_is_named_without_its_extension() {
+        let f = Fixture::new("config-file");
+        f.file(".config/starship.toml", "");
+        f.file(".config/kitty.conf", "");
+        f.file(".config/some.yaml", "");
+        let names = f.names();
+        for want in ["starship", "kitty", "some"] {
+            assert!(
+                names.contains(&want.to_string()),
+                "{names:?} missing {want}"
+            );
+        }
+        // 拡張子付きのままの名前は、どのパッケージとも一致しない
+        for bad in ["kitty.conf", "some.yaml"] {
+            assert!(!names.contains(&bad.to_string()), "{names:?} has {bad}");
+        }
+    }
+
+    /// 生成物があるならテンプレートは数えない。
+    #[test]
+    fn a_template_is_skipped_when_its_output_exists() {
+        let f = Fixture::new("tmpl-skip");
+        f.dir(".config/alacritty.tmpl");
+        f.dir(".config/alacritty");
+        let names = f.names();
+        assert_eq!(names.iter().filter(|n| *n == "alacritty").count(), 1);
+    }
+
+    /// 秘密は、その scheme を宣言したプロバイダのコマンドを要求する。
+    #[test]
+    fn a_secret_requires_the_provider_it_actually_names() {
+        let f = Fixture::new("provider");
+        f.manifest("[link]\ncommon = []\n\n[providers.pass]\ncommand = \"pass show {}\"\n");
+        f.file(".config/x.conf.tmpl", "token = {{ pass://a/b }}\n");
+        let names = f.names();
+        assert!(names.contains(&"pass".to_string()), "{names:?}");
+        // 宣言していない op を要求しない
+        assert!(!names.contains(&"op".to_string()), "{names:?}");
+    }
+
+    /// 宣言が無ければ既定の op。
+    #[test]
+    fn without_a_declaration_a_secret_requires_op() {
+        let f = Fixture::new("provider-default");
+        f.file(".config/x.conf.tmpl", "token = {{ op://a/b }}\n");
+        assert!(f.names().contains(&"op".to_string()));
+    }
+
+    #[test]
+    fn an_annotation_declares_a_requirement_by_hand() {
+        let f = Fixture::new("annotation");
+        f.file(".config/x/conf", "# sennit: requires command jq\n");
+        assert!(f.names().contains(&"jq".to_string()));
+    }
+
+    #[test]
+    fn a_font_family_in_the_terminal_config_is_a_requirement() {
+        let f = Fixture::new("font");
+        f.file(
+            ".config/alacritty/alacritty.toml",
+            "[font.normal]\nfamily = \"Hack Nerd Font Mono\"\n",
+        );
+        let reqs = scan(&f.root).unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r.kind == Kind::Font && r.name == "Hack Nerd Font Mono"),
+            "{reqs:?}"
+        );
+    }
+
+    /// git の設定が呼ぶコマンド。`!` のシェル前置と絶対パスを剥がす。
+    #[test]
+    fn a_command_from_git_config_is_a_requirement() {
+        let f = Fixture::new("git");
+        f.file(
+            ".config/git/config",
+            "[core]\n\tpager = delta\n[interactive]\n\tdiffFilter = delta --color-only\n",
+        );
+        assert!(f.names().contains(&"delta".to_string()));
+    }
+
+    /// 隠しファイルは拾わない。
+    #[test]
+    fn dotfiles_under_config_are_not_requirements() {
+        let f = Fixture::new("hidden");
+        f.file(".config/.DS_Store", "");
+        assert!(!f.names().contains(&".DS_Store".to_string()));
+    }
 }

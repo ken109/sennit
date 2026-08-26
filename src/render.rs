@@ -365,6 +365,19 @@ fn resolve(token: &str, vars: &BTreeMap<String, String>, source: &str) -> Result
     }
 }
 
+/// 条件を解決して、残る文だけにする。
+///
+/// 秘密を読むかどうかの判定はこの後でなければならない。生の本文を見ると、
+/// 他の OS 向けに括ってある op:// まで数えてしまい、そのテンプレートは
+/// このマシンでは永久に保留されたまま生成されない。
+pub fn resolve_conditionals(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    source: &str,
+) -> Result<String> {
+    strip_conditionals(template, vars, source)
+}
+
 pub fn expand_with(
     template: &str,
     vars: &BTreeMap<String, String>,

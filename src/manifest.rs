@@ -84,6 +84,17 @@ impl Manifest {
         for p in self.modes.keys() {
             paths.push(("modes", p));
         }
+        for p in &self.data {
+            paths.push(("data", p));
+        }
+        for h in self.hooks.values() {
+            if let Some(cwd) = &h.cwd {
+                paths.push(("hook cwd", cwd));
+            }
+            for w in &h.when_changed {
+                paths.push(("hook when-changed", w));
+            }
+        }
 
         // 相対パスは $HOME とリポジトリの両方の基準になる。絶対パスを混ぜると
         // join がそちらを採ってリポジトリの外を指し、`..` は $HOME の外へ出る。
@@ -109,8 +120,10 @@ impl Manifest {
         for (path, mode) in &self.modes {
             let m = u32::from_str_radix(mode, 8)
                 .with_context(|| format!("mode `{mode}` for `{path}` is not octal"))?;
-            if m > 0o7777 {
-                bail!("mode `{mode}` for `{path}` is out of range");
+            // 許可ビットだけ。setuid / setgid は dotfiles の用途に無く、
+            // 受け付けると verify が見る 0o777 と食い違って収束しなくなる。
+            if m > 0o777 {
+                bail!("mode `{mode}` for `{path}` is out of range; use three octal digits");
             }
         }
         Ok(())
@@ -138,12 +151,16 @@ impl Manifest {
         self.encrypted.values().any(|t| Path::new(t) == rel)
     }
 
-    /// このパスに宣言されたモード。前方一致で最も長いものを採る。
+    /// このパスに宣言されたモード。書いたパスそのものにだけ効く。
+    ///
+    /// 以前は前方一致で、ディレクトリの宣言が下のファイルにも降りていた。
+    /// `.ssh = "700"` が known_hosts を実行可能にする一方、ディレクトリ
+    /// 自体は誰も触らず、verify は永久に「755 のままだ」と言い続けていた。
+    /// verify は昔から書いたパスだけを見ていたので、そちらに揃える。
     pub fn mode_for(&self, rel: &Path) -> Option<u32> {
         self.modes
             .iter()
-            .filter(|(pat, _)| rel.starts_with(pat))
-            .max_by_key(|(pat, _)| pat.len())
+            .find(|(pat, _)| Path::new(pat.as_str()) == rel)
             // 8 進として読めることは load の検査で保証済み
             .and_then(|(_, m)| u32::from_str_radix(m, 8).ok())
     }
@@ -286,12 +303,36 @@ mod tests {
     }
 
     /// 前方一致で最も長い宣言を採る。ディレクトリ全体に指定しつつ、
-    /// その中の 1 つだけ変えられるように。
+    /// 書いたパスにだけ効く。ディレクトリの宣言は下へ降りない。
+    ///
+    /// 降ろしていた頃は `.ssh = "700"` が known_hosts を実行可能にし、
+    /// ディレクトリ自体は誰も触らないので verify が永久に落ちていた。
     #[test]
-    fn the_longest_matching_declaration_wins() {
+    fn a_declaration_applies_to_the_path_it_names() {
         let m = with_modes(&[(".ssh", "700"), (".ssh/config", "600")]);
+        assert_eq!(m.mode_for(Path::new(".ssh")), Some(0o700));
         assert_eq!(m.mode_for(Path::new(".ssh/config")), Some(0o600));
-        assert_eq!(m.mode_for(Path::new(".ssh/known_hosts")), Some(0o700));
+        assert_eq!(m.mode_for(Path::new(".ssh/known_hosts")), None);
+    }
+
+    #[test]
+    fn four_digit_modes_are_rejected() {
+        // verify が見るのは 0o777 なので、受け取ると永久に食い違う
+        let e = load("[link]\ncommon = []\n\n[modes]\n\"bin/tool\" = \"2755\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("out of range"), "{e:#}");
+    }
+
+    #[test]
+    fn a_data_file_that_escapes_is_rejected() {
+        let e = load("data = [\"../outside.toml\"]\n\n[link]\ncommon = []\n").unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
+    }
+
+    #[test]
+    fn a_hook_cwd_that_escapes_is_rejected() {
+        let e = load("[link]\ncommon = []\n\n[hooks.h]\nrun = \"true\"\ncwd = \"../elsewhere\"\n")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
     }
 
     /// 宣言があればそれが勝つ。生成物を書き込み可能にしたい場合の逃げ道。

@@ -263,10 +263,9 @@ fn check(root: &Path) -> Result<()> {
 
 /// theme.toml を単一ソースとして、配色を持つ設定ファイルを生成する。
 ///
-/// 生成物はリポジトリにコミットする。git で差分が見え、sennit check が
-/// 生成後のファイルを読め、新規 clone でも設定が揃っているため。
-/// 代わりに「テンプレートを直したが生成し忘れる」ことが起きうるので、
-/// --check を CI に置いて食い違いを落とす。
+/// 生成物はコミットしない。apply が配置の前に必ず作るので clone 直後でも
+/// 揃うし、同じ変更が差分に 2 度出るのを避けられる。秘密を含む生成物が
+/// リポジトリに入らないのも同じ理由による。
 fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) -> Result<()> {
     decrypt_all(root, manifest, dry_run)?;
     if manifest.render.is_empty() {
@@ -290,8 +289,11 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) ->
     for (out_rel, tmpl_rel) in &manifest.render {
         let tmpl_path = root.join(tmpl_rel);
         let out_path = root.join(out_rel);
-        let template = std::fs::read_to_string(&tmpl_path)
+        let raw = std::fs::read_to_string(&tmpl_path)
             .with_context(|| format!("failed to read template {}", tmpl_path.display()))?;
+        // 条件を先に解決する。消える分岐の中の op:// は、このマシンでは
+        // 要らない秘密なので数えない。
+        let template = render::resolve_conditionals(&raw, &vars, tmpl_rel)?;
 
         // 秘密を参照するものは既定で飛ばす。1Password はサインインと
         // ロック解除を人手に要求するので、初回セットアップや CI、
@@ -414,19 +416,6 @@ fn decrypt_all(root: &Path, manifest: &Manifest, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// 生成物を書く。秘密を含むものは 0600 にする。
-///
-/// 既定の umask 022 では 0644 になり、トークンが誰でも読める状態で置かれる。
-/// 手で管理していた頃の ~/.npmrc は 0600 だったので、これは劣化にあたる。
-/// 内容ではなく権限で守る。
-/// 生成物を書く。
-///
-/// 既定で読み取り専用にする。生成物はテンプレートの隣に並ぶので、
-/// うっかりそちらを開いて編集してしまう。書けてしまうと次の render で
-/// 黙って消える。書けなくしておけばエディタが保存に失敗し、その場で気づく。
-///
-/// symlink 越しに $HOME から編集した場合も同じく弾かれる。生の編集感を
-/// 保つのがこのツールの主張だが、生成物だけは例外であることを権限で示す。
 /// 生成物のあるべきモードに揃える。
 ///
 /// 失敗を握り潰さない。秘密を含む生成物が誰でも読める状態のまま
@@ -439,7 +428,7 @@ fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) -> Result<()> 
         // まだ無いものは次の書き込みで正しいモードになる
         Err(_) => return Ok(()),
     };
-    if meta.permissions().mode() & 0o7777 != want {
+    if meta.permissions().mode() & 0o777 != want {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(want))
             .with_context(|| format!("failed to set mode on {}", path.display()))?;
     }
@@ -458,8 +447,15 @@ fn write_generated(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    // 前回書いたものが読み取り専用だと開けない
-    if path.exists() {
+    // ディレクトリに chmod 0600 を掛けると中身が読めなくなる。開く前に断る。
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.is_dir() {
+            bail!(
+                "{} is a directory; a generated file cannot be written there",
+                path.display()
+            );
+        }
+        // 前回書いたものが読み取り専用だと開けない
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
     }
     let mut f = std::fs::OpenOptions::new()
@@ -501,7 +497,14 @@ fn apply(
     // 行き先の無い symlink が $HOME に残る。数には出すが、張らない。
     let (changes, not_yet): (Vec<_>, Vec<_>) = plan.changes().partition(|e| e.src.exists());
 
-    let mut backups = Vec::new();
+    // 退避の記録は積み上げる。次の apply が上書きすると、前回退避した
+    // 利用者のファイルが .sennit-backup のまま行き場を失う。
+    let mut kept: Vec<state::Backup> = previous
+        .backups
+        .iter()
+        .filter(|b| b.kept_at.exists())
+        .cloned()
+        .collect();
     let mut pruned = 0usize;
 
     // 前回張ったが今回の宣言から外れたもの。放っておくと管理をやめた設定の
@@ -564,11 +567,20 @@ fn apply(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        if let Some(kept) = remove_dest(&e.dest, &e.state, backup)? {
-            backups.push(state::Backup {
+        if let Some(at) = remove_dest(&e.dest, &e.state, backup)? {
+            kept.push(state::Backup {
                 dest: e.dest.clone(),
-                kept_at: kept,
+                kept_at: at,
             });
+            // 退避したその場で記録する。以降のどこかで落ちると、
+            // 動かしたファイルの在り処だけが分からなくなる。links は
+            // まだ確定していないので前回の値のまま残す。
+            state::State {
+                links: previous.links.clone(),
+                backups: kept.clone(),
+                hooks: previous.hooks.clone(),
+            }
+            .save(home)?;
         }
         std::os::unix::fs::symlink(&e.src, &e.dest)
             .with_context(|| format!("failed to link {}", e.dest.display()))?;
@@ -579,7 +591,7 @@ fn apply(
         hooks::run_all(root, &manifest.hooks, &previous.hooks, true)?;
         println!(
             "\n{} change(s), {} prune(s), nothing written (--dry-run)",
-            changes.len(),
+            changes.len() + not_yet.len(),
             pruned
         );
         return Ok(());
@@ -588,42 +600,43 @@ fn apply(
     // 宣言されたモードを揃える。symlink 方式なのでリポジトリ側の実体に
     // かける。生成物は render 側で既に揃っているが、ただ張っただけの
     // ファイルはここでしか直せない。
+    // 宣言されたパスそのものに掛ける。symlink 方式なのでリポジトリ側の
+    // 実体が対象で、$HOME からはそれが見える。ファイルでもディレクトリでも
+    // 同じ扱いにする。verify が見るのも同じパスなので、両者が食い違わない。
     let mut fixed = 0usize;
-    for e in &plan.entries {
-        let Some(want) = manifest.mode_for(&e.rel) else {
-            continue;
-        };
-        if !e.src.exists() {
+    for rel in manifest.modes.keys() {
+        let want = manifest
+            .mode_for(Path::new(rel))
+            .expect("validated when the manifest loaded");
+        let path = root.join(rel);
+        if !path.exists() {
             continue;
         }
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&e.src)
-            .with_context(|| format!("failed to stat {}", e.src.display()))?;
-        if meta.permissions().mode() & 0o7777 != want {
-            std::fs::set_permissions(&e.src, std::fs::Permissions::from_mode(want))
-                .with_context(|| format!("failed to set mode on {}", e.src.display()))?;
-            println!("  {:>8}  {}  ({:o})", "mode", e.rel.display(), want);
-            fixed += 1;
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if meta.permissions().mode() & 0o777 == want {
+            continue;
         }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
+            .with_context(|| format!("failed to set mode on {}", path.display()))?;
+        // 落ちた先を読み直す。要求どおりにならないまま成功を返すと、
+        // 毎回「直した」と言い続けて収束しない。
+        let got = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        if got != want {
+            bail!(
+                "{}: asked for mode {:o} but the filesystem gave {:o}",
+                path.display(),
+                want,
+                got
+            );
+        }
+        println!("  {:>8}  {}  ({:o})", "mode", rel, want);
+        fixed += 1;
     }
 
     // フックより先に記録を書く。フックが落ちると、退避したファイルの
-    // 在り処だけが失われて rollback が効かなくなる。移動は済んでいるので、
-    // 記録の方を先に確定させる。
-    //
-    // 退避の記録は積み上げる。次の apply が上書きすると、前回退避した
-    // 利用者のファイルが .sennit-backup のまま行き場を失う。
-    let mut kept: Vec<state::Backup> = previous
-        .backups
-        .iter()
-        .filter(|b| b.kept_at.exists())
-        .cloned()
-        .collect();
-    for b in &backups {
-        if !kept.iter().any(|k| k.kept_at == b.kept_at) {
-            kept.push(b.clone());
-        }
-    }
+    // 在り処だけが失われて rollback が効かなくなる。
     state::State {
         links: current.clone(),
         backups: kept.clone(),
@@ -645,11 +658,23 @@ fn apply(
     .save(home)?;
 
     if changes.is_empty() && pruned == 0 && fixed == 0 && hooks == previous.hooks {
-        println!("already up to date ({} links)", plan.entries.len());
+        if not_yet.is_empty() {
+            println!("already up to date ({} links)", plan.entries.len());
+        } else {
+            // 置いていないものがあるのに「最新です」と言わない
+            println!(
+                "{} link(s) in place, {} not generated yet",
+                plan.entries.len() - not_yet.len(),
+                not_yet.len()
+            );
+        }
         return Ok(());
     }
 
     println!("\n{} link(s) updated, {} pruned", changes.len(), pruned);
+    if !not_yet.is_empty() {
+        println!("{} not generated yet, so not linked", not_yet.len());
+    }
     if !kept.is_empty() {
         println!(
             "{} file(s) moved aside; `sennit rollback` puts them back",
@@ -670,7 +695,24 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    for b in &st.backups {
+    // 同じ行き先に複数の退避があると、順に rename して最後のものだけが
+    // 残る。つまり最も古い — 利用者が sennit を入れる前から持っていた —
+    // ファイルを、戻す動作そのものが消していた。
+    //
+    // 戻すのは行き先ごとに最後の 1 つだけ。古い方はファイルとして残し、
+    // どこに在るかを伝える。消すよりは残す。
+    let mut newest: Vec<&state::Backup> = Vec::new();
+    let mut shadowed: Vec<&state::Backup> = Vec::new();
+    for b in st.backups.iter().rev() {
+        if newest.iter().any(|n| n.dest == b.dest) {
+            shadowed.push(b);
+        } else {
+            newest.push(b);
+        }
+    }
+    newest.reverse();
+
+    for b in &newest {
         println!("  {:>8}  {}", "restore", b.dest.display());
         if dry_run {
             continue;
@@ -689,15 +731,24 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
             .with_context(|| format!("failed to restore {}", b.dest.display()))?;
     }
 
-    if dry_run {
+    for b in &shadowed {
         println!(
-            "\n{} file(s) would be restored (--dry-run)",
-            st.backups.len()
+            "  {:>8}  {}  (an older copy of {})",
+            "kept",
+            b.kept_at.display(),
+            b.dest.display()
         );
+    }
+
+    if dry_run {
+        println!("\n{} file(s) would be restored (--dry-run)", newest.len());
         return Ok(());
     }
-    let n = st.backups.len();
-    st.backups.clear();
+    let n = newest.len();
+    // 戻していない退避は記録に残す。ファイルが在るのに誰も指していない
+    // 状態を作らない。
+    let keep: Vec<state::Backup> = shadowed.into_iter().cloned().collect();
+    st.backups = keep;
     st.save(home)?;
     println!("\n{n} file(s) restored");
     Ok(())

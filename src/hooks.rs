@@ -116,24 +116,81 @@ pub fn run_all(
 mod tests {
     use super::*;
 
-    fn hook(when: &[&str]) -> Hook {
-        Hook {
-            when_changed: when.iter().map(|s| s.to_string()).collect(),
-            run: "true".into(),
-            cwd: None,
-        }
-    }
-
     /// 監視対象が無いフックは毎回走る。「常に実行」を表現する手段が要る。
     #[test]
     fn a_hook_without_watches_always_runs() {
-        let dir = std::env::temp_dir();
+        // 走ったかどうかは、実行が残す痕跡で見る。dry_run では何も走らないので
+        // 「指紋が空」を見ても、走らないフックと区別が付かなかった。
+        let dir = std::env::temp_dir().join("sennit-hook-always");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let mut hooks = BTreeMap::new();
-        hooks.insert("always".to_string(), hook(&[]));
-        let seen = BTreeMap::new();
-        // 走ったかどうかは戻り値では分からないので、指紋が入らないことで見る
-        let next = run_all(&dir, &hooks, &seen, true).unwrap();
-        assert!(next.is_empty());
+        hooks.insert(
+            "always".to_string(),
+            Hook {
+                when_changed: vec![],
+                run: "echo ran >> ran.txt".to_string(),
+                cwd: None,
+            },
+        );
+
+        // 前回の記録に同じ名前があっても、監視対象が無いなら毎回走る
+        let mut seen = BTreeMap::new();
+        seen.insert("always".to_string(), fingerprint(&dir, &[]));
+
+        run_all(&dir, &hooks, &seen, false).unwrap();
+        run_all(&dir, &hooks, &seen, false).unwrap();
+        let ran = std::fs::read_to_string(dir.join("ran.txt")).unwrap();
+        assert_eq!(ran.lines().count(), 2, "{ran:?}");
+    }
+
+    /// 監視対象が変わっていなければ走らない。
+    #[test]
+    fn a_watched_hook_is_skipped_when_nothing_changed() {
+        let dir = std::env::temp_dir().join("sennit-hook-watched");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("watched"), "one").unwrap();
+
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "w".to_string(),
+            Hook {
+                when_changed: vec!["watched".to_string()],
+                run: "echo ran >> ran.txt".to_string(),
+                cwd: None,
+            },
+        );
+
+        let seen = run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap();
+        assert!(dir.join("ran.txt").exists());
+        // 2 回目は走らない
+        run_all(&dir, &hooks, &seen, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ran.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    /// 非零で終わったフックは apply を落とす。
+    #[test]
+    fn a_failing_hook_is_an_error() {
+        let dir = std::env::temp_dir().join("sennit-hook-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "boom".to_string(),
+            Hook {
+                when_changed: vec![],
+                run: "exit 3".to_string(),
+                cwd: None,
+            },
+        );
+        let e = run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap_err();
+        assert!(format!("{e:#}").contains("boom"), "{e:#}");
     }
 
     /// 同じ内容なら指紋も同じ。ここが揺れるとフックが毎回走ってしまう。
