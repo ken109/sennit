@@ -62,6 +62,8 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 | `sennit list` | Show the current state of every managed path. |
 | `sennit render` | Expand templates from a single source of truth. `--check` fails if the committed output is stale. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
+| `sennit verify` | Verify that everything declared actually resolves on this machine. |
+| `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. |
 | `sennit sync` | Install declared packages that are missing. |
 
 Every path is classified as one of four states, and only the ones that need work are
@@ -147,6 +149,32 @@ the package stays behind — easy to miss, because everything keeps working. Com
 left out of this direction on purpose: plenty of them (`bat`, `fd`, `rg`) are used daily
 from the shell without appearing in any config file.
 
+## Three ways of being wrong
+
+Declarations go stale in three different directions, and each needs a different kind of
+evidence:
+
+| | question | evidence |
+|---|---|---|
+| `check` | is everything the configs need declared? | the repository |
+| `verify` | does everything declared actually exist here? | this machine |
+| `audit` | does anything actually use it? | shell history |
+
+`check` is static and machine-independent, so it can gate CI. `verify` catches a
+declaration that names something wrong — Homebrew's formula is `gnupg`, not `gpg`, and the
+difference is invisible until you look at the machine. It only judges what can be judged:
+commands on `PATH` and installed font families. GUI applications and libraries are counted
+and skipped, because their absence from `PATH` means nothing.
+
+`audit` covers the gap the other two cannot see: tools you only ever type. `rg` and `fd`
+appear in no config file, so removing their declarations breaks nothing that `check` can
+notice. It cross-references history with the configs, so a tool that runs automatically —
+`starship`, `delta` — is not mistaken for an unused one. It never fails the build: history
+is per machine and gets trimmed, so absence is a prompt to look, not proof.
+
+None of the three can answer "what breaks if I remove this". That needs removing it and
+running the install, which is a job for CI rather than for this binary.
+
 ## Installing packages
 
 `sync` reads the same `packages.toml` and installs what is missing:
@@ -194,7 +222,7 @@ or `sudo`, before sennit can run at all.
 
 ## Status
 
-v0.4. Minimum supported Rust version is 1.90.
+v0.5. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

@@ -9,6 +9,8 @@ pub enum Kind {
     Command,
     Font,
     Extension,
+    /// 実行ファイルを持たないもの(共有ライブラリ、証明書など)
+    Library,
 }
 
 impl Kind {
@@ -17,6 +19,7 @@ impl Kind {
             Kind::Command => "command",
             Kind::Font => "font",
             Kind::Extension => "extension",
+            Kind::Library => "library",
         }
     }
 }
@@ -94,7 +97,35 @@ pub struct Ignore {
     pub commands: Vec<String>,
 }
 
+impl Package {
+    pub fn kind_of(&self) -> Kind {
+        match self.kind.as_deref() {
+            Some("font") => Kind::Font,
+            Some("extension") => Kind::Extension,
+            Some("library") => Kind::Library,
+            _ => Kind::Command,
+        }
+    }
+
+    pub fn manager_of(&self) -> Manager {
+        Manager::parse(self.manager.as_deref())
+    }
+}
+
 impl Packages {
+    /// 現在の OS に当てはまり、自動導入の対象になるパッケージ。
+    pub fn applicable(&self) -> Vec<(String, &Package)> {
+        let mut out: Vec<(String, &Package)> = self
+            .packages
+            .iter()
+            .filter(|(_, p)| !p.optional)
+            .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
+            .map(|(n, p)| (n.clone(), p))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// 現在の OS で sync の対象になるパッケージを返す。
     /// optional なものは自動導入しない。
     ///
@@ -140,11 +171,7 @@ impl Packages {
             // 設定は全 OS に配置されるが本体は入らない、という状態を可視化するため。
             let os_mismatch = !pkg.os.is_empty() && !pkg.os.iter().any(|o| o == current_os);
             let optional = pkg.optional || os_mismatch;
-            let kind = match pkg.kind.as_deref() {
-                Some("font") => Kind::Font,
-                Some("extension") => Kind::Extension,
-                _ => Kind::Command,
-            };
+            let kind = pkg.kind_of();
             // パッケージ名も提供名として数える。コマンドは大抵パッケージ名と
             // 同じ(bat, fd)で、エディタ拡張は ID がそのまま設定に現れる。
             //

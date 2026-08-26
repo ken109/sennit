@@ -1,9 +1,11 @@
+mod audit;
 mod detect;
 mod manifest;
 mod packages;
 mod plan;
 mod render;
 mod sync;
+mod verify;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -43,6 +45,14 @@ enum Command {
     Diff,
     /// 設定が参照している依存が packages.toml に宣言されているか検証する
     Check,
+    /// シェル履歴を見て、宣言したコマンドが実際に使われているか棚卸しする
+    Audit {
+        /// 履歴ファイル(既定: ~/.zsh_history か ~/.bash_history)
+        #[arg(long)]
+        history: Option<PathBuf>,
+    },
+    /// 宣言したものがこのマシンで実際に解決できるか確かめる
+    Verify,
     /// packages.toml の宣言をもとに未導入のパッケージを入れる
     Sync {
         /// 実際には入れず、何を入れるかだけ表示する
@@ -93,6 +103,8 @@ fn run() -> Result<()> {
         Command::Check => check(&root),
         Command::Render { check } => render_all(&root, &manifest, check),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
+        Command::Verify => verify::verify(&root),
+        Command::Audit { history } => audit::audit(&root, history),
         Command::List { changed } => {
             print_list(&plan, changed);
             Ok(())
