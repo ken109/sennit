@@ -1197,3 +1197,39 @@ fn commented_out_settings_are_not_requirements() {
     assert!(text.contains("Hack Nerd Font Mono"), "{text}");
     assert!(text.contains("toml"), "{text}");
 }
+
+/// まだ生成されていない出力にモードを宣言していても、apply は落ちない。
+///
+/// 秘密を読むテンプレートは --secrets を渡すまで生成されないので、初回や
+/// CI では親ディレクトリごと存在しない。これを異常扱いにすると、その状態が
+/// 常態であるコンテナで一度も apply が通らなくなる。
+#[test]
+fn a_declared_mode_on_a_deferred_output_does_not_fail_the_run() {
+    let r = Repo::new("mode-deferred");
+    r.manifest(
+        r#"
+[link]
+common = ["a.conf", "gh"]
+ignore = ["*.tmpl"]
+
+[render]
+"gh/hosts.yml" = "hosts.yml.tmpl"
+
+[modes]
+"gh/hosts.yml" = "600"
+
+[providers.never]
+command = "false {}"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("a.conf", "plain\n");
+    r.write("hosts.yml.tmpl", "token = {{ never://a/b }}\n");
+
+    let preview = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(preview.contains("nothing written"), "{preview}");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("link(s) updated"), "{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
+}

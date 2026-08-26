@@ -551,9 +551,6 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
             .mode_for(Path::new(rel))
             .expect("validated when the manifest loaded");
         let path = root.join(rel);
-        // 途中のディレクトリが symlink なら、最後の 1 要素を見るだけでは
-        // リポジトリの外に出ていることに気づけない。
-        must_be_inside(root, &path)?;
         // metadata も set_permissions も symlink を辿る。宣言されたパスが
         // リンクなら、chmod が掛かるのはリンク先 — リポジトリの外かもしれない。
         // 宣言は「そのパスそのもの」に効くと書いてあるので、リンクは断る。
@@ -567,13 +564,21 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
         }
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
-            // まだ作られていない生成物。次に作られるときに正しいモードになる
+            // まだ作られていない生成物。次に作られるときに正しいモードになる。
+            //
+            // 「無い」の判定はリポジトリの内外を見るより先。逆にすると、
+            // 秘密を読むテンプレートの出力にモードを宣言しているだけで、
+            // 親ディレクトリがまだ無い初回の apply が canonicalize に
+            // 失敗して丸ごと落ちる。CI とコンテナは常にその状態になる。
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
                 return Err(anyhow::Error::new(err))
                     .with_context(|| format!("failed to stat {}", path.display()))
             }
         };
+        // 途中のディレクトリが symlink なら、最後の 1 要素を見るだけでは
+        // リポジトリの外に出ていることに気づけない。
+        must_be_inside(root, &path)?;
         // ディレクトリは所有者の読みと実行の両方が要る。read_dir には読みが、
         // 中のファイルに触るには実行が必要で、どちらを落としても sennit は
         // 二度とそこを歩けない。しかも自分で掛けたモードなので、次の apply は
