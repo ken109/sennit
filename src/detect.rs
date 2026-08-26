@@ -24,6 +24,7 @@ pub fn scan(root: &Path) -> Result<Vec<Requirement>> {
     config_dirs(root, &mut reqs)?;
     annotations(root, &mut reqs)?;
     secret_templates(root, &mut reqs)?;
+    encryption_tool(root, &mut reqs)?;
     reqs.sort_by(|a, b| (a.kind.label(), &a.name).cmp(&(b.kind.label(), &b.name)));
     reqs.dedup_by(|a, b| a.kind == b.kind && a.name == b.name);
     Ok(reqs)
@@ -196,6 +197,30 @@ fn secret_templates(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
             ),
         });
     }
+    Ok(())
+}
+
+/// [encryption] を宣言しているなら、その復号コマンドが要る。
+///
+/// テンプレートの op:// と同じで、宣言した瞬間に依存が生まれるが
+/// どの設定ファイルにも現れない。
+fn encryption_tool(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
+    let manifest_path = root.join("sennit.toml");
+    let Ok(manifest) = crate::manifest::Manifest::load(&manifest_path) else {
+        return Ok(());
+    };
+    let Some(enc) = manifest.encryption else {
+        return Ok(());
+    };
+    let Some(bin) = crate::render::shell_words(&enc.command).into_iter().next() else {
+        return Ok(());
+    };
+    let name = bin.rsplit('/').next().unwrap_or(&bin).to_string();
+    out.push(Requirement {
+        kind: Kind::Command,
+        name,
+        source: "sennit.toml ([encryption])".into(),
+    });
     Ok(())
 }
 

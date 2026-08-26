@@ -61,7 +61,7 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 | `sennit rollback` | Put back files that the last apply moved aside. |
 | `sennit diff` | Show what an apply would change, before it happens. |
 | `sennit list` | Show the current state of every managed path. |
-| `sennit render` | Expand templates from a single source of truth. `--check` fails if the committed output is stale. |
+| `sennit render` | Expand templates and decrypt encrypted files. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
 | `sennit verify` | Verify that everything declared actually resolves on this machine. |
 | `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. |
@@ -305,6 +305,33 @@ is per machine and gets trimmed, so absence is a prompt to look, not proof.
 
 None of the three can answer "what breaks if I remove this". That needs removing it and
 running the install, which is a job for CI rather than for this binary.
+
+## Encrypted files
+
+A provider fetches a value from somewhere else. Encryption goes the other way: the secret
+lives in the repository, and a key opens it.
+
+```toml
+[encryption]
+command  = "age -d -i ~/.config/sennit/age.key {}"
+identity = "~/.config/sennit/age.key"
+
+[encrypted]
+".ssh/config" = ".ssh/config.age"
+```
+
+The command takes the ciphertext path as `{}` and prints the plaintext. `age`, `gpg -d`
+and `sops -d` all fit.
+
+The difference from a provider matters more than it looks. Nothing has to be signed into
+and nothing has to be unlocked by a person, so this works unattended — on a fresh machine,
+in a container, in CI — provided the key is there. Where 1Password cannot help during a
+first install, this can. The two cover different halves of the problem.
+
+If the declared `identity` is absent, the file is deferred rather than failed: not having
+put the key on this machine yet is a different thing from being broken. Decrypted output
+is written 0600 unless `[modes]` says otherwise, and is gitignored like everything else
+that gets generated.
 
 ## Installing packages
 

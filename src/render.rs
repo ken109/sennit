@@ -198,7 +198,7 @@ impl SecretCache {
 }
 
 /// 引用符を尊重した最小の分割。見るのはコマンド定義側の引用だけ。
-fn shell_words(s: &str) -> Vec<String> {
+pub fn shell_words(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;

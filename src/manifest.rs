@@ -18,6 +18,12 @@ pub struct Manifest {
     /// 秘密の取り出し方。scheme -> コマンド。宣言が無ければ op のみ。
     #[serde(default)]
     pub providers: crate::render::Providers,
+    /// 出力パス -> リポジトリ内の暗号文ファイル
+    #[serde(default)]
+    pub encrypted: std::collections::BTreeMap<String, String>,
+    /// 暗号文の開き方
+    #[serde(default)]
+    pub encryption: Option<crate::encrypted::Encryption>,
     /// パス -> 8進のモード。
     ///
     /// symlink 方式なのでリポジトリ側の権限がそのまま見える。宣言しておくと
@@ -96,6 +102,8 @@ mod tests {
             render: Default::default(),
             hooks: Default::default(),
             providers: Default::default(),
+            encrypted: Default::default(),
+            encryption: None,
             data: Default::default(),
             modes: Default::default(),
         }

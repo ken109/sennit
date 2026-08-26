@@ -1,5 +1,6 @@
 mod audit;
 mod detect;
+mod encrypted;
 mod hooks;
 mod manifest;
 mod packages;
@@ -237,6 +238,7 @@ fn check(root: &Path) -> Result<()> {
 /// 代わりに「テンプレートを直したが生成し忘れる」ことが起きうるので、
 /// --check を CI に置いて食い違いを落とす。
 fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
+    decrypt_all(root, manifest)?;
     if manifest.render.is_empty() {
         return Ok(());
     }
@@ -296,6 +298,55 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
             "{} template(s) not rendered; run `sennit apply --secrets` once 1Password is unlocked",
             deferred.len()
         );
+    }
+    Ok(())
+}
+
+/// リポジトリ内の暗号文を復号して置く。
+///
+/// プロバイダと違い外部サービスもサインインも要らないので、鍵さえあれば
+/// 無人で動く。鍵が無い環境では保留するが、それは「設定していない」であって
+/// 「壊れている」ではない。
+fn decrypt_all(root: &Path, manifest: &Manifest) -> Result<()> {
+    if manifest.encrypted.is_empty() {
+        return Ok(());
+    }
+    let Some(enc) = &manifest.encryption else {
+        bail!("encrypted files are declared but [encryption] is not");
+    };
+
+    if !enc.ready() {
+        for out_rel in manifest.encrypted.keys() {
+            println!("  \x1b[36mdeferred\x1b[0m   {out_rel}  (no decryption key)");
+        }
+        if let Some(id) = enc.identity_path() {
+            println!(
+                "{} encrypted file(s) not decrypted; the key is expected at {id}",
+                manifest.encrypted.len()
+            );
+        }
+        return Ok(());
+    }
+
+    for (out_rel, src_rel) in &manifest.encrypted {
+        let src = root.join(src_rel);
+        let out_path = root.join(out_rel);
+        let plain = enc.decrypt(&src)?;
+
+        // 中身が同じなら触らない
+        if std::fs::read(&out_path).ok().as_deref() == Some(plain.as_slice()) {
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&out_path, &plain)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+        // 暗号化してあるということは秘密なので、既定で 0600
+        let mode = manifest.mode_for(Path::new(out_rel)).unwrap_or(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
+        println!("  \x1b[35mdecrypted\x1b[0m  {out_rel}");
     }
     Ok(())
 }
