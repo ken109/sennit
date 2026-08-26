@@ -183,7 +183,7 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         out.push(Requirement {
             kind: Kind::Command,
             name,
-            source: ".config/ (設定ディレクトリの存在)".into(),
+            source: ".config/ (directory exists)".into(),
         });
     }
     Ok(())
