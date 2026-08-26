@@ -12,7 +12,22 @@ A dotfiles manager that keeps symlink semantics, and adds templating and drift d
 brew install ken109/tap/sennit   # or: cargo install sennit
 ```
 
+- [Why another one?](#why-another-one)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [What apply will not do](#what-apply-will-not-do)
+- [Templating](#templating)
+- [Per-machine variation](#per-machine-variation)
+- [Running things after placing them](#running-things-after-placing-them)
+- [File modes](#file-modes)
+- [Secrets](#secrets)
+- [Encrypted files](#encrypted-files)
+- [Installing packages](#installing-packages)
+- [Three ways of being wrong](#three-ways-of-being-wrong)
+- [Drift detection](#drift-detection)
+
 ## Why another one?
+
 
 Most dotfiles managers make you choose between two models, and both cost something:
 
@@ -30,6 +45,7 @@ color palette. So sennit renders those into your repository, commits the result,
 symlinks everything the same way. The live-edit loop survives for every other config.
 
 ## Quick start
+
 
 In the root of your dotfiles repository:
 
@@ -55,6 +71,7 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 
 ## Commands
 
+
 | | |
 |---|---|
 | `sennit apply` | Render templates, then place symlinks. Only touches what needs changing. `--dry-run` to preview. |
@@ -78,7 +95,20 @@ touched:
 | `wrong` | a symlink pointing somewhere else |
 | `occupied` | a real file or directory is in the way |
 
+## What apply will not do
+
+
+`apply` never destroys a file you wrote. When something that is not a symlink is sitting
+where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
+`sennit rollback` puts it back. `--no-backup` opts out, and is the only way to lose
+anything.
+
+It also remembers what it linked. A path that was linked last time and is no longer
+declared gets its symlink removed, so dropping a config from the repository does not leave
+a dangling link behind in `$HOME`.
+
 ## Templating
+
 
 Add a `theme.toml` (or any TOML file of values) and declare what is generated from what:
 
@@ -130,6 +160,67 @@ nothing it produces reaches the repository.
 token = "{{ op://Personal/GitHub/token }}"
 ```
 
+## Per-machine variation
+
+
+`os = ["darwin"]` restricts a declaration to one platform. `profiles` restricts it to a
+purpose:
+
+```toml
+[packages.slack]
+manager  = "brew-cask"
+profiles = ["work"]
+```
+
+The profile comes from `SENNIT_PROFILE`, which takes a comma-separated list. A declaration
+with no `profiles` always applies; one with `profiles` applies only when it overlaps, so
+an unset `SENNIT_PROFILE` installs less rather than more.
+
+Templates see the same context, alongside whatever is in your data files:
+
+| | |
+|---|---|
+| `{{ sennit.os }}` | `darwin` or `linux` |
+| `{{ sennit.hostname }}` | short hostname |
+| `{{ sennit.profile }}` | the current profile list |
+| `{{ env.ANYTHING }}` | environment variables |
+
+`[data]` in `sennit.toml` lists which files to read; it defaults to `theme.toml` alone.
+
+## Running things after placing them
+
+
+Placing a file is often only half of it. `.config/bat/themes/` is useless until
+`bat cache --build` has registered what is in it, and until then `BAT_THEME` silently does
+not resolve and everything downstream falls back to default colours. That relationship
+lived in a shell script, ran unconditionally, and was written down nowhere.
+
+```toml
+[hooks.bat-themes]
+when-changed = [".config/bat/themes"]
+run = "bat cache --build"
+```
+
+`apply` runs a hook after linking, and only when what it watches has changed. A hook with
+no `when-changed` runs every time.
+
+## File modes
+
+
+A config holding a token still works perfectly at mode 0644, which is exactly why nobody
+notices. Declare what it should be and `apply` sets it, `verify` checks it:
+
+```toml
+[modes]
+".npmrc" = "600"
+```
+
+The longest matching prefix wins, so a directory can be declared once and one file inside
+it overridden. Rendered output containing a secret is set to 0600 even without a
+declaration, since the default umask would otherwise publish it.
+
+## Secrets
+
 Providers are declared rather than built in, since they all have the same shape — run a
 command, read what it prints:
 
@@ -164,74 +255,109 @@ A template that references `op://` also makes `check` require the `op` command, 
 dependency shows up the moment it exists rather than on whichever machine first tries to
 use it.
 
-## What apply will not do
+## Encrypted files
 
-`apply` never destroys a file you wrote. When something that is not a symlink is sitting
-where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
-`sennit rollback` puts it back. `--no-backup` opts out, and is the only way to lose
-anything.
 
-It also remembers what it linked. A path that was linked last time and is no longer
-declared gets its symlink removed, so dropping a config from the repository does not leave
-a dangling link behind in `$HOME`.
-
-## Running things after placing them
-
-Placing a file is often only half of it. `.config/bat/themes/` is useless until
-`bat cache --build` has registered what is in it, and until then `BAT_THEME` silently does
-not resolve and everything downstream falls back to default colours. That relationship
-lived in a shell script, ran unconditionally, and was written down nowhere.
+A provider fetches a value from somewhere else. Encryption goes the other way: the secret
+lives in the repository, and a key opens it.
 
 ```toml
-[hooks.bat-themes]
-when-changed = [".config/bat/themes"]
-run = "bat cache --build"
+[encryption]
+command  = "age -d -i ~/.config/sennit/age.key {}"
+identity = "~/.config/sennit/age.key"
+
+[encrypted]
+".ssh/config" = ".ssh/config.age"
 ```
 
-`apply` runs a hook after linking, and only when what it watches has changed. A hook with
-no `when-changed` runs every time.
+The command takes the ciphertext path as `{}` and prints the plaintext. `age`, `gpg -d`
+and `sops -d` all fit.
 
-## Per-machine variation
+The difference from a provider matters more than it looks. Nothing has to be signed into
+and nothing has to be unlocked by a person, so this works unattended — on a fresh machine,
+in a container, in CI — provided the key is there. Where 1Password cannot help during a
+first install, this can. The two cover different halves of the problem.
 
-`os = ["darwin"]` restricts a declaration to one platform. `profiles` restricts it to a
-purpose:
+If the declared `identity` is absent, the file is deferred rather than failed: not having
+put the key on this machine yet is a different thing from being broken. Decrypted output
+is written 0600 unless `[modes]` says otherwise, and is gitignored like everything else
+that gets generated.
 
-```toml
-[packages.slack]
-manager  = "brew-cask"
-profiles = ["work"]
+## Installing packages
+
+
+`sync` reads the same `packages.toml` and installs what is missing:
+
+```sh
+sennit sync --dry-run
+sennit sync
 ```
 
-The profile comes from `SENNIT_PROFILE`, which takes a comma-separated list. A declaration
-with no `profiles` always applies; one with `profiles` applies only when it overlaps, so
-an unset `SENNIT_PROFILE` installs less rather than more.
+It asks each manager what is already installed and only installs the difference, so
+idempotency does not depend on the manager's own behaviour.
 
-Templates see the same context, alongside whatever is in your data files:
-
-| | |
+| manager | |
 |---|---|
-| `{{ sennit.os }}` | `darwin` or `linux` |
-| `{{ sennit.hostname }}` | short hostname |
-| `{{ sennit.profile }}` | the current profile list |
-| `{{ env.ANYTHING }}` | environment variables |
+| `brew` | default; works on Linux too via Homebrew on Linux |
+| `brew-cask` | macOS only, except font casks which install on Linux as well |
+| `mise` | runtimes |
+| `apt` / `yay` | Linux; selected automatically from what the machine has |
 
-`[data]` in `sennit.toml` lists which files to read; it defaults to `theme.toml` alone.
-
-## File modes
-
-A config holding a token still works perfectly at mode 0644, which is exactly why nobody
-notices. Declare what it should be and `apply` sets it, `verify` checks it:
+Package names differ between distributions, so declare them where they do:
 
 ```toml
-[modes]
-".npmrc" = "600"
+[packages.libyaml]
+apt = "libyaml-dev"      # on Debian-like systems, use apt with this name
+yay = "libyaml"          # on Arch-like systems, use yay with this name
 ```
 
-The longest matching prefix wins, so a directory can be declared once and one file inside
-it overridden. Rendered output containing a secret is set to 0600 even without a
-declaration, since the default umask would otherwise publish it.
+On Linux, an `apt` or `yay` entry decides both the manager and the name. Without one,
+the default `manager` is used. Entries marked `optional`, or restricted to another OS via
+`os = ["darwin"]`, are skipped. Editor extensions are declared so that `check` knows about
+them, but are installed by the editor itself.
+
+Managers run in dependency order — `apt`/`yay` first, since distribution packages are what
+Homebrew sits on, then `brew`, `brew-cask`, and `mise` last because `brew` is what installs
+it.
+
+`apt` needs root. sennit works out how to get it before running anything: as root it calls
+`apt-get` directly, otherwise it uses `sudo` when that is passwordless or when there is a
+terminal for `sudo` to prompt on. When neither holds — a script or a container build where
+`sudo` would block on a password nobody can type — it stops with an explanation rather than
+hanging. `yay` is never run through `sudo`, since it refuses to run as root.
+
+`sync` does not replace your bootstrap script: something still has to install Homebrew,
+or `sudo`, before sennit can run at all.
+
+## Three ways of being wrong
+
+
+Declarations go stale in three different directions, and each needs a different kind of
+evidence:
+
+| | question | evidence |
+|---|---|---|
+| `check` | is everything the configs need declared? | the repository |
+| `verify` | does everything declared actually exist here? | this machine |
+| `audit` | does anything actually use it? | shell history |
+
+`check` is static and machine-independent, so it can gate CI. `verify` catches a
+declaration that names something wrong — Homebrew's formula is `gnupg`, not `gpg`, and the
+difference is invisible until you look at the machine. It only judges what can be judged:
+commands on `PATH` and installed font families. GUI applications and libraries are counted
+and skipped, because their absence from `PATH` means nothing.
+
+`audit` covers the gap the other two cannot see: tools you only ever type. `rg` and `fd`
+appear in no config file, so removing their declarations breaks nothing that `check` can
+notice. It cross-references history with the configs, so a tool that runs automatically —
+`starship`, `delta` — is not mistaken for an unused one. It never fails the build: history
+is per machine and gets trimmed, so absence is a prompt to look, not proof.
+
+None of the three can answer "what breaks if I remove this". That needs removing it and
+running the install, which is a job for CI rather than for this binary.
 
 ## Drift detection
+
 
 The problem `check` solves is specific: **you update a config, and forget to update the
 package list.** The config references a tool that a fresh machine will never install, and
@@ -280,105 +406,8 @@ the package stays behind — easy to miss, because everything keeps working. Com
 left out of this direction on purpose: plenty of them (`bat`, `fd`, `rg`) are used daily
 from the shell without appearing in any config file.
 
-## Three ways of being wrong
-
-Declarations go stale in three different directions, and each needs a different kind of
-evidence:
-
-| | question | evidence |
-|---|---|---|
-| `check` | is everything the configs need declared? | the repository |
-| `verify` | does everything declared actually exist here? | this machine |
-| `audit` | does anything actually use it? | shell history |
-
-`check` is static and machine-independent, so it can gate CI. `verify` catches a
-declaration that names something wrong — Homebrew's formula is `gnupg`, not `gpg`, and the
-difference is invisible until you look at the machine. It only judges what can be judged:
-commands on `PATH` and installed font families. GUI applications and libraries are counted
-and skipped, because their absence from `PATH` means nothing.
-
-`audit` covers the gap the other two cannot see: tools you only ever type. `rg` and `fd`
-appear in no config file, so removing their declarations breaks nothing that `check` can
-notice. It cross-references history with the configs, so a tool that runs automatically —
-`starship`, `delta` — is not mistaken for an unused one. It never fails the build: history
-is per machine and gets trimmed, so absence is a prompt to look, not proof.
-
-None of the three can answer "what breaks if I remove this". That needs removing it and
-running the install, which is a job for CI rather than for this binary.
-
-## Encrypted files
-
-A provider fetches a value from somewhere else. Encryption goes the other way: the secret
-lives in the repository, and a key opens it.
-
-```toml
-[encryption]
-command  = "age -d -i ~/.config/sennit/age.key {}"
-identity = "~/.config/sennit/age.key"
-
-[encrypted]
-".ssh/config" = ".ssh/config.age"
-```
-
-The command takes the ciphertext path as `{}` and prints the plaintext. `age`, `gpg -d`
-and `sops -d` all fit.
-
-The difference from a provider matters more than it looks. Nothing has to be signed into
-and nothing has to be unlocked by a person, so this works unattended — on a fresh machine,
-in a container, in CI — provided the key is there. Where 1Password cannot help during a
-first install, this can. The two cover different halves of the problem.
-
-If the declared `identity` is absent, the file is deferred rather than failed: not having
-put the key on this machine yet is a different thing from being broken. Decrypted output
-is written 0600 unless `[modes]` says otherwise, and is gitignored like everything else
-that gets generated.
-
-## Installing packages
-
-`sync` reads the same `packages.toml` and installs what is missing:
-
-```sh
-sennit sync --dry-run
-sennit sync
-```
-
-It asks each manager what is already installed and only installs the difference, so
-idempotency does not depend on the manager's own behaviour.
-
-| manager | |
-|---|---|
-| `brew` | default; works on Linux too via Homebrew on Linux |
-| `brew-cask` | macOS only, except font casks which install on Linux as well |
-| `mise` | runtimes |
-| `apt` / `yay` | Linux; selected automatically from what the machine has |
-
-Package names differ between distributions, so declare them where they do:
-
-```toml
-[packages.libyaml]
-apt = "libyaml-dev"      # on Debian-like systems, use apt with this name
-yay = "libyaml"          # on Arch-like systems, use yay with this name
-```
-
-On Linux, an `apt` or `yay` entry decides both the manager and the name. Without one,
-the default `manager` is used. Entries marked `optional`, or restricted to another OS via
-`os = ["darwin"]`, are skipped. Editor extensions are declared so that `check` knows about
-them, but are installed by the editor itself.
-
-Managers run in dependency order — `apt`/`yay` first, since distribution packages are what
-Homebrew sits on, then `brew`, `brew-cask`, and `mise` last because `brew` is what installs
-it.
-
-`apt` needs root. sennit works out how to get it before running anything: as root it calls
-`apt-get` directly, otherwise it uses `sudo` when that is passwordless or when there is a
-terminal for `sudo` to prompt on. When neither holds — a script or a container build where
-`sudo` would block on a password nobody can type — it stops with an explanation rather than
-hanging. `yay` is never run through `sudo`, since it refuses to run as root.
-
-`sync` does not replace your bootstrap script: something still has to install Homebrew,
-or `sudo`, before sennit can run at all.
-
 ## Status
+
 
 v0.6. Minimum supported Rust version is 1.90.
 
@@ -387,5 +416,6 @@ adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, sin
 will replace whatever is currently sitting at a managed path.
 
 ## License
+
 
 MIT

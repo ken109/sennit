@@ -24,11 +24,11 @@ use std::path::{Path, PathBuf};
     about = "Dotfiles manager that keeps symlink semantics"
 )]
 struct Cli {
-    /// リポジトリルート(既定: sennit.toml を上方向に探索)
+    /// Repository root (default: search upwards for sennit.toml)
     #[arg(long, global = true)]
     root: Option<PathBuf>,
 
-    /// 配置先(既定: $HOME)
+    /// Where to place files (default: $HOME)
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
@@ -38,59 +38,60 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// symlink を配置する
+    /// Render, then place symlinks
     Apply {
-        /// 実際には変更せず、何をするかだけ表示する
+        /// Show what would happen without changing anything
         #[arg(long)]
         dry_run: bool,
-        /// symlink でない実体を、退避せずに削除する
+        /// Delete a real file in the way instead of moving it aside
         #[arg(long)]
         no_backup: bool,
-        /// 1Password を参照するテンプレートも展開する
+        /// Also render templates that read secrets
         #[arg(long)]
         secrets: bool,
     },
-    /// 適用したときに何が変わるかを表示する
+    /// Show what an apply would change
     Diff,
-    /// 設定が参照している依存が packages.toml に宣言されているか検証する
+    /// Check that every dependency the configs reference is declared
     Check,
-    /// シェル履歴を見て、宣言したコマンドが実際に使われているか棚卸しする
+    /// Cross-check declarations against shell history to find unused ones
     Audit {
-        /// 履歴ファイル(既定: ~/.zsh_history か ~/.bash_history)
+        /// History file (default: ~/.zsh_history or ~/.bash_history)
         #[arg(long)]
         history: Option<PathBuf>,
     },
-    /// 宣言したものがこのマシンで実際に解決できるか確かめる
+    /// Check that everything declared actually resolves on this machine
     Verify {
-        /// 結果を JSON で書き出す(マシン間の比較用)
+        /// Write the result as JSON, for comparing machines
         #[arg(long)]
         export: Option<PathBuf>,
     },
-    /// 2 台分の verify --export を比べる
+    /// Diff two `verify --export` reports
     Compare { a: PathBuf, b: PathBuf },
-    /// packages.toml の宣言をもとに未導入のパッケージを入れる
+    /// Install declared packages that are missing
     Sync {
-        /// 実際には入れず、何を入れるかだけ表示する
+        /// Show what would be installed without installing it
         #[arg(long)]
         dry_run: bool,
     },
-    /// theme.toml からテンプレートを展開して設定ファイルを生成する
+    /// Render templates and decrypt encrypted files
     Render {
-        /// 1Password を参照するテンプレートも展開する。
-        /// 既定では飛ばす。op はログインとロック解除を人手に要求するので、
-        /// 自動セットアップの途中では必ず失敗するため。
+        /// Also render templates that read secrets.
+        ///
+        /// Skipped by default: a secret manager needs a person to sign in and
+        /// unlock it, which cannot happen partway through an unattended install.
         #[arg(long)]
         secrets: bool,
     },
-    /// 直前の apply が退避したファイルを元に戻す
+    /// Put back files that the last apply moved aside
     Rollback {
-        /// 実際には戻さず、何を戻すかだけ表示する
+        /// Show what would be restored without restoring it
         #[arg(long)]
         dry_run: bool,
     },
-    /// 配置状況を一覧する
+    /// Show the state of every managed path
     List {
-        /// 差分のあるものだけ表示する
+        /// Only show entries that need changing
         #[arg(long)]
         changed: bool,
     },
