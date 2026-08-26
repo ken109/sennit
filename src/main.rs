@@ -328,6 +328,7 @@ fn render_all(
         if std::fs::read_to_string(&out_path).ok().as_deref() == Some(rendered.as_str()) {
             if !dry_run {
                 enforce_mode(
+                    root,
                     &out_path,
                     manifest.mode_for(Path::new(out_rel)),
                     render::needs_secrets(&template),
@@ -418,7 +419,7 @@ fn decrypt_all(
 
         // 中身が同じでも権限は揃える
         if std::fs::read(&out_path).ok().as_deref() == Some(plain.as_slice()) {
-            enforce_mode(&out_path, manifest.mode_for(Path::new(out_rel)), true)?;
+            enforce_mode(root, &out_path, manifest.mode_for(Path::new(out_rel)), true)?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
@@ -437,9 +438,10 @@ fn decrypt_all(
 ///
 /// 失敗を握り潰さない。秘密を含む生成物が誰でも読める状態のまま
 /// コマンドが成功を返すと、権限で守るという前提そのものが崩れる。
-fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) -> Result<()> {
+fn enforce_mode(root: &Path, path: &Path, declared: Option<u32>, secret: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let want = declared.unwrap_or(if secret { 0o400 } else { 0o444 });
+    must_be_inside(root, path)?;
     // 生成物の置き場が symlink なら、chmod はリンク先に掛かる
     if let Ok(m) = std::fs::symlink_metadata(path) {
         if m.file_type().is_symlink() {
@@ -469,14 +471,15 @@ fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) -> Result<()> 
 ///
 /// 中身を書く前に最終的なモードで作る。先に書いてから chmod すると、
 /// umask 022 の既定で 0644 のファイルにトークンが入っている瞬間が生まれる。
-fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    // 置き場が本当にリポジトリの中か確かめる。symlink_metadata が見るのは
-    // 最後の 1 要素だけで、途中のディレクトリが symlink なら素通りする。
-    // リポジトリに `out -> /somewhere/outside` を 1 つ置くだけで、宣言の
-    // 検査(`..` と絶対パスを断る)を回り込んで外のファイルを潰せてしまう。
+/// このパスが本当にリポジトリの中を指しているか確かめる。
+///
+/// symlink_metadata が見るのは最後の 1 要素だけで、途中のディレクトリが
+/// symlink なら素通りする。リポジトリに `out -> /somewhere/outside` を
+/// 1 つ置くだけで、宣言の検査(`..` と絶対パスを断る)を回り込んで外の
+/// ファイルを書いたり chmod したりできてしまう。
+///
+/// 書き込みも権限変更も、触る前にここを通す。
+fn must_be_inside(root: &Path, path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or(root);
     let real = std::fs::canonicalize(parent)
         .with_context(|| format!("failed to resolve {}", parent.display()))?;
@@ -489,6 +492,14 @@ fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Resu
             real.display()
         );
     }
+    Ok(())
+}
+
+fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    must_be_inside(root, path)?;
 
     // 書き先を確かめてから触る。chmod も open も symlink を辿るので、
     // 「ディレクトリではない」だけ見て進むと、リンクの先にあるディレクトリを
@@ -540,6 +551,9 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
             .mode_for(Path::new(rel))
             .expect("validated when the manifest loaded");
         let path = root.join(rel);
+        // 途中のディレクトリが symlink なら、最後の 1 要素を見るだけでは
+        // リポジトリの外に出ていることに気づけない。
+        must_be_inside(root, &path)?;
         // metadata も set_permissions も symlink を辿る。宣言されたパスが
         // リンクなら、chmod が掛かるのはリンク先 — リポジトリの外かもしれない。
         // 宣言は「そのパスそのもの」に効くと書いてあるので、リンクは断る。
@@ -1212,7 +1226,7 @@ mod tests {
         std::fs::write(&p, "x").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        enforce_mode(&p, None, true).unwrap();
+        enforce_mode(&d, &p, None, true).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o400

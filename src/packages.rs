@@ -143,11 +143,7 @@ impl Packages {
     /// そこで差し替える。どちらの宣言も無ければ既定の manager を使う
     /// (linuxbrew は Linux でも動くため)。
     pub fn installable(&self) -> Vec<Installable> {
-        let linux_pm = if cfg!(target_os = "macos") {
-            None
-        } else {
-            detect_linux_pm()
-        };
+        let linux_pm = current_linux_pm();
 
         let mut out: Vec<Installable> = self
             .packages
@@ -302,14 +298,26 @@ fn which(bin: &str) -> bool {
 /// この OS で sync が導入経路を持つか。verify はこれを見て、入れようが
 /// ないものを「見つからない」と報告しないようにする。
 pub fn will_install(pkg: &Package) -> bool {
+    will_install_with(pkg, current_linux_pm())
+}
+
+/// このマシンの Linux パッケージマネージャ。macOS では無い。
+fn current_linux_pm() -> Option<Manager> {
     if cfg!(target_os = "macos") {
-        return true;
+        None
+    } else {
+        detect_linux_pm()
     }
-    if pkg.apt.is_some() || pkg.yay.is_some() {
-        return true;
-    }
-    // Linux で cask は入れられない。font cask だけは brew が扱える
-    !(Manager::parse(pkg.manager.as_deref()) == Manager::BrewCask && !is_font(pkg))
+}
+
+/// 判定の本体。マネージャを引数で受けるのは、関数の中で cfg! を見ると
+/// 一方の OS では常に同じ答えになり、テストが何も押さえられないため。
+///
+/// sync が使うのと同じ resolve に訊く。ここで条件を書き写すと必ずずれる。
+/// 実際、macOS を先に真で返していたせいで、`manager = "apt"` を os 無しで
+/// 書いた宣言が sync からは消え、verify だけが missing と言い続けていた。
+pub fn will_install_with(pkg: &Package, linux_pm: Option<Manager>) -> bool {
+    resolve("", pkg, linux_pm).is_some()
 }
 
 fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Installable> {
@@ -331,9 +339,13 @@ fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Insta
         }
     }
     let manager = Manager::parse(pkg.manager.as_deref());
-    // macOS で dpkg-query / pacman を呼びに行かない。os を書き忘れた
-    // `manager = "apt"` 1 件で sync 全体が最初のマネージャで落ちていた。
-    if cfg!(target_os = "macos") && matches!(manager, Manager::Apt | Manager::Yay) {
+    // Linux のマネージャが無い環境(macOS)で dpkg-query / pacman を呼びに
+    // 行かない。os を書き忘れた `manager = "apt"` 1 件で、sync 全体が
+    // 最初のマネージャで落ちていた。
+    //
+    // cfg! ではなく linux_pm で判断する。関数の中で OS を見ると、片方の
+    // OS では常に同じ答えになってテストが何も押さえられない。
+    if linux_pm.is_none() && matches!(manager, Manager::Apt | Manager::Yay) {
         return None;
     }
     Some(Installable {
@@ -500,13 +512,26 @@ mod load_tests {
     /// ORDER の先頭なので sync 全体が最初のマネージャで落ちていた。
     /// --dry-run でも落ちるので、宣言を直すまで何も見られない。
     #[test]
-    #[cfg(target_os = "macos")]
-    fn a_distro_manager_is_not_used_on_macos() {
+    fn a_distro_manager_is_not_used_where_there_is_none() {
         let p = pkg("manager = \"apt\"\n");
         assert!(resolve("libyaml", &p, None).is_none());
+        assert!(resolve("libyaml", &p, Some(Manager::Apt)).is_some());
         // 既定の brew は当然通る
         let q = pkg("");
         assert!(resolve("ripgrep", &q, None).is_some());
+    }
+
+    /// sync と verify が同じ答えを出す。
+    ///
+    /// macOS を先に真で返していた頃は、`manager = "apt"` を os 無しで書くと
+    /// sync の対象から消える一方 verify は missing と言い続け、利用者に
+    /// できることが何も無い状態になっていた。
+    #[test]
+    fn a_distro_manager_without_os_is_not_installable_on_macos() {
+        let p = pkg("manager = \"apt\"\n");
+        // macOS では Linux のマネージャが無い
+        assert!(!will_install_with(&p, None));
+        assert!(will_install_with(&p, Some(Manager::Apt)));
     }
 
     /// verify が「入れようがないもの」を missing と言わない。

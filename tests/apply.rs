@@ -1116,3 +1116,84 @@ fn a_declared_mode_does_not_follow_a_symlink_out_of_the_repository() {
     );
     assert_eq!(mode_of(&outside), 0o600, "the link target was chmod-ed");
 }
+
+/// 読めなくなった「親」を、宣言から外れたものとして扱わない。
+///
+/// 対象そのものではなくその上のディレクトリが読めなくなる場合、対象の
+/// stat は通るので、対象を狭めるテストでは捕まらない。
+#[test]
+fn an_unreadable_ancestor_does_not_prune() {
+    use std::os::unix::fs::PermissionsExt;
+    if euid() == 0 {
+        return;
+    }
+    let r = Repo::new("unreadable-ancestor");
+    r.manifest("[link]\ncommon = [\"conf/nvim\"]\n");
+    r.write("conf/nvim/init.lua", "-- x\n");
+    ok(&r.run(&["apply"]));
+
+    std::fs::set_permissions(r.root_path("conf"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = r.run(&["apply"]);
+    std::fs::set_permissions(r.root_path("conf"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        !out.status.success(),
+        "an unreadable ancestor should be an error, not a prune:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        std::fs::symlink_metadata(r.home_path("conf/nvim/init.lua")).is_ok(),
+        "the link was pruned"
+    );
+}
+
+/// 宣言したモードは、途中のディレクトリが symlink でもリポジトリの外へ
+/// 出ない。最後の 1 要素だけ見ていた頃は素通りしていた。
+#[test]
+fn a_declared_mode_cannot_escape_through_a_symlinked_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::new("mode-symlink-parent");
+    let outside = r.home.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let victim = outside.join("victim");
+    std::fs::write(&victim, "key\n").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    r.manifest("[link]\ncommon = []\n\n[modes]\n\"out/victim\" = \"777\"\n");
+    std::os::unix::fs::symlink(&outside, r.root_path("out")).unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "should refuse to chmod outside the repo"
+    );
+    assert_eq!(mode_of(&victim), 0o600, "the file outside was chmod-ed");
+}
+
+/// コメントアウトした設定を、生きている宣言として読まない。
+#[test]
+fn commented_out_settings_are_not_requirements() {
+    let r = Repo::new("comments");
+    r.manifest("[link]\ncommon = []\n");
+    std::fs::write(r.root_path("packages.toml"), "[packages]\n").unwrap();
+    r.write(
+        ".config/alacritty/alacritty.toml",
+        "[font.normal]\n# family = \"JetBrains Mono\"\nfamily = \"Hack Nerd Font Mono\"\n",
+    );
+    r.write(
+        ".config/zed/settings.json",
+        "{\n  // \"buffer_font_family\": \"Zed Plex Mono\",\n  \"auto_install_extensions\": {\n    // \"html\": true,\n    \"toml\": true,\n  },\n}\n",
+    );
+
+    let out = r.run(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    for phantom in ["JetBrains Mono", "Zed Plex Mono", "html"] {
+        assert!(
+            !text.contains(phantom),
+            "{phantom} came from a comment:\n{text}"
+        );
+    }
+    // 生きている宣言は拾えている
+    assert!(text.contains("Hack Nerd Font Mono"), "{text}");
+    assert!(text.contains("toml"), "{text}");
+}

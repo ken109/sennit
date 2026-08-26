@@ -58,6 +58,7 @@ fn git_config(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     let Some(text) = read(root, ".config/git/config") else {
         return Ok(());
     };
+    let text = without_comments(&text, &["#", ";"]);
     for line in text.lines() {
         let line = line.trim();
         let Some((key, value)) = line.split_once('=') else {
@@ -83,6 +84,7 @@ fn alacritty(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     let Some(text) = read(root, ".config/alacritty/alacritty.toml") else {
         return Ok(());
     };
+    let text = without_comments(&text, &["#"]);
     for cap in find_all(&text, "family = \"") {
         out.push(Requirement {
             kind: Kind::Font,
@@ -98,6 +100,8 @@ fn zed(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     let Some(text) = read(root, ".config/zed/settings.json") else {
         return Ok(());
     };
+    // JSONC。コメントアウトされた設定を生きているものとして読まない
+    let text = without_comments(&text, &["//"]);
     for key in ["\"buffer_font_family\": \"", "\"font_family\": \""] {
         for cap in find_all(&text, key) {
             out.push(Requirement {
@@ -139,6 +143,8 @@ fn zsh(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
+        // コメントアウトした行は走らない。要求として数えない
+        let text = without_comments(&text, &["#"]);
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -362,6 +368,53 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// 行コメントを落とす。引用符の中のものは残す。
+///
+/// 検出器は生の本文を走査するので、コメントアウトした設定も生きている
+/// 宣言として読んでしまう。`// "buffer_font_family": "Zed Plex Mono"` の
+/// 1 行で、使っていないフォントが要求として出て check が落ちる。
+/// check は CI の関門なので、直そうとすると使っていないパッケージを
+/// 宣言することになる。
+fn without_comments(text: &str, markers: &[&str]) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut cut = line.len();
+        let mut in_string = false;
+        let bytes: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == '\\' && in_string {
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                i += 1;
+                continue;
+            }
+            // 行頭か空白の直後だけをコメントの始まりとみなす。無条件に切ると
+            // `${#arr}` や `https://` まで巻き込み、生きている宣言を落とす。
+            let at_start = i == 0 || bytes[i - 1].is_whitespace();
+            if !in_string && at_start {
+                let rest: String = bytes[i..].iter().collect();
+                if markers.iter().any(|m| rest.starts_with(*m)) {
+                    cut = line
+                        .char_indices()
+                        .nth(i)
+                        .map(|(b, _)| b)
+                        .unwrap_or(line.len());
+                    break;
+                }
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
 }
 
 /// prefix に続く、閉じ記号までの文字列をすべて拾う小さなヘルパ。

@@ -46,8 +46,17 @@ impl Plan {
 
         for target in manifest.targets() {
             let abs = root.join(target);
-            if !abs.exists() {
-                continue;
+            // exists() は EACCES も「無い」と答える。読めなくなっただけの
+            // ディレクトリを宣言から外れたものとして扱うと、その下のリンクが
+            // すべて stale になり $HOME から消える。無いのか読めないのかを
+            // 区別する — WalkDir の側と同じ理由。
+            match std::fs::metadata(&abs) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| format!("failed to read {}", abs.display()))
+                }
             }
 
             if abs.is_file() {
