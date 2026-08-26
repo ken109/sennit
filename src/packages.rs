@@ -35,6 +35,8 @@ pub enum Manager {
     Brew,
     BrewCask,
     Mise,
+    Apt,
+    Yay,
     ZedExtension,
     /// sennit は導入に関与しない
     None,
@@ -46,6 +48,8 @@ impl Manager {
             None | Some("brew") => Manager::Brew,
             Some("brew-cask") => Manager::BrewCask,
             Some("mise") => Manager::Mise,
+            Some("apt") => Manager::Apt,
+            Some("yay") => Manager::Yay,
             // Zed 拡張は settings.json の auto_install_extensions が入れる
             Some("zed-extension") => Manager::ZedExtension,
             _ => Manager::None,
@@ -69,6 +73,12 @@ pub struct Package {
     pub optional: bool,
     #[serde(default)]
     pub manager: Option<String>,
+    /// Debian 系での パッケージ名。指定があると Linux では apt を使う
+    #[serde(default)]
+    pub apt: Option<String>,
+    /// Arch 系での パッケージ名。指定があると Linux では yay を使う
+    #[serde(default)]
+    pub yay: Option<String>,
 }
 
 /// sync が実際に導入するパッケージ 1 件。
@@ -85,23 +95,26 @@ pub struct Ignore {
 }
 
 impl Packages {
-    /// 現在の OS で sync の対象になるパッケージを manager 別に返す。
+    /// 現在の OS で sync の対象になるパッケージを返す。
     /// optional なものは自動導入しない。
+    ///
+    /// Linux では apt / yay の宣言があればそちらを優先する。パッケージ名が
+    /// ディストリで違う(libyaml -> libyaml-dev)場合があるため、名前も
+    /// そこで差し替える。どちらの宣言も無ければ既定の manager を使う
+    /// (linuxbrew は Linux でも動くため)。
     pub fn installable(&self) -> Vec<Installable> {
-        let current_os = if cfg!(target_os = "macos") {
-            "darwin"
+        let linux_pm = if cfg!(target_os = "macos") {
+            None
         } else {
-            "linux"
+            detect_linux_pm()
         };
+
         let mut out: Vec<Installable> = self
             .packages
             .iter()
             .filter(|(_, p)| !p.optional)
-            .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os))
-            .map(|(name, p)| Installable {
-                name: name.clone(),
-                manager: Manager::parse(p.manager.as_deref()),
-            })
+            .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
+            .filter_map(|(name, p)| resolve(name, p, linux_pm))
             .filter(|i| !matches!(i.manager, Manager::None | Manager::ZedExtension))
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -144,6 +157,66 @@ impl Packages {
         }
         out
     }
+}
+
+pub fn current_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    }
+}
+
+/// この Linux で使えるパッケージマネージャを 1 つ選ぶ。
+/// 両方あることは通常無いが、あれば yay を優先する(Arch 系とみなす)。
+fn detect_linux_pm() -> Option<Manager> {
+    for (bin, m) in [("yay", Manager::Yay), ("apt-get", Manager::Apt)] {
+        if which(bin) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|d| {
+                let p = d.join(bin);
+                p.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 1 パッケージについて、この環境で使うマネージャと名前を決める。
+fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Installable> {
+    if let Some(pm) = linux_pm {
+        let distro_name = match pm {
+            Manager::Apt => pkg.apt.as_deref(),
+            Manager::Yay => pkg.yay.as_deref(),
+            _ => None,
+        };
+        if let Some(n) = distro_name {
+            return Some(Installable {
+                name: n.to_string(),
+                manager: pm,
+            });
+        }
+        // apt / yay の宣言が無く、既定が cask なら Linux では入れられない
+        if Manager::parse(pkg.manager.as_deref()) == Manager::BrewCask && !is_font(pkg) {
+            return None;
+        }
+    }
+    Some(Installable {
+        name: name.to_string(),
+        manager: Manager::parse(pkg.manager.as_deref()),
+    })
+}
+
+/// フォントの cask は Linux でも動く(supports_linux? な cask)。
+fn is_font(pkg: &Package) -> bool {
+    pkg.kind.as_deref() == Some("font")
 }
 
 #[cfg(test)]
@@ -198,6 +271,61 @@ mod tests {
         let p =
             parse("[packages.tokyo-night]\nmanager = \"zed-extension\"\nkind = \"extension\"\n");
         assert!(p.installable().is_empty());
+    }
+
+    fn pkg(src: &str) -> Package {
+        toml::from_str(src).unwrap()
+    }
+
+    /// Linux で apt の宣言があれば、マネージャも名前もそちらを使う。
+    /// libyaml -> libyaml-dev のようにディストリで名前が違うため。
+    #[test]
+    fn apt_declaration_overrides_manager_and_name_on_linux() {
+        let p = pkg("apt = \"libyaml-dev\"\nyay = \"libyaml\"\n");
+        let r = resolve("libyaml", &p, Some(Manager::Apt)).unwrap();
+        assert_eq!(r.manager, Manager::Apt);
+        assert_eq!(r.name, "libyaml-dev");
+    }
+
+    #[test]
+    fn yay_declaration_is_used_on_arch() {
+        let p = pkg("apt = \"build-essential\"\nyay = \"base-devel\"\n");
+        let r = resolve("build-essential", &p, Some(Manager::Yay)).unwrap();
+        assert_eq!(r.manager, Manager::Yay);
+        assert_eq!(r.name, "base-devel");
+    }
+
+    /// 宣言が無ければ既定のマネージャのまま。linuxbrew は Linux でも動く。
+    #[test]
+    fn falls_back_to_default_manager_when_no_distro_name() {
+        let p = pkg("");
+        let r = resolve("bat", &p, Some(Manager::Apt)).unwrap();
+        assert_eq!(r.manager, Manager::Brew);
+        assert_eq!(r.name, "bat");
+    }
+
+    /// cask は Linux では入れられないので対象から外す。
+    #[test]
+    fn casks_are_skipped_on_linux() {
+        let p = pkg("manager = \"brew-cask\"\n");
+        assert!(resolve("alacritty", &p, Some(Manager::Apt)).is_none());
+    }
+
+    /// ただしフォントの cask は Linux でも入る。
+    #[test]
+    fn font_casks_still_apply_on_linux() {
+        let p = pkg("manager = \"brew-cask\"\nkind = \"font\"\n");
+        let r = resolve("font-cica", &p, Some(Manager::Apt)).unwrap();
+        assert_eq!(r.manager, Manager::BrewCask);
+    }
+
+    /// macOS では apt / yay の宣言があっても無視する。
+    #[test]
+    fn distro_names_are_ignored_on_macos() {
+        let p = pkg("apt = \"libyaml-dev\"\n");
+        let r = resolve("libyaml", &p, None).unwrap();
+        assert_eq!(r.manager, Manager::Brew);
+        assert_eq!(r.name, "libyaml");
     }
 
     #[test]

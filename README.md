@@ -151,17 +151,34 @@ sennit sync
 ```
 
 It asks each manager what is already installed and only installs the difference, so
-idempotency does not depend on the manager's own behaviour. Supported managers are
-Homebrew (`brew`, `brew-cask`) and `mise`. Entries marked `optional`, or restricted to
-another OS via `os = ["darwin"]`, are skipped. Editor extensions are declared so that
-`check` knows about them, but are installed by the editor itself.
+idempotency does not depend on the manager's own behaviour.
 
-`sync` does not replace your bootstrap script. Installing the OS-level packages that
-Homebrew itself needs is still a job for shell.
+| manager | |
+|---|---|
+| `brew` | default; works on Linux too via Homebrew on Linux |
+| `brew-cask` | macOS only, except font casks which install on Linux as well |
+| `mise` | runtimes |
+| `apt` / `yay` | Linux; selected automatically from what the machine has |
+
+Package names differ between distributions, so declare them where they do:
+
+```toml
+[packages.libyaml]
+apt = "libyaml-dev"      # on Debian-like systems, use apt with this name
+yay = "libyaml"          # on Arch-like systems, use yay with this name
+```
+
+On Linux, an `apt` or `yay` entry decides both the manager and the name. Without one,
+the default `manager` is used. Entries marked `optional`, or restricted to another OS via
+`os = ["darwin"]`, are skipped. Editor extensions are declared so that `check` knows about
+them, but are installed by the editor itself.
+
+`sync` does not replace your bootstrap script: something still has to install Homebrew,
+or `sudo`, before sennit can run at all.
 
 ## Status
 
-v0.2. Minimum supported Rust version is 1.90.
+v0.3. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

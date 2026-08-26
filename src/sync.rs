@@ -13,7 +13,13 @@ pub fn sync(root: &Path, dry_run: bool) -> Result<()> {
     let wanted = packages.installable();
 
     let mut planned = 0usize;
-    for manager in [Manager::Brew, Manager::BrewCask, Manager::Mise] {
+    for manager in [
+        Manager::Brew,
+        Manager::BrewCask,
+        Manager::Mise,
+        Manager::Apt,
+        Manager::Yay,
+    ] {
         let names: Vec<&Installable> = wanted.iter().filter(|i| i.manager == manager).collect();
         if names.is_empty() {
             continue;
@@ -58,6 +64,8 @@ fn label(m: Manager) -> &'static str {
         Manager::Brew => "brew",
         Manager::BrewCask => "brew --cask",
         Manager::Mise => "mise",
+        Manager::Apt => "apt",
+        Manager::Yay => "yay",
         Manager::ZedExtension => "zed",
         Manager::None => "-",
     }
@@ -70,6 +78,12 @@ fn list_installed(manager: Manager) -> Result<BTreeSet<String>> {
         Manager::Brew => ("brew", &["list", "--formula", "-1"]),
         Manager::BrewCask => ("brew", &["list", "--cask", "-1"]),
         Manager::Mise => ("mise", &["ls", "--installed", "--no-header"]),
+        // dpkg-query は導入済みのみを ok として出す
+        Manager::Apt => (
+            "dpkg-query",
+            &["-W", "-f=${binary:Package} ${db:Status-Status}\n"],
+        ),
+        Manager::Yay => ("pacman", &["-Qq"]),
         _ => return Ok(BTreeSet::new()),
     };
 
@@ -85,11 +99,22 @@ fn list_installed(manager: Manager) -> Result<BTreeSet<String>> {
         );
     }
 
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .map(|s| s.to_string())
-        .collect())
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(match manager {
+        // dpkg は削除済みのパッケージも列挙するので installed だけ拾う。
+        // アーキ修飾(pkg:amd64)も落とす。
+        Manager::Apt => text
+            .lines()
+            .filter(|l| l.ends_with(" installed"))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|n| n.split(':').next().unwrap_or(n).to_string())
+            .collect(),
+        _ => text
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|s| s.to_string())
+            .collect(),
+    })
 }
 
 fn install(manager: Manager, names: &[&str]) -> Result<()> {
@@ -97,6 +122,8 @@ fn install(manager: Manager, names: &[&str]) -> Result<()> {
         Manager::Brew => ("brew", &["install"]),
         Manager::BrewCask => ("brew", &["install", "--cask"]),
         Manager::Mise => ("mise", &["use", "-g"]),
+        Manager::Apt => ("sudo", &["apt-get", "install", "-y"]),
+        Manager::Yay => ("yay", &["-S", "--noconfirm"]),
         _ => return Ok(()),
     };
 
