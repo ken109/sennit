@@ -173,6 +173,16 @@ the default `manager` is used. Entries marked `optional`, or restricted to anoth
 `os = ["darwin"]`, are skipped. Editor extensions are declared so that `check` knows about
 them, but are installed by the editor itself.
 
+Managers run in dependency order — `apt`/`yay` first, since distribution packages are what
+Homebrew sits on, then `brew`, `brew-cask`, and `mise` last because `brew` is what installs
+it.
+
+`apt` needs root. sennit works out how to get it before running anything: as root it calls
+`apt-get` directly, otherwise it uses `sudo` when that is passwordless or when there is a
+terminal for `sudo` to prompt on. When neither holds — a script or a container build where
+`sudo` would block on a password nobody can type — it stops with an explanation rather than
+hanging. `yay` is never run through `sudo`, since it refuses to run as root.
+
 `sync` does not replace your bootstrap script: something still has to install Homebrew,
 or `sudo`, before sennit can run at all.
 

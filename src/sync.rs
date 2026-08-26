@@ -121,15 +121,23 @@ fn list_installed(manager: Manager) -> Result<BTreeSet<String>> {
 }
 
 fn install(manager: Manager, names: &[&str]) -> Result<()> {
-    let (bin, base): (&str, &[&str]) = match manager {
-        Manager::Brew => ("brew", &["install"]),
-        Manager::BrewCask => ("brew", &["install", "--cask"]),
-        Manager::Mise => ("mise", &["use", "-g"]),
-        Manager::Apt => ("sudo", &["apt-get", "install", "-y"]),
-        Manager::Yay => ("yay", &["-S", "--noconfirm"]),
-        _ => return Ok(()),
-    };
+    match manager {
+        Manager::Brew => run("brew", &["install"], names),
+        Manager::BrewCask => run("brew", &["install", "--cask"], names),
+        Manager::Mise => run("mise", &["use", "-g"], names),
+        // yay は root で実行すると自分で拒否するので昇格しない
+        Manager::Yay => run("yay", &["-S", "--noconfirm"], names),
+        Manager::Apt => {
+            let esc = Escalation::detect()?;
+            // パッケージ一覧が古いと "Unable to locate package" で落ちる
+            esc.run("apt-get", &["update"], &[])?;
+            esc.run("apt-get", &["install", "-y"], names)
+        }
+        _ => Ok(()),
+    }
+}
 
+fn run(bin: &str, base: &[&str], names: &[&str]) -> Result<()> {
     let status = Command::new(bin)
         .args(base)
         .args(names)
@@ -139,6 +147,89 @@ fn install(manager: Manager, names: &[&str]) -> Result<()> {
         bail!("`{bin} {}` failed", base.join(" "));
     }
     Ok(())
+}
+
+/// root 権限の取り方。apt のようにシステムを触るマネージャで使う。
+///
+/// 素朴に sudo を呼ぶと、パスワードが必要でかつ端末が無い環境
+/// (CI、スクリプト経由、コンテナのビルド中)で止まるか、分かりにくい形で
+/// 失敗する。呼ぶ前に判定して、無理なら理由を添えて落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalation {
+    /// 既に root。sudo を挟まない
+    None,
+    Sudo,
+}
+
+impl Escalation {
+    fn detect() -> Result<Self> {
+        if is_root() {
+            return Ok(Escalation::None);
+        }
+        if !which("sudo") {
+            bail!("apt requires root, but this is not root and sudo is not installed");
+        }
+        // パスワード不要ならそのまま使える
+        if sudo_is_passwordless() {
+            return Ok(Escalation::Sudo);
+        }
+        // 端末があれば sudo が自分で聞けるので任せる
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return Ok(Escalation::Sudo);
+        }
+        bail!(
+            "apt requires root: sudo needs a password and there is no terminal to ask on.\n\
+             Run sennit from a terminal, run it as root, or allow passwordless sudo for apt-get."
+        )
+    }
+
+    /// 実行時に前置するコマンド。root なら何も挟まない。
+    fn prefix(self) -> Option<&'static str> {
+        match self {
+            Escalation::None => None,
+            Escalation::Sudo => Some("sudo"),
+        }
+    }
+
+    fn run(self, bin: &str, base: &[&str], names: &[&str]) -> Result<()> {
+        match self.prefix() {
+            None => run(bin, base, names),
+            Some(prefix) => {
+                let mut args: Vec<&str> = vec![bin];
+                args.extend_from_slice(base);
+                run(prefix, &args, names)
+            }
+        }
+    }
+}
+
+fn is_root() -> bool {
+    // getuid を呼ばずに済ませる。root のときだけ存在が保証される値ではないが、
+    // id -u は POSIX で必ず使える。
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+fn sudo_is_passwordless() -> bool {
+    // 失敗時に sudo が "a password is required" を出すが、ここでは判定に
+    // 使うだけなので利用者には見せない
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -169,5 +260,16 @@ mod tests {
     #[test]
     fn casks_run_after_formulae() {
         assert!(pos(Manager::Brew) < pos(Manager::BrewCask));
+    }
+
+    /// root なら sudo を挟まない。コンテナのビルド中など root で走る場面がある。
+    #[test]
+    fn root_does_not_use_sudo() {
+        assert_eq!(Escalation::None.prefix(), None);
+    }
+
+    #[test]
+    fn non_root_uses_sudo() {
+        assert_eq!(Escalation::Sudo.prefix(), Some("sudo"));
     }
 }
