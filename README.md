@@ -73,10 +73,12 @@ from anywhere inside your repository.
 Directories are linked file by file rather than as a whole, so that a tool writing into
 `~/.config/something/` does not make untracked files appear inside your repository.
 
-`ignore` takes two kinds of pattern: `*.ext` matches by extension, anything else matches a
-path prefix. Declared `[render]` templates and `[encrypted]` ciphertexts are excluded
-whether or not you list them, so forgetting `ignore = ["*.tmpl"]` cannot put an unexpanded
-template in `$HOME`.
+`ignore` takes two kinds of pattern: `*.ext` matches by extension, and anything else is a
+path prefix rooted at the repository — whole components, from the top. `conf/nvim` matches
+`conf/nvim/init.lua` but not `conf/nvim-extra`, and `README.md` matches only a `README.md`
+at the root, not one inside a subdirectory. Declared `[render]` templates and `[encrypted]`
+ciphertexts are excluded whether or not you list them, which is what makes a forgotten
+`ignore = ["*.tmpl"]` harmless.
 
 `packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
 and `sync`; `apply` does not read it. What was linked is recorded in
@@ -128,8 +130,11 @@ failure partway through can strand a file you can no longer find.
 If the same path was moved aside more than once, `rollback` restores the most recent and
 tells you where the older copies are, rather than renaming each over the last. It is
 idempotent: running it twice does not put an older file back over the one it just
-restored. `--no-backup` opts out, and is the only way to lose
-anything; on a directory it removes the whole tree, and says how many files that is.
+restored. And if you wrote something new at that path after the apply, it is moved aside
+too rather than overwritten — restoring a backup should not cost you a different file.
+
+`--no-backup` opts out, and is the only way sennit itself discards a file; on a directory
+it removes the whole tree, and says how many files that is.
 
 It also remembers what it linked. A path that was linked last time and is no longer
 declared gets its symlink removed, so dropping a config from the repository does not leave
@@ -272,7 +277,10 @@ notices. Declare what it should be and `apply` sets it, `verify` checks it:
 ```
 
 A declaration applies to the path it names and nothing else — a directory declaration sets
-the directory's own mode, not the modes of the files inside it. (It used to descend, which
+the directory's own mode, not the modes of the files inside it, and applies whether or not
+anything links that path. A directory mode that would take away your own read or execute
+bit is refused: sennit has to walk that directory on the next run, and a tool that can lock
+itself out of its own repository in one step is not much use. (It used to descend, which
 made `".ssh" = "700"` produce an executable `known_hosts` while leaving the directory
 untouched, so `verify` failed on it forever.) Since files are placed by symlink, the mode
 is set on the copy in your repository, which is the same file your `$HOME` path resolves
@@ -281,8 +289,11 @@ to. Three octal digits; `verify` compares the same three.
 Without a declaration, generated output is read-only — 0444, or 0400 when it holds a
 secret, since the default umask would otherwise publish it. Generated files are created
 with that mode rather than chmod-ed afterwards, so a token never sits in a 0644 file even
-briefly. A mode that is not valid octal is refused when the manifest loads: a restriction
-that silently does not apply is worse than one that fails loudly.
+briefly. A mode must be exactly three octal digits — `"60"` would otherwise be read as
+`0060`, quietly producing a file its owner cannot read — and anything else is refused when
+the manifest loads: a restriction that silently does not apply is worse than one that
+fails loudly. `verify` reports a declared path it could not read rather than passing over
+it.
 
 ## Secrets
 
@@ -305,8 +316,8 @@ command = "security find-generic-password -s {} -w"
 
 `{}` becomes the part after `://`, passed as an argument rather than through a shell. With
 nothing declared, `op` is assumed. A reference to an undeclared scheme fails and lists the
-ones that are. `trim = false` keeps the trailing newline, which is otherwise dropped since
-most CLIs add one.
+ones that are, as long as some provider is declared. `trim = false` keeps the trailing
+newline, which is otherwise dropped since most CLIs add one.
 
 Any such reference is read at render time — but only when you ask for it. `apply` skips
 those templates and names the providers they need; `apply --secrets` renders them.
@@ -485,7 +496,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.14. Minimum supported Rust version is 1.90.
+v0.15. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

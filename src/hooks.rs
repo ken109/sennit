@@ -72,14 +72,26 @@ fn collect(path: &Path, root: &Path, out: &mut Vec<(String, u64)>, depth: usize)
     out.push((key, stamp ^ (meta.len() << 20)));
 }
 
+/// run_all の結果。
+///
+/// 指紋だけでは「何かした」が分からない。監視対象の無いフックは毎回走るが
+/// 指紋は動かないので、実際にコマンドを走らせた回に apply が「最新です」と
+/// 出てしまっていた。走った本数も返す。
+#[derive(Debug)]
+pub struct Ran {
+    pub fingerprints: BTreeMap<String, String>,
+    pub count: usize,
+}
+
 /// 変化したフックだけを走らせ、新しい指紋を返す。
 pub fn run_all(
     root: &Path,
     hooks: &BTreeMap<String, Hook>,
     previous: &BTreeMap<String, String>,
     dry_run: bool,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<Ran> {
     let mut next = previous.clone();
+    let mut count = 0usize;
 
     for (name, hook) in hooks {
         let fp = fingerprint(root, &hook.when_changed);
@@ -90,6 +102,7 @@ pub fn run_all(
         }
 
         println!("  {:>8}  {name}", "hook");
+        count += 1;
         if dry_run {
             continue;
         }
@@ -109,7 +122,10 @@ pub fn run_all(
         }
         next.insert(name.clone(), fp);
     }
-    Ok(next)
+    Ok(Ran {
+        fingerprints: next,
+        count,
+    })
 }
 
 #[cfg(test)]
@@ -138,8 +154,8 @@ mod tests {
         let mut seen = BTreeMap::new();
         seen.insert("always".to_string(), fingerprint(&dir, &[]));
 
-        run_all(&dir, &hooks, &seen, false).unwrap();
-        run_all(&dir, &hooks, &seen, false).unwrap();
+        assert_eq!(run_all(&dir, &hooks, &seen, false).unwrap().count, 1);
+        assert_eq!(run_all(&dir, &hooks, &seen, false).unwrap().count, 1);
         let ran = std::fs::read_to_string(dir.join("ran.txt")).unwrap();
         assert_eq!(ran.lines().count(), 2, "{ran:?}");
     }
@@ -163,9 +179,11 @@ mod tests {
         );
 
         let seen = run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap();
+        assert_eq!(seen.count, 1);
         assert!(dir.join("ran.txt").exists());
         // 2 回目は走らない
-        run_all(&dir, &hooks, &seen, false).unwrap();
+        let again = run_all(&dir, &hooks, &seen.fingerprints, false).unwrap();
+        assert_eq!(again.count, 0);
         assert_eq!(
             std::fs::read_to_string(dir.join("ran.txt"))
                 .unwrap()

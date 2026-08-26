@@ -350,7 +350,7 @@ fn render_all(
                 } else {
                     0o444
                 });
-        write_generated(&out_path, rendered.as_bytes(), mode)
+        write_generated(root, &out_path, rendered.as_bytes(), mode)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
     }
@@ -426,7 +426,7 @@ fn decrypt_all(
         }
         // 復号結果も生成物なので読み取り専用。暗号化してあった＝秘密なので 0400
         let mode = manifest.mode_for(Path::new(out_rel)).unwrap_or(0o400);
-        write_generated(&out_path, &plain, mode)
+        write_generated(root, &out_path, &plain, mode)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[35mdecrypted\x1b[0m  {out_rel}");
     }
@@ -460,9 +460,26 @@ fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) -> Result<()> 
 ///
 /// 中身を書く前に最終的なモードで作る。先に書いてから chmod すると、
 /// umask 022 の既定で 0644 のファイルにトークンが入っている瞬間が生まれる。
-fn write_generated(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // 置き場が本当にリポジトリの中か確かめる。symlink_metadata が見るのは
+    // 最後の 1 要素だけで、途中のディレクトリが symlink なら素通りする。
+    // リポジトリに `out -> /somewhere/outside` を 1 つ置くだけで、宣言の
+    // 検査(`..` と絶対パスを断る)を回り込んで外のファイルを潰せてしまう。
+    let parent = path.parent().unwrap_or(root);
+    let real = std::fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve {}", parent.display()))?;
+    let real_root = std::fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve {}", root.display()))?;
+    if !real.starts_with(&real_root) {
+        bail!(
+            "{} resolves to {}, which is outside the repository",
+            path.display(),
+            real.display()
+        );
+    }
 
     // 書き先を確かめてから触る。chmod も open も symlink を辿るので、
     // 「ディレクトリではない」だけ見て進むと、リンクの先にあるディレクトリを
@@ -496,6 +513,69 @@ fn write_generated(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     // 既存ファイルを開いた場合は .mode() が効かないので揃え直す
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
+}
+
+/// 宣言されたモードを揃える。戻り値は直した数。
+///
+/// 宣言されたパスそのものに掛ける。symlink 方式なのでリポジトリ側の実体が
+/// 対象で、$HOME からはそれが見える。ファイルでもディレクトリでも同じ扱いに
+/// する。verify が見るのも同じパスなので、両者が食い違わない。
+///
+/// preview では変えずに、掛けられるかだけ見る。締め出すような宣言を
+/// --dry-run が通してしまうと、preview から始めろという案内が嘘になる。
+fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usize> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixed = 0usize;
+    for rel in manifest.modes.keys() {
+        let want = manifest
+            .mode_for(Path::new(rel))
+            .expect("validated when the manifest loaded");
+        let path = root.join(rel);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            // まだ作られていない生成物。次に作られるときに正しいモードになる
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("failed to stat {}", path.display()))
+            }
+        };
+        // ディレクトリは所有者の読みと実行の両方が要る。read_dir には読みが、
+        // 中のファイルに触るには実行が必要で、どちらを落としても sennit は
+        // 二度とそこを歩けない。しかも自分で掛けたモードなので、次の apply は
+        // その下を「無くなった」と読み、verify はディレクトリ自身しか見ない。
+        if meta.is_dir() && want & 0o500 != 0o500 {
+            bail!(
+                "mode {:o} on the directory `{}` would remove your own access to it",
+                want,
+                rel
+            );
+        }
+        if meta.permissions().mode() & 0o777 == want {
+            continue;
+        }
+        if preview {
+            println!("  {:>8}  {}  ({:o})", "would set", rel, want);
+            fixed += 1;
+            continue;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
+            .with_context(|| format!("failed to set mode on {}", path.display()))?;
+        // 落ちた先を読み直す。要求どおりにならないまま成功を返すと、
+        // 毎回「直した」と言い続けて収束しない。
+        let got = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        if got != want {
+            bail!(
+                "{}: asked for mode {:o} but the filesystem gave {:o}",
+                path.display(),
+                want,
+                got
+            );
+        }
+        println!("  {:>8}  {}  ({:o})", "mode", rel, want);
+        fixed += 1;
+    }
+    Ok(fixed)
 }
 
 fn apply(
@@ -645,6 +725,10 @@ fn apply(
     if dry_run {
         // フックは実際には走らせず、何が走るかだけ出す
         hooks::run_all(root, &manifest.hooks, &previous.hooks, true)?;
+        // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
+        // 締め出すような宣言をここで断らないと、preview だけ通って apply が
+        // 落ちる。README は diff と --dry-run から始めろと書いてある。
+        enforce_modes(root, manifest, true)?;
         println!(
             "\n{} change(s), {} prune(s), nothing written (--dry-run)",
             changes.len() + not_yet.len(),
@@ -653,60 +737,10 @@ fn apply(
         return Ok(());
     }
 
-    // 宣言されたモードを揃える。symlink 方式なのでリポジトリ側の実体に
-    // かける。生成物は render 側で既に揃っているが、ただ張っただけの
-    // ファイルはここでしか直せない。
-    // 宣言されたパスそのものに掛ける。symlink 方式なのでリポジトリ側の
-    // 実体が対象で、$HOME からはそれが見える。ファイルでもディレクトリでも
-    // 同じ扱いにする。verify が見るのも同じパスなので、両者が食い違わない。
-    let mut fixed = 0usize;
-    for rel in manifest.modes.keys() {
-        let want = manifest
-            .mode_for(Path::new(rel))
-            .expect("validated when the manifest loaded");
-        let path = root.join(rel);
-        use std::os::unix::fs::PermissionsExt;
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            // まだ作られていない生成物。次に作られるときに正しいモードになる
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(anyhow::Error::new(err))
-                    .with_context(|| format!("failed to stat {}", path.display()))
-            }
-        };
-        // 5: 所有者の実行ビットを落としたディレクトリは、中へ入れなくなる。
-        // 次の apply はその下を「無くなった」と読んで $HOME のリンクを消し、
-        // verify はディレクトリ自身しか見ないので ok と言う。
-        if meta.is_dir() && want & 0o100 == 0 {
-            bail!(
-                "mode {:o} on the directory `{}` would remove your own access to it",
-                want,
-                rel
-            );
-        }
-        if meta.permissions().mode() & 0o777 == want {
-            continue;
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
-            .with_context(|| format!("failed to set mode on {}", path.display()))?;
-        // 落ちた先を読み直す。要求どおりにならないまま成功を返すと、
-        // 毎回「直した」と言い続けて収束しない。
-        let got = std::fs::metadata(&path)?.permissions().mode() & 0o777;
-        if got != want {
-            bail!(
-                "{}: asked for mode {:o} but the filesystem gave {:o}",
-                path.display(),
-                want,
-                got
-            );
-        }
-        println!("  {:>8}  {}  ({:o})", "mode", rel, want);
-        fixed += 1;
-    }
-
-    // フックより先に記録を書く。フックが落ちると、退避したファイルの
-    // 在り処だけが失われて rollback が効かなくなる。
+    // 張った直後に記録を確定させる。モードもフックもこのあとで落ちうるが、
+    // リンクはもう $HOME に在る。記録しないまま抜けると、次の apply が
+    // それを知らないので prune の対象にもならず、管理から外れたリンクが
+    // 残り続ける。記録が先、後始末はあと。
     state::State {
         links: current.clone(),
         backups: kept.clone(),
@@ -714,9 +748,19 @@ fn apply(
     }
     .save(home)?;
 
+    // 宣言されたモードを揃える。symlink 方式なのでリポジトリ側の実体に
+    // かける。生成物は render 側で既に揃っているが、ただ張っただけの
+    // ファイルはここでしか直せない。
+    let fixed = enforce_modes(root, manifest, false)?;
+
     // 配置のあとにフックを走らせる。設定を置いてから取り込む処理なので、
     // 順序が逆だと参照先がまだ無い。
-    let hooks = hooks::run_all(root, &manifest.hooks, &previous.hooks, false)?;
+    //
+    // 監視対象の無いフックは毎回走るので指紋が動かない。指紋の比較だけでは
+    // 「何かした」を取りこぼし、実際にコマンドを走らせた回に「最新です」と
+    // 出てしまう。走った本数を見る。
+    let ran = hooks::run_all(root, &manifest.hooks, &previous.hooks, false)?;
+    let hooks = ran.fingerprints;
 
     // 記録は毎回書く。「変更なし」で書かずに抜けると、手で張られた環境や
     // state を消した環境で links が空のままになり、prune が永久に効かない。
@@ -727,7 +771,7 @@ fn apply(
     }
     .save(home)?;
 
-    if changes.is_empty() && pruned == 0 && fixed == 0 && hooks == previous.hooks {
+    if changes.is_empty() && pruned == 0 && fixed == 0 && ran.count == 0 {
         if not_yet.is_empty() {
             println!("already up to date ({} links)", plan.entries.len());
         } else {
@@ -791,11 +835,22 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
             println!("            the backup is gone; skipped");
             continue;
         }
-        // 張った symlink を外してから書き戻す
-        if let Ok(meta) = std::fs::symlink_metadata(&b.dest) {
-            if meta.file_type().is_symlink() {
+        // 張った symlink を外してから書き戻す。
+        //
+        // symlink でない実体が居る場合は、apply の後に利用者が書いたもの。
+        // その上に rename すると黙って消える。退避を戻すコマンドが、
+        // 戻す先にあったものを失わせるのでは意味が無いので、そちらも退ける。
+        match std::fs::symlink_metadata(&b.dest) {
+            Ok(meta) if meta.file_type().is_symlink() => {
                 std::fs::remove_file(&b.dest)?;
             }
+            Ok(_) => {
+                let aside = backup_path(&b.dest)?;
+                std::fs::rename(&b.dest, &aside)
+                    .with_context(|| format!("failed to move {} aside", b.dest.display()))?;
+                println!("            what was there is now at {}", aside.display());
+            }
+            Err(_) => {}
         }
         std::fs::rename(&b.kept_at, &b.dest)
             .with_context(|| format!("failed to restore {}", b.dest.display()))?;
@@ -1068,7 +1123,7 @@ mod tests {
     fn a_generated_file_is_created_with_its_final_mode() {
         let d = scratch("write-generated");
         let p = d.join("out.conf");
-        write_generated(&p, b"token", 0o400).unwrap();
+        write_generated(&d, &p, b"token", 0o400).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o400
@@ -1080,9 +1135,9 @@ mod tests {
     fn a_read_only_generated_file_can_still_be_rewritten() {
         let d = scratch("write-generated-again");
         let p = d.join("out.conf");
-        write_generated(&p, b"one", 0o444).unwrap();
+        write_generated(&d, &p, b"one", 0o444).unwrap();
         // 読み取り専用にしたものを次の render が書き直せないと詰む
-        write_generated(&p, b"two", 0o444).unwrap();
+        write_generated(&d, &p, b"two", 0o444).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "two");
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,

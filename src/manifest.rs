@@ -120,6 +120,12 @@ impl Manifest {
         for (path, mode) in &self.modes {
             let m = u32::from_str_radix(mode, 8)
                 .with_context(|| format!("mode `{mode}` for `{path}` is not octal"))?;
+            // 3 桁ちょうど。`"60"` は 0o060 と読まれ、所有者から権限を
+            // 落としたモードが意図せず掛かる。`"0600"` のような 4 桁も、
+            // setuid ビットを含む書き方と紛れるので断る。
+            if mode.len() != 3 {
+                bail!("mode `{mode}` for `{path}` must be exactly three octal digits");
+            }
             // 許可ビットだけ。setuid / setgid は dotfiles の用途に無く、
             // 受け付けると verify が見る 0o777 と食い違って収束しなくなる。
             if m > 0o777 {
@@ -315,11 +321,21 @@ mod tests {
         assert_eq!(m.mode_for(Path::new(".ssh/known_hosts")), None);
     }
 
+    /// 3 桁ちょうどでなければ断る。
+    ///
+    /// `"60"` は 0o060 と読まれ、所有者が読めないファイルが黙って出来る。
+    /// 4 桁は verify が見る 0o777 と食い違って収束しない。
     #[test]
-    fn four_digit_modes_are_rejected() {
-        // verify が見るのは 0o777 なので、受け取ると永久に食い違う
-        let e = load("[link]\ncommon = []\n\n[modes]\n\"bin/tool\" = \"2755\"\n").unwrap_err();
-        assert!(format!("{e:#}").contains("out of range"), "{e:#}");
+    fn a_mode_must_be_three_octal_digits() {
+        for bad in ["2755", "0600", "60", "6"] {
+            let toml = format!("[link]\ncommon = []\n\n[modes]\n\"bin/tool\" = \"{bad}\"\n");
+            let e = load(&toml).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("three octal digits"),
+                "{bad}: {e:#}"
+            );
+        }
+        assert!(load("[link]\ncommon = []\n\n[modes]\n\"bin/tool\" = \"755\"\n").is_ok());
     }
 
     #[test]

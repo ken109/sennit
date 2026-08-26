@@ -600,3 +600,373 @@ fn a_directory_mode_that_locks_you_out_is_refused() {
         0o600
     );
 }
+
+/// rollback は、戻す先に居るファイルを潰さない。
+///
+/// apply のあとに利用者がそこへ書いたものは、退避の記録には無い。
+/// その上に rename すると、退避を戻すコマンドが別のファイルを消す。
+#[test]
+fn rollback_does_not_destroy_what_is_at_the_destination() {
+    let r = Repo::new("rollback-dest");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write_home("a.conf", "ORIGINAL\n");
+    ok(&r.run(&["apply"]));
+
+    // 利用者がリンクを外して自分で書いた
+    std::fs::remove_file(r.home_path("a.conf")).unwrap();
+    r.write_home("a.conf", "NEW WORK\n");
+
+    ok(&r.run(&["rollback"]));
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
+        "ORIGINAL\n"
+    );
+    let bodies: Vec<String> = std::fs::read_dir(&r.home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b == "NEW WORK\n"),
+        "what was at the destination was destroyed: {bodies:?}"
+    );
+}
+
+/// 退避を取った直後に落ちても、記録は残っている。
+#[test]
+fn a_backup_is_recorded_before_anything_else_can_fail() {
+    let r = Repo::new("backup-early");
+    // a.conf は退避され、そのあと zz/b.conf の配置が失敗する
+    r.manifest("[link]\ncommon = [\"a.conf\", \"zz\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write("zz/b.conf", "b\n");
+    r.write_home("a.conf", "MINE\n");
+    // $HOME/zz を実体のファイルにしておくと、その下に作れない
+    r.write_home("zz", "not a directory\n");
+
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success(), "apply should have failed");
+
+    ok(&r.run(&["rollback"]));
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
+        "MINE\n"
+    );
+}
+
+/// 生成物の書き先がディレクトリなら、権限を触る前に断る。
+#[test]
+fn a_generated_output_is_not_written_over_a_directory() {
+    let r = Repo::new("dir-output");
+    r.manifest(
+        r#"
+[link]
+common = ["gen.conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"gen.conf" = "gen.conf.tmpl"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("gen.conf.tmpl", "x = {{ bg }}\n");
+    std::fs::create_dir_all(r.root_path("gen.conf")).unwrap();
+    std::fs::write(r.root_path("gen.conf/inner"), "inner\n").unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    // 中身が読めなくなっていない
+    assert_eq!(
+        mode_of(&r.root_path("gen.conf")) & 0o700,
+        0o700,
+        "the directory was chmod-ed before the refusal"
+    );
+    assert!(r.root_path("gen.conf/inner").exists());
+}
+
+/// --no-backup は apply 経由でも、退避せずに消す。
+#[test]
+fn no_backup_replaces_without_keeping_a_copy() {
+    let r = Repo::new("no-backup-apply");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write_home("a.conf", "MINE\n");
+
+    let out = ok(&r.run(&["apply", "--no-backup"]));
+    assert!(out.contains("replace"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
+        "repo\n"
+    );
+    let out = ok(&r.run(&["rollback"]));
+    assert!(out.contains("nothing to roll back"), "{out}");
+}
+
+/// 宣言したモードが違えば verify が落ちる。
+#[test]
+fn verify_fails_on_a_wrong_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::new("verify-mode");
+    r.manifest("[link]\ncommon = [\".npmrc\"]\n\n[modes]\n\".npmrc\" = \"600\"\n");
+    r.write(".npmrc", "token\n");
+    ok(&r.run(&["apply"]));
+
+    std::fs::set_permissions(
+        r.root_path(".npmrc"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success(), "verify should fail on a wrong mode");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("declared 600"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// 暗号文を復号して置く。鍵が無ければ保留する。
+#[test]
+fn an_encrypted_file_is_decrypted_and_kept_private() {
+    let r = Repo::new("encrypted");
+    r.write("secret.age", "PLAINTEXT\n");
+    // 復号コマンドは中身をそのまま出すだけのもので代用する
+    r.manifest(
+        r#"
+[link]
+common = ["secret"]
+ignore = ["*.age"]
+
+[encrypted]
+"secret" = "secret.age"
+
+[encryption]
+command = "cat {}"
+"#,
+    );
+
+    ok(&r.run(&["apply"]));
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("secret")).unwrap(),
+        "PLAINTEXT\n"
+    );
+    assert_eq!(mode_of(&r.root_path("secret")), 0o400);
+}
+
+/// 鍵が宣言されていて存在しないなら、失敗ではなく保留。
+#[test]
+fn an_encrypted_file_is_deferred_without_its_key() {
+    let r = Repo::new("encrypted-nokey");
+    r.write("secret.age", "PLAINTEXT\n");
+    r.manifest(
+        r#"
+[link]
+common = ["secret"]
+ignore = ["*.age"]
+
+[encrypted]
+"secret" = "secret.age"
+
+[encryption]
+command = "cat {}"
+identity = "/nonexistent/key.txt"
+"#,
+    );
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("no decryption key"), "{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("secret")).is_err());
+}
+
+/// --secrets を渡すとプロバイダが呼ばれ、結果は本人だけが読める。
+#[test]
+fn a_secret_is_fetched_with_secrets_and_written_private() {
+    let r = Repo::new("secrets");
+    r.manifest(
+        r#"
+[link]
+common = ["conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"conf" = "conf.tmpl"
+
+[providers.fake]
+command = "echo {}"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("conf.tmpl", "token = {{ fake://hello }}\n");
+
+    ok(&r.run(&["apply", "--secrets"]));
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("conf")).unwrap(),
+        "token = hello\n"
+    );
+    assert_eq!(mode_of(&r.root_path("conf")), 0o400);
+}
+
+/// 宣言の無い scheme は、名指しで断る。
+#[test]
+fn an_undeclared_scheme_is_named() {
+    let r = Repo::new("unknown-scheme");
+    r.manifest(
+        r#"
+[link]
+common = ["conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"conf" = "conf.tmpl"
+
+[providers.fake]
+command = "echo {}"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("conf.tmpl", "token = {{ nosuch://x }}\n");
+
+    let out = r.run(&["apply", "--secrets"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nosuch"), "{err}");
+    assert!(err.contains("fake"), "{err}");
+}
+
+/// フックが実際に走った回は「最新です」と言わない。
+#[test]
+fn apply_does_not_claim_nothing_happened_after_running_a_hook() {
+    let r = Repo::new("hook-ran");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n\n[hooks.always]\nrun = \"true\"\n");
+    r.write("a.conf", "repo\n");
+    ok(&r.run(&["apply"]));
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("hook"), "{out}");
+    assert!(
+        !out.contains("already up to date"),
+        "a hook ran, so something happened:\n{out}"
+    );
+}
+
+/// 締め出すモードは preview の時点で断る。
+#[test]
+fn dry_run_refuses_a_directory_mode_that_locks_you_out() {
+    let r = Repo::new("dry-run-dir-mode");
+    r.manifest("[link]\ncommon = [\".ssh\"]\n\n[modes]\n\".ssh\" = \"600\"\n");
+    r.write(".ssh/config", "Host x\n");
+
+    let out = r.run(&["apply", "--dry-run"]);
+    assert!(
+        !out.status.success(),
+        "the preview should refuse what the real apply refuses"
+    );
+}
+
+/// 途中のディレクトリが symlink でも、リポジトリの外へは書かない。
+///
+/// symlink_metadata が見るのは最後の 1 要素だけ。`out -> /outside` を
+/// 置くだけで、宣言の検査を回り込んで外のファイルを潰せていた。
+#[test]
+fn a_generated_output_cannot_escape_through_a_symlinked_parent() {
+    let r = Repo::new("symlink-parent");
+    let outside = r.home.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("gen.conf"), "PRECIOUS\n").unwrap();
+
+    r.manifest(
+        r#"
+[link]
+common = ["out"]
+ignore = ["*.tmpl"]
+
+[render]
+"out/gen.conf" = "gen.conf.tmpl"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("gen.conf.tmpl", "x = {{ bg }}\n");
+    std::os::unix::fs::symlink(&outside, r.root_path("out")).unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "writing outside the repo should fail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("gen.conf")).unwrap(),
+        "PRECIOUS\n"
+    );
+}
+
+/// ディレクトリから所有者の読みを落とすモードも断る。
+#[test]
+fn a_directory_mode_without_read_is_refused() {
+    let r = Repo::new("dir-mode-read");
+    r.manifest("[link]\ncommon = [\".ssh\"]\n\n[modes]\n\".ssh\" = \"300\"\n");
+    r.write(".ssh/config", "Host x\n");
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "300 on a directory should be refused"
+    );
+    // 掛かっていない
+    assert_ne!(mode_of(&r.root_path(".ssh")) & 0o500, 0);
+}
+
+/// モードで落ちても、張ったリンクは記録に残る。
+///
+/// 記録が無いと、次の apply はそのリンクを知らないので prune もできず、
+/// 宣言から外しても $HOME に残り続ける。
+#[test]
+fn links_are_recorded_even_if_a_later_step_fails() {
+    let r = Repo::new("record-before-modes");
+    r.manifest("[link]\ncommon = [\"a.conf\", \".ssh\"]\n\n[modes]\n\".ssh\" = \"600\"\n");
+    r.write("a.conf", "repo\n");
+    r.write(".ssh/config", "Host x\n");
+
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
+
+    // 宣言から外せば prune できる = 記録されていた
+    r.manifest("[link]\ncommon = []\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("prune"), "the link was never recorded:\n{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_err());
+}
+
+/// 読めない宣言パスを verify が「問題なし」と言わない。
+///
+/// apply は同じ宣言について「stat できない」で落ちる。片方が拒み、
+/// 片方が承認するなら、宣言した制限は誰にも適用されないまま通る。
+#[test]
+fn verify_does_not_approve_a_mode_it_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+    if euid() == 0 {
+        return;
+    }
+    let r = Repo::new("verify-unreadable");
+    r.manifest("[link]\ncommon = []\n\n[modes]\n\"scripts/tool\" = \"600\"\n");
+    r.write("scripts/tool", "#!/bin/sh\n");
+
+    std::fs::set_permissions(
+        r.root_path("scripts"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let out = r.run(&["verify"]);
+    std::fs::set_permissions(
+        r.root_path("scripts"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "verify approved a mode it could not read:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
