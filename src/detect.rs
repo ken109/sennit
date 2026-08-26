@@ -172,8 +172,10 @@ fn zsh(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
 /// テンプレートに書いた瞬間に op への依存が生まれるが、それはどの設定
 /// ファイルにも現れない。宣言し忘れると、秘密を使うマシンでだけ失敗する。
 fn secret_templates(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
+    // テンプレートは .config の外にも置ける(.npmrc.tmpl)。リポジトリ全体から
+    // 拡張子で拾う。
     let mut files = Vec::new();
-    walk(&root.join(".config"), &mut files, 0);
+    walk(root, &mut files, 0);
 
     for path in files {
         if path.extension().is_none_or(|e| e != "tmpl") {
@@ -252,7 +254,7 @@ fn annotations(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
 }
 
 fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
-    if depth > 5 {
+    if depth > 6 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -260,6 +262,11 @@ fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
     };
     for e in entries.filter_map(|e| e.ok()) {
         let p = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == "target" || name == "node_modules" {
+            continue;
+        }
         if p.is_dir() {
             walk(&p, out, depth + 1);
         } else {
