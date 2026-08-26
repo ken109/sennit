@@ -91,6 +91,28 @@ pub fn needs_secrets(template: &str) -> bool {
     false
 }
 
+/// このテンプレートが参照している秘密のスキーム。重複は畳む。
+///
+/// 保留したときに「何が要るのか」を出すために使う。プロバイダは宣言で
+/// 足せるので、名前を決め打ちにはできない。
+pub fn schemes_used(template: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = template;
+    while let Some(i) = rest.find("{{") {
+        let after = &rest[i + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        if let Some((scheme, _)) = split_reference(after[..end].trim()) {
+            if !out.iter().any(|s| s == scheme) {
+                out.push(scheme.to_string());
+            }
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
 /// `{{ key }}` を差し替えるだけの最小のテンプレート展開。
 ///
 /// 汎用テンプレートエンジンを入れないのは、条件分岐やループを持ち込むと
@@ -262,7 +284,15 @@ fn strip_conditionals(
         }
 
         if let Some(cond) = directive.strip_prefix("if ") {
-            stack.push(evaluate(cond.trim(), vars, source)?);
+            // 落とす側にある条件は評価しない。OS で括った中にその OS でしか
+            // 存在しない変数を書く、というのが分岐の主用途で、そこを評価すると
+            // 反対の OS で必ず落ちる。消える文は読まない。
+            let value = if keeping {
+                evaluate(cond.trim(), vars, source)?
+            } else {
+                false
+            };
+            stack.push(value);
             trim_line(&out, after, &mut rest);
             continue;
         }
@@ -327,6 +357,10 @@ fn resolve(token: &str, vars: &BTreeMap<String, String>, source: &str) -> Result
     }
     match vars.get(token) {
         Some(v) => Ok(v.clone()),
+        // 環境変数は「設定されていない」が正常な状態で、それを表す値が空文字。
+        // 未設定を誤りにすると `{{ if env.WORK_LAPTOP }}` が、常に設定されて
+        // いる変数にしか書けなくなり、条件として使い物にならない。
+        None if token.starts_with("env.") => Ok(String::new()),
         None => bail!("{source}: unknown variable `{token}` in a condition"),
     }
 }
@@ -382,6 +416,67 @@ mod tests {
         v.insert("ui.bg".into(), "#1a1b26".into());
         v.insert("normal.red".into(), "#f7768e".into());
         v
+    }
+
+    /// 分岐の主用途は「その OS にしかない設定を括る」。落とす側を評価すると、
+    /// 反対の OS で必ず落ちる。
+    #[test]
+    fn a_condition_in_a_dropped_branch_is_not_evaluated() {
+        let mut v = vars();
+        v.insert("sennit.os".into(), "darwin".into());
+        let out = expand_with_test(
+            "{{ if sennit.os == \"linux\" }}{{ if linux.only.thing }}x = 1\n{{ end }}{{ end }}ok\n",
+            &v,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn a_dropped_branch_may_hold_a_variable_that_does_not_exist() {
+        let mut v = vars();
+        v.insert("sennit.os".into(), "darwin".into());
+        let out = expand_with_test(
+            "{{ if sennit.os == \"linux\" }}x = {{ linux.only.thing }}\n{{ end }}ok\n",
+            &v,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(out, "ok\n");
+    }
+
+    /// 未設定は環境変数の正常な状態で、それを表す値が空文字。誤りにすると
+    /// 常に設定されている変数にしか条件が書けない。
+    #[test]
+    fn an_unset_environment_variable_is_false_in_a_condition() {
+        let out = expand_with_test(
+            "{{ if env.SENNIT_NO_SUCH_VAR }}yes\n{{ else }}no\n{{ end }}",
+            &vars(),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(out, "no\n");
+    }
+
+    #[test]
+    fn an_unset_environment_variable_compares_as_empty() {
+        let out = expand_with_test(
+            "{{ if env.SENNIT_NO_SUCH_VAR == \"\" }}unset\n{{ end }}",
+            &vars(),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(out, "unset\n");
+    }
+
+    #[test]
+    fn schemes_used_lists_each_provider_once() {
+        assert_eq!(
+            schemes_used("{{ op://a/b }}{{ op://c/d }}{{ pass://e }}{{ ui.bg }}"),
+            vec!["op".to_string(), "pass".to_string()]
+        );
+        assert!(schemes_used("{{ ui.bg }}").is_empty());
     }
 
     #[test]
