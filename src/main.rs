@@ -139,6 +139,27 @@ fn check(root: &Path) -> Result<()> {
         provided.len()
     );
 
+    // 逆方向: 宣言してあるのに、どの設定も参照していないもの。
+    // 使わなくなった設定を消したときにパッケージだけ残る、というドリフトを拾う。
+    // コマンドは設定に現れないまま日常的に使うもの(bat, fd, rg)が多いので、
+    // 参照されることが前提のフォントと拡張だけを対象にする。
+    let required_names: std::collections::HashSet<_> =
+        required.iter().map(|r| (r.kind, r.name.clone())).collect();
+    let mut unused: Vec<_> = provided
+        .keys()
+        .filter(|(k, _)| matches!(k, packages::Kind::Font | packages::Kind::Extension))
+        .filter(|key| !required_names.contains(*key))
+        .collect();
+    unused.sort();
+
+    for (kind, name) in &unused {
+        println!(
+            "\x1b[33munused\x1b[0m      {:<9} {}  (declared, referenced by nothing)",
+            kind.label(),
+            name
+        );
+    }
+
     for o in &optional {
         println!(
             "\x1b[33moptional\x1b[0m    {:<9} {}  (declared, not installed by setup)",

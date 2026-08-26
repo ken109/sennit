@@ -141,6 +141,12 @@ commands = ["brew", "git", "curl"]   # provided by the system or the bootstrap
 Anything you deliberately do not install is declared `optional = true`, so the file records
 what is intentional rather than hiding it in an ignore list.
 
+`check` also looks the other way, at fonts and editor extensions that are declared but
+that nothing references. That is the drift you get when a config stops using something and
+the package stays behind — easy to miss, because everything keeps working. Commands are
+left out of this direction on purpose: plenty of them (`bat`, `fd`, `rg`) are used daily
+from the shell without appearing in any config file.
+
 ## Installing packages
 
 `sync` reads the same `packages.toml` and installs what is missing:
@@ -188,7 +194,7 @@ or `sudo`, before sennit can run at all.
 
 ## Status
 
-v0.3. Minimum supported Rust version is 1.90.
+v0.4. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// 依存の種類。設定ファイルから参照されうる名前空間を分ける。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Command,
     Font,
@@ -145,9 +145,15 @@ impl Packages {
                 Some("extension") => Kind::Extension,
                 _ => Kind::Command,
             };
-            // パッケージ名は常に提供する。provides はそれに加える別名
-            // (neovim が nvim を、nushell が nu を提供するような場合)。
-            out.insert((kind, name.clone()), optional);
+            // パッケージ名も提供名として数える。コマンドは大抵パッケージ名と
+            // 同じ(bat, fd)で、エディタ拡張は ID がそのまま設定に現れる。
+            //
+            // フォントだけは違う。font-cica というパッケージ名は
+            // ファミリ名ではないので、参照名として数えると
+            // 「宣言したが誰も参照していない」の検出が意味を失う。
+            if kind != Kind::Font {
+                out.insert((kind, name.clone()), optional);
+            }
             for p in &pkg.provides {
                 out.insert((kind, p.clone()), optional);
             }
@@ -255,6 +261,27 @@ mod tests {
     fn ignore_list_counts_as_provided() {
         let p = parse("[packages]\n[ignore]\ncommands = [\"brew\"]\n");
         assert!(p.provided().contains_key(&(Kind::Command, "brew".into())));
+    }
+
+    /// フォントのパッケージ名はファミリ名ではないので提供名に数えない。
+    /// 数えてしまうと font-cica という名前が常に「参照されている」ことになり、
+    /// 未使用フォントの検出が働かなくなる。
+    #[test]
+    fn font_package_name_is_not_a_font_name() {
+        let p = parse("[packages.font-cica]\nkind = \"font\"\nprovides = [\"Cica\"]\n");
+        let provided = p.provided();
+        assert!(provided.contains_key(&(Kind::Font, "Cica".into())));
+        assert!(!provided.contains_key(&(Kind::Font, "font-cica".into())));
+    }
+
+    /// 一方、エディタ拡張は ID がそのまま設定に現れるので数える。
+    #[test]
+    fn extension_package_name_is_the_reference() {
+        let p =
+            parse("[packages.tokyo-night]\nkind = \"extension\"\nmanager = \"zed-extension\"\n");
+        assert!(p
+            .provided()
+            .contains_key(&(Kind::Extension, "tokyo-night".into())));
     }
 
     #[test]
