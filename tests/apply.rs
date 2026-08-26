@@ -20,6 +20,15 @@ struct Repo {
 impl Repo {
     fn new(name: &str) -> Self {
         let base = std::env::temp_dir().join(format!("sennit-it-{name}"));
+        // 前回の実行が権限を狭めたまま終わっていると remove_dir_all が通らない。
+        // テストが落ちた後にもう一度走らせられないのは、それ自体が困る。
+        if base.exists() {
+            let _ = Command::new("chmod")
+                .arg("-R")
+                .arg("u+rwX")
+                .arg(&base)
+                .status();
+        }
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("repo");
         let home = base.join("home");
@@ -429,4 +438,165 @@ fn euid() -> u32 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1000)
+}
+
+/// 読めなくなっただけのファイルを「消えた」と読まない。
+///
+/// Path::exists() は EACCES も false を返す。それを「宣言から外れた」と
+/// 読むと、権限が変わっただけで $HOME のリンクが消える。
+#[test]
+fn an_unreadable_file_is_not_treated_as_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    if euid() == 0 {
+        return;
+    }
+    let r = Repo::new("unreadable-file");
+    r.manifest("[link]\ncommon = [\"conf\"]\n");
+    r.write("conf/sub/b.conf", "b\n");
+    ok(&r.run(&["apply"]));
+
+    // readdir は通るが stat が通らない状態にする
+    std::fs::set_permissions(
+        r.root_path("conf/sub"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let out = r.run(&["apply"]);
+    std::fs::set_permissions(
+        r.root_path("conf/sub"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "an unreadable file should be an error, not a prune: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        std::fs::symlink_metadata(r.home_path("conf/sub/b.conf")).is_ok(),
+        "the link was pruned"
+    );
+}
+
+/// rollback は何度打っても同じ結果になる。
+///
+/// 古い退避を記録に残していた頃は、2 度目が今戻したファイルの上に
+/// 古い方を書き、3 つあれば 2 つが消えた。
+#[test]
+fn rollback_is_idempotent() {
+    let r = Repo::new("rollback-twice");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+
+    for body in ["FIRST\n", "SECOND\n", "THIRD\n"] {
+        if r.home_path("a.conf").exists()
+            || std::fs::symlink_metadata(r.home_path("a.conf")).is_ok()
+        {
+            std::fs::remove_file(r.home_path("a.conf")).unwrap();
+        }
+        r.write_home("a.conf", body);
+        ok(&r.run(&["apply"]));
+    }
+
+    ok(&r.run(&["rollback"]));
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
+        "THIRD\n"
+    );
+    let out = ok(&r.run(&["rollback"]));
+    assert!(out.contains("nothing to roll back"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
+        "THIRD\n"
+    );
+    // 古い 2 つはファイルとして残っている
+    let bodies: Vec<String> = std::fs::read_dir(&r.home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    for want in ["FIRST\n", "SECOND\n"] {
+        assert!(bodies.iter().any(|b| b == want), "{want:?} was destroyed");
+    }
+}
+
+/// 生成物の置き場が symlink なら断る。リンクを辿って書くと、
+/// リポジトリの外のファイルを黙って潰せる。
+#[test]
+fn a_generated_output_is_not_written_through_a_symlink() {
+    let r = Repo::new("symlink-output");
+    r.manifest(
+        r#"
+[link]
+common = ["gen.conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"gen.conf" = "gen.conf.tmpl"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("gen.conf.tmpl", "x = {{ bg }}\n");
+
+    let victim = r.home.parent().unwrap().join("victim");
+    std::fs::write(&victim, "PRECIOUS\n").unwrap();
+    std::os::unix::fs::symlink(&victim, r.root_path("gen.conf")).unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "writing through a symlink should fail"
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "PRECIOUS\n");
+}
+
+/// --dry-run の 1 行ずつの予告が、本番と食い違わない。
+#[test]
+fn dry_run_previews_what_apply_will_link() {
+    let r = Repo::new("dry-run-preview");
+    r.manifest(
+        r#"
+[link]
+common = ["a.conf", "gen.conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"gen.conf" = "gen.conf.tmpl"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("a.conf", "plain\n");
+    r.write("gen.conf.tmpl", "x = {{ bg }}\n");
+
+    let preview = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(
+        !preview.contains("not generated yet"),
+        "dry-run said it cannot link a file it also said it would render:\n{preview}"
+    );
+    let real = ok(&r.run(&["apply"]));
+    assert!(real.contains("2 link(s) updated"), "{real}");
+}
+
+/// 自分が入れなくなるモードをディレクトリに掛けない。
+#[test]
+fn a_directory_mode_that_locks_you_out_is_refused() {
+    let r = Repo::new("dir-mode");
+    r.manifest("[link]\ncommon = [\".ssh\"]\n\n[modes]\n\".ssh\" = \"600\"\n");
+    r.write(".ssh/config", "Host x\n");
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "600 on a directory should be refused"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        std::fs::metadata(r.root_path(".ssh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }

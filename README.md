@@ -121,9 +121,14 @@ touched:
 
 `apply` never destroys a file you wrote. When something that is not a symlink is sitting
 where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
-`sennit rollback` puts it back. Directories are moved whole. The record accumulates across
-applies and is written before hooks run, so a later apply — or a hook that fails — cannot
-strand a file you can no longer find. `--no-backup` opts out, and is the only way to lose
+`sennit rollback` puts it back. Directories are moved whole. The record is written the
+moment a file is moved, and accumulates across applies, so neither a later apply nor a
+failure partway through can strand a file you can no longer find.
+
+If the same path was moved aside more than once, `rollback` restores the most recent and
+tells you where the older copies are, rather than renaming each over the last. It is
+idempotent: running it twice does not put an older file back over the one it just
+restored. `--no-backup` opts out, and is the only way to lose
 anything; on a directory it removes the whole tree, and says how many files that is.
 
 It also remembers what it linked. A path that was linked last time and is no longer
@@ -480,7 +485,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.13. Minimum supported Rust version is 1.90.
+v0.14. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

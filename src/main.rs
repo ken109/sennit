@@ -139,9 +139,11 @@ fn run() -> Result<()> {
             secrets,
         } => {
             // 生成物はコミットしないので、配置の前に必ず作る
-            render_all(&root, &manifest, secrets, dry_run)?;
+            let produced = render_all(&root, &manifest, secrets, dry_run)?;
             let plan = Plan::build(&root, &home, &manifest)?;
-            apply(&plan, &root, &home, &manifest, dry_run, !no_backup)
+            apply(
+                &plan, &root, &home, &manifest, dry_run, !no_backup, &produced,
+            )
         }
         Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
@@ -149,7 +151,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Check => check(&root),
-        Command::Render { secrets } => render_all(&root, &manifest, secrets, false),
+        Command::Render { secrets } => render_all(&root, &manifest, secrets, false).map(|_| ()),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
         Command::Verify { export } => verify::verify(&root, export),
         // 先に捌いてある
@@ -266,10 +268,17 @@ fn check(root: &Path) -> Result<()> {
 /// 生成物はコミットしない。apply が配置の前に必ず作るので clone 直後でも
 /// 揃うし、同じ変更が差分に 2 度出るのを避けられる。秘密を含む生成物が
 /// リポジトリに入らないのも同じ理由による。
-fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) -> Result<()> {
-    decrypt_all(root, manifest, dry_run)?;
+/// 戻り値は「この実行で作られる(--dry-run なら作られるはずの)出力」。
+/// apply はこれを見て、まだディスクに無いものを張ってよいか判断する。
+fn render_all(
+    root: &Path,
+    manifest: &Manifest,
+    secrets: bool,
+    dry_run: bool,
+) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let mut produced = decrypt_all(root, manifest, dry_run)?;
     if manifest.render.is_empty() {
-        return Ok(());
+        return Ok(produced);
     }
     let data: Vec<PathBuf> = if manifest.data.is_empty() {
         vec![root.join("theme.toml")]
@@ -307,8 +316,10 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) ->
         // コマンドがそれを出すのは筋が通らない。
         if dry_run && render::needs_secrets(&template) {
             println!("  \x1b[33mwould render\x1b[0m  {out_rel}  (reads secrets)");
+            produced.insert(PathBuf::from(out_rel));
             continue;
         }
+        produced.insert(PathBuf::from(out_rel));
         let rendered = render::expand_with(&template, &vars, tmpl_rel, &mut cache)?;
 
         // 中身が同じなら書き直さない。mtime が動くと apply が無駄に張り直す。
@@ -360,7 +371,7 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) ->
             deferred.len()
         );
     }
-    Ok(())
+    Ok(produced)
 }
 
 /// リポジトリ内の暗号文を復号して置く。
@@ -368,9 +379,14 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) ->
 /// プロバイダと違い外部サービスもサインインも要らないので、鍵さえあれば
 /// 無人で動く。鍵が無い環境では保留するが、それは「設定していない」であって
 /// 「壊れている」ではない。
-fn decrypt_all(root: &Path, manifest: &Manifest, dry_run: bool) -> Result<()> {
+fn decrypt_all(
+    root: &Path,
+    manifest: &Manifest,
+    dry_run: bool,
+) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let mut produced = std::collections::BTreeSet::new();
     if manifest.encrypted.is_empty() {
-        return Ok(());
+        return Ok(produced);
     }
     let Some(enc) = &manifest.encryption else {
         bail!("encrypted files are declared but [encryption] is not");
@@ -386,13 +402,14 @@ fn decrypt_all(root: &Path, manifest: &Manifest, dry_run: bool) -> Result<()> {
                 manifest.encrypted.len()
             );
         }
-        return Ok(());
+        return Ok(produced);
     }
 
     for (out_rel, src_rel) in &manifest.encrypted {
         let src = root.join(src_rel);
         let out_path = root.join(out_rel);
         // 復号もコマンドの実行で、鍵によっては人手を要求する。--dry-run では走らせない。
+        produced.insert(PathBuf::from(out_rel));
         if dry_run {
             println!("  \x1b[35mwould decrypt\x1b[0m  {out_rel}");
             continue;
@@ -413,7 +430,7 @@ fn decrypt_all(root: &Path, manifest: &Manifest, dry_run: bool) -> Result<()> {
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[35mdecrypted\x1b[0m  {out_rel}");
     }
-    Ok(())
+    Ok(produced)
 }
 
 /// 生成物のあるべきモードに揃える。
@@ -447,16 +464,24 @@ fn write_generated(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    // ディレクトリに chmod 0600 を掛けると中身が読めなくなる。開く前に断る。
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.is_dir() {
-            bail!(
-                "{} is a directory; a generated file cannot be written there",
-                path.display()
-            );
-        }
+    // 書き先を確かめてから触る。chmod も open も symlink を辿るので、
+    // 「ディレクトリではない」だけ見て進むと、リンクの先にあるディレクトリを
+    // 0600 にしてしまうし、リポジトリの外のファイルを黙って上書きできる。
+    // 生成物の置き場が symlink である理由は無いので、どちらも断る。
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => bail!(
+            "{} is a directory; a generated file cannot be written there",
+            path.display()
+        ),
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symlink; a generated file is written in place, not through a link",
+            path.display()
+        ),
         // 前回書いたものが読み取り専用だと開けない
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+        Ok(_) => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+        }
+        Err(_) => {}
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -480,22 +505,53 @@ fn apply(
     manifest: &Manifest,
     dry_run: bool,
     backup: bool,
+    // この実行で作られる生成物。--dry-run では実際には書かれていないので、
+    // 「まだ無い」と「これから作られる」を取り違えないために要る。
+    produced: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<()> {
     let previous = state::State::load(home)?;
+
+    // 「張れる状態にあるか」を 1 か所で決める。
+    //
+    // Path::exists() は使えない。あれは EACCES も「無い」と答えるので、
+    // 読めなくなっただけのファイルが記録から落ち、次の apply がそれを
+    // 「宣言から外れた」と読んで $HOME のリンクを消す。無いのか読めないのか
+    // は区別しなければならない。
+    let placeable = |e: &plan::Entry| -> Result<bool> {
+        match std::fs::symlink_metadata(&e.src) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // --dry-run では生成物がまだ書かれていない。これから作られる
+                // ものを「置けない」と出すと、preview が本番と食い違う。
+                Ok(dry_run && produced.contains(&e.rel))
+            }
+            Err(err) => Err(anyhow::Error::new(err))
+                .with_context(|| format!("failed to read {}", e.src.display())),
+        }
+    };
+
     // 記録に載せるのは実際に張ったものだけ。まだ作られていない生成物を
     // 載せると、次の apply がそれを stale と見なして消しにかかる。
-    let current: Vec<PathBuf> = plan
-        .entries
-        .iter()
-        .filter(|e| e.src.exists())
-        .map(|e| e.rel.clone())
-        .collect();
+    let mut current: Vec<PathBuf> = Vec::new();
+    for e in &plan.entries {
+        if placeable(e)? {
+            current.push(e.rel.clone());
+        }
+    }
     let stale = previous.stale(&current);
 
     // 宣言されている生成物は、まだ作られていないことがある。秘密を読む
     // テンプレートは --secrets を渡すまで飛ばされるので、その状態で張ると
     // 行き先の無い symlink が $HOME に残る。数には出すが、張らない。
-    let (changes, not_yet): (Vec<_>, Vec<_>) = plan.changes().partition(|e| e.src.exists());
+    let mut changes: Vec<&plan::Entry> = Vec::new();
+    let mut not_yet: Vec<&plan::Entry> = Vec::new();
+    for e in plan.changes() {
+        if placeable(e)? {
+            changes.push(e);
+        } else {
+            not_yet.push(e);
+        }
+    }
 
     // 退避の記録は積み上げる。次の apply が上書きすると、前回退避した
     // 利用者のファイルが .sennit-backup のまま行き場を失う。
@@ -609,12 +665,26 @@ fn apply(
             .mode_for(Path::new(rel))
             .expect("validated when the manifest loaded");
         let path = root.join(rel);
-        if !path.exists() {
-            continue;
-        }
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            // まだ作られていない生成物。次に作られるときに正しいモードになる
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("failed to stat {}", path.display()))
+            }
+        };
+        // 5: 所有者の実行ビットを落としたディレクトリは、中へ入れなくなる。
+        // 次の apply はその下を「無くなった」と読んで $HOME のリンクを消し、
+        // verify はディレクトリ自身しか見ないので ok と言う。
+        if meta.is_dir() && want & 0o100 == 0 {
+            bail!(
+                "mode {:o} on the directory `{}` would remove your own access to it",
+                want,
+                rel
+            );
+        }
         if meta.permissions().mode() & 0o777 == want {
             continue;
         }
@@ -731,9 +801,9 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
             .with_context(|| format!("failed to restore {}", b.dest.display()))?;
     }
 
-    for b in &shadowed {
+    for b in shadowed.iter().rev() {
         println!(
-            "  {:>8}  {}  (an older copy of {})",
+            "  {:>8}  {}  (an older copy of {}; left where it is)",
             "kept",
             b.kept_at.display(),
             b.dest.display()
@@ -745,12 +815,19 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let n = newest.len();
-    // 戻していない退避は記録に残す。ファイルが在るのに誰も指していない
-    // 状態を作らない。
-    let keep: Vec<state::Backup> = shadowed.into_iter().cloned().collect();
-    st.backups = keep;
+    let older = shadowed.len();
+
+    // 記録は空にする。古い退避を残すと、次の rollback がそれを今戻した
+    // ファイルの上に書いてしまう。3 つあれば 2 つが消える。rollback は
+    // 何度打っても同じ結果でなければならない。
+    //
+    // ファイルは消さない。記録から外れるだけで、場所は上に出してある。
+    st.backups.clear();
     st.save(home)?;
     println!("\n{n} file(s) restored");
+    if older > 0 {
+        println!("{older} older copy(ies) left on disk; move them back by hand if you want them");
+    }
     Ok(())
 }
 
