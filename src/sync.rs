@@ -215,10 +215,15 @@ fn is_root() -> bool {
 }
 
 fn sudo_is_passwordless() -> bool {
+    // 実際に走らせるコマンドで確かめる。`sudo -n true` を試すと、
+    // `%sudo ALL=(ALL) NOPASSWD: /usr/bin/apt-get` のように対象を絞った
+    // 設定では失敗し、「apt-get を passwordless にしてください」という
+    // 既にやってあることを案内して止まる。
+    //
     // 失敗時に sudo が "a password is required" を出すが、ここでは判定に
     // 使うだけなので利用者には見せない
     Command::new("sudo")
-        .args(["-n", "true"])
+        .args(["-n", "apt-get", "--version"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

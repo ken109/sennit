@@ -379,7 +379,10 @@ fn find_all(text: &str, prefix: &str) -> Vec<String> {
         let after = &rest[i + prefix.len()..];
         if let Some(j) = after.find(close) {
             out.push(after[..j].to_string());
-            rest = &after[j..];
+            // 閉じ記号の次から続ける。閉じ記号の位置から再開すると、開きと
+            // 閉じが同じ `"` のときにその閉じ引用符を次の開きとして読み、
+            // 値と値の“あいだ”(`: true,`)を 1 件として拾ってしまう。
+            rest = &after[j + close.len_utf8()..];
         } else {
             break;
         }
@@ -486,6 +489,24 @@ mod tests {
         let f = Fixture::new("provider-default");
         f.file(".config/x.conf.tmpl", "token = {{ op://a/b }}\n");
         assert!(f.names().contains(&"op".to_string()));
+    }
+
+    /// 引用符の対を順に読む。開きと閉じが同じ記号なので、閉じた位置から
+    /// 再開すると値と値の“あいだ”を 1 件として拾ってしまう。
+    #[test]
+    fn several_editor_extensions_do_not_produce_a_phantom_requirement() {
+        let f = Fixture::new("zed-extensions");
+        f.file(
+            ".config/zed/settings.json",
+            "{\n  \"auto_install_extensions\": {\n    \"tokyo-night\": true,\n    \"toml\": true,\n    \"nix\": true,\n  },\n}\n",
+        );
+        let names: Vec<String> = scan(&f.root)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == Kind::Extension)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["nix", "tokyo-night", "toml"]);
     }
 
     #[test]

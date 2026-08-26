@@ -109,7 +109,7 @@ pub fn verify(root: &Path, export: Option<PathBuf>) -> Result<()> {
     let mut skipped = 0usize;
 
     for (name, pkg) in packages.applicable() {
-        match verifiable(&name, pkg) {
+        match verifiable(&name, pkg, crate::packages::will_install(pkg)) {
             None => {
                 skipped += 1;
                 unverifiable.push(name.clone());
@@ -180,7 +180,10 @@ pub fn verify(root: &Path, export: Option<PathBuf>) -> Result<()> {
 
 /// このパッケージについて「存在すればこれが見つかるはず」という名前の一覧。
 /// 検証しようがないものは None。
-fn verifiable(name: &str, pkg: &Package) -> Option<Vec<(Kind, String)>> {
+/// `installable` はこのマシンで sync が導入経路を持つか。呼び出し側から
+/// 渡すのは、この判定が OS で変わるため。関数の中で cfg! を見ると、
+/// 一方の OS では常に真になってテストが何も押さえられなくなる。
+fn verifiable(name: &str, pkg: &Package, installable: bool) -> Option<Vec<(Kind, String)>> {
     let kind = pkg.kind_of();
     match kind {
         // 拡張はエディタが入れるので PATH には出ない
@@ -206,6 +209,12 @@ fn verifiable(name: &str, pkg: &Package) -> Option<Vec<(Kind, String)>> {
     // (1password-cli の op)。provides を書いているなら、それは
     // 「これが見つかるはず」という宣言なので検証する。
     if pkg.manager_of() == Manager::BrewCask && pkg.provides.is_empty() {
+        return None;
+    }
+    // ただし sync がこの OS で入れないものを「無い」と言っても仕方がない。
+    // Linux では apt / yay の名前が無い cask は導入経路が無く、provides を
+    // 書いていると verify だけが永久に落ち続ける状態になっていた。
+    if !installable {
         return None;
     }
     // mise が入れるものは shim 経由で、mise を有効化したシェルでしか
@@ -306,14 +315,14 @@ mod tests {
     #[test]
     fn looks_for_provided_names_not_the_package_name() {
         let p = pkg("provides = [\"nvim\"]\n");
-        let got = verifiable("neovim", &p).unwrap();
+        let got = verifiable("neovim", &p, true).unwrap();
         assert_eq!(got, vec![(Kind::Command, "nvim".to_string())]);
     }
 
     #[test]
     fn falls_back_to_the_package_name() {
         let p = pkg("");
-        let got = verifiable("bat", &p).unwrap();
+        let got = verifiable("bat", &p, true).unwrap();
         assert_eq!(got, vec![(Kind::Command, "bat".to_string())]);
     }
 
@@ -322,7 +331,7 @@ mod tests {
     #[test]
     fn gui_casks_are_not_verifiable() {
         let p = pkg("manager = \"brew-cask\"\n");
-        assert!(verifiable("slack", &p).is_none());
+        assert!(verifiable("slack", &p, true).is_none());
     }
 
     /// ただし provides を書いた cask は検証する。1password-cli は cask だが
@@ -330,7 +339,7 @@ mod tests {
     #[test]
     fn casks_that_declare_a_command_are_verified() {
         let p = pkg("manager = \"brew-cask\"\nprovides = [\"op\"]\n");
-        let got = verifiable("1password-cli", &p).unwrap();
+        let got = verifiable("1password-cli", &p, true).unwrap();
         assert_eq!(got, vec![(Kind::Command, "op".to_string())]);
     }
 
@@ -339,21 +348,32 @@ mod tests {
     fn font_casks_are_verified_by_family_name() {
         let p =
             pkg("manager = \"brew-cask\"\nkind = \"font\"\nprovides = [\"Hack Nerd Font Mono\"]\n");
-        let got = verifiable("font-hack-nerd-font", &p).unwrap();
+        let got = verifiable("font-hack-nerd-font", &p, true).unwrap();
         assert_eq!(got, vec![(Kind::Font, "Hack Nerd Font Mono".to_string())]);
     }
 
     /// mise の shim は mise を有効化したシェルにしか出ない。
+    /// このマシンで入れようがないものを「無い」と報告しない。
+    ///
+    /// Linux で apt / yay の名前が無い cask がこれに当たる。sync は入れず、
+    /// verify だけが missing と言い続け、利用者にできることが何も無い。
+    #[test]
+    fn what_cannot_be_installed_here_is_not_verified() {
+        let p: Package = toml::from_str("manager = \"brew-cask\"\nprovides = [\"op\"]\n").unwrap();
+        assert!(verifiable("1password-cli", &p, true).is_some());
+        assert!(verifiable("1password-cli", &p, false).is_none());
+    }
+
     #[test]
     fn mise_managed_tools_are_not_verifiable() {
         let p = pkg("manager = \"mise\"\n");
-        assert!(verifiable("go", &p).is_none());
+        assert!(verifiable("go", &p, true).is_none());
     }
 
     /// ライブラリは実行ファイルを持たない。
     #[test]
     fn libraries_are_not_verifiable() {
         let p = pkg("kind = \"library\"\n");
-        assert!(verifiable("libyaml", &p).is_none());
+        assert!(verifiable("libyaml", &p, true).is_none());
     }
 }

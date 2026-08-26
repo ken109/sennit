@@ -1082,3 +1082,37 @@ command = "sh -c 'echo provider >> {m}; echo v'"
         std::fs::read_to_string(&marker).unwrap_or_default()
     );
 }
+
+/// [link] の対象が重なっていても、同じパスを二度張ろうとしない。
+#[test]
+fn overlapping_link_targets_do_not_break_the_first_apply() {
+    let r = Repo::new("overlap");
+    r.manifest("[link]\ncommon = [\"conf\", \"conf/nvim\"]\n");
+    r.write("conf/nvim/init.lua", "-- x\n");
+    r.write("conf/zzz.conf", "z\n");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("2 link(s) updated"), "{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("conf/nvim/init.lua")).is_ok());
+    assert!(std::fs::symlink_metadata(r.home_path("conf/zzz.conf")).is_ok());
+}
+
+/// 宣言したモードのパスが symlink なら、リンク先を触らずに断る。
+#[test]
+fn a_declared_mode_does_not_follow_a_symlink_out_of_the_repository() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = Repo::new("mode-symlink");
+    let outside = r.home.parent().unwrap().join("secret");
+    std::fs::write(&outside, "key\n").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    r.manifest("[link]\ncommon = []\n\n[modes]\n\"keylink\" = \"644\"\n");
+    std::os::unix::fs::symlink(&outside, r.root_path("keylink")).unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(
+        !out.status.success(),
+        "a symlinked mode target should be refused"
+    );
+    assert_eq!(mode_of(&outside), 0o600, "the link target was chmod-ed");
+}

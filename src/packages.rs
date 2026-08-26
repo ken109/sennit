@@ -299,6 +299,19 @@ fn which(bin: &str) -> bool {
 }
 
 /// 1 パッケージについて、この環境で使うマネージャと名前を決める。
+/// この OS で sync が導入経路を持つか。verify はこれを見て、入れようが
+/// ないものを「見つからない」と報告しないようにする。
+pub fn will_install(pkg: &Package) -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    if pkg.apt.is_some() || pkg.yay.is_some() {
+        return true;
+    }
+    // Linux で cask は入れられない。font cask だけは brew が扱える
+    !(Manager::parse(pkg.manager.as_deref()) == Manager::BrewCask && !is_font(pkg))
+}
+
 fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Installable> {
     if let Some(pm) = linux_pm {
         let distro_name = match pm {
@@ -317,9 +330,15 @@ fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Insta
             return None;
         }
     }
+    let manager = Manager::parse(pkg.manager.as_deref());
+    // macOS で dpkg-query / pacman を呼びに行かない。os を書き忘れた
+    // `manager = "apt"` 1 件で sync 全体が最初のマネージャで落ちていた。
+    if cfg!(target_os = "macos") && matches!(manager, Manager::Apt | Manager::Yay) {
+        return None;
+    }
     Some(Installable {
         name: name.to_string(),
-        manager: Manager::parse(pkg.manager.as_deref()),
+        manager,
     })
 }
 
@@ -470,6 +489,43 @@ mod tests {
 #[cfg(test)]
 mod load_tests {
     use super::*;
+
+    fn pkg(toml: &str) -> Package {
+        toml::from_str(toml).unwrap()
+    }
+
+    /// macOS で dpkg-query / pacman を呼びに行かない。
+    ///
+    /// os を書き忘れた `manager = "apt"` が 1 件あるだけで、apt は
+    /// ORDER の先頭なので sync 全体が最初のマネージャで落ちていた。
+    /// --dry-run でも落ちるので、宣言を直すまで何も見られない。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_distro_manager_is_not_used_on_macos() {
+        let p = pkg("manager = \"apt\"\n");
+        assert!(resolve("libyaml", &p, None).is_none());
+        // 既定の brew は当然通る
+        let q = pkg("");
+        assert!(resolve("ripgrep", &q, None).is_some());
+    }
+
+    /// verify が「入れようがないもの」を missing と言わない。
+    ///
+    /// Linux では apt / yay の名前が無い cask に導入経路が無い。provides を
+    /// 書いていると verify だけが永久に落ち続ける状態になっていた。
+    #[test]
+    fn a_cask_without_a_distro_name_is_not_installable_on_linux() {
+        let cask = pkg("manager = \"brew-cask\"\nprovides = [\"op\"]\n");
+        let with_apt = pkg("manager = \"brew-cask\"\nprovides = [\"op\"]\napt = \"op\"\n");
+        let font = pkg("manager = \"brew-cask\"\nkind = \"font\"\nprovides = [\"X\"]\n");
+        if cfg!(target_os = "macos") {
+            assert!(will_install(&cask));
+        } else {
+            assert!(!will_install(&cask));
+        }
+        assert!(will_install(&with_apt));
+        assert!(will_install(&font));
+    }
 
     fn load(toml: &str) -> Result<Packages> {
         let p = std::env::temp_dir().join(format!(

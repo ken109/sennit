@@ -100,6 +100,12 @@ impl Plan {
         manifest: &Manifest,
         rel: &Path,
     ) -> Result<()> {
+        // [link] の対象が重なっていると同じパスが二度入り、二度目の
+        // symlink が EEXIST で落ちる。diff も --dry-run も何も言わないまま、
+        // 最初の apply だけが途中で止まる。
+        if entries.iter().any(|e| e.rel == rel) {
+            return Ok(());
+        }
         // テンプレートは生成の入力であって配置対象ではない。ignore の宣言に
         // 頼ると書き忘れたときに、未展開の {{ }} を含むファイルがそのまま
         // $HOME に置かれる。[render] の入力は自明に対象外なので自動で外す。

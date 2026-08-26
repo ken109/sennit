@@ -440,6 +440,15 @@ fn decrypt_all(
 fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let want = declared.unwrap_or(if secret { 0o400 } else { 0o444 });
+    // 生成物の置き場が symlink なら、chmod はリンク先に掛かる
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if m.file_type().is_symlink() {
+            bail!(
+                "{} is a symlink; a generated file is written in place, not through a link",
+                path.display()
+            );
+        }
+    }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         // まだ無いものは次の書き込みで正しいモードになる
@@ -531,6 +540,17 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
             .mode_for(Path::new(rel))
             .expect("validated when the manifest loaded");
         let path = root.join(rel);
+        // metadata も set_permissions も symlink を辿る。宣言されたパスが
+        // リンクなら、chmod が掛かるのはリンク先 — リポジトリの外かもしれない。
+        // 宣言は「そのパスそのもの」に効くと書いてあるので、リンクは断る。
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => bail!(
+                "`{}` is a symlink; a declared mode applies to the path itself, \
+                 and following the link would change something else",
+                rel
+            ),
+            _ => {}
+        }
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             // まだ作られていない生成物。次に作られるときに正しいモードになる
