@@ -1,17 +1,44 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
-use std::path::Path;
 
-/// theme.toml をフラットな "section.key" -> 値 の表に落とす。
-pub fn load_vars(path: &Path) -> Result<BTreeMap<String, String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-
+/// テンプレートから見える値をまとめる。
+///
+/// データファイル(既定は theme.toml)に加えて、その場でしか分からない値も
+/// 入れる。ホスト名やプロファイルは配色と違ってファイルに書けないが、
+/// マシンごとに変える設定では最も必要になる。
+pub fn load_vars(paths: &[std::path::PathBuf]) -> Result<BTreeMap<String, String>> {
     let mut vars = BTreeMap::new();
-    flatten(&value, String::new(), &mut vars);
+
+    for path in paths {
+        // 宣言されたデータファイルが無いのは設定漏れなので黙って進まない
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let value: toml::Value =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        flatten(&value, String::new(), &mut vars);
+    }
+
+    vars.insert("sennit.os".into(), crate::packages::current_os().into());
+    vars.insert("sennit.hostname".into(), hostname());
+    vars.insert(
+        "sennit.profile".into(),
+        crate::packages::current_profiles().join(","),
+    );
+    for (k, v) in std::env::vars() {
+        vars.insert(format!("env.{k}"), v);
+    }
     Ok(vars)
+}
+
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn flatten(value: &toml::Value, prefix: String, out: &mut BTreeMap<String, String>) {

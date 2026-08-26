@@ -9,6 +9,18 @@ pub struct Manifest {
     /// 出力パス -> テンプレートパス
     #[serde(default)]
     pub render: std::collections::BTreeMap<String, String>,
+    /// 配置後に走らせる処理
+    #[serde(default)]
+    pub hooks: std::collections::BTreeMap<String, crate::hooks::Hook>,
+    /// テンプレートに渡すデータファイル。既定は theme.toml。
+    #[serde(default)]
+    pub data: Vec<String>,
+    /// パス -> 8進のモード。
+    ///
+    /// symlink 方式なのでリポジトリ側の権限がそのまま見える。宣言しておくと
+    /// apply が揃え、verify が検査する。
+    #[serde(default)]
+    pub modes: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +55,15 @@ impl Manifest {
         out
     }
 
+    /// このパスに宣言されたモード。前方一致で最も長いものを採る。
+    pub fn mode_for(&self, rel: &Path) -> Option<u32> {
+        self.modes
+            .iter()
+            .filter(|(pat, _)| rel.starts_with(pat))
+            .max_by_key(|(pat, _)| pat.len())
+            .and_then(|(_, m)| u32::from_str_radix(m, 8).ok())
+    }
+
     /// ignore のパターンは 2 種類だけ扱う。
     /// - `*.ext` : 拡張子一致
     /// - それ以外: パスの前方一致(同一パスも含む)
@@ -70,6 +91,9 @@ mod tests {
                 ignore: ignore.iter().map(|s| s.to_string()).collect(),
             },
             render: Default::default(),
+            hooks: Default::default(),
+            data: Default::default(),
+            modes: Default::default(),
         }
     }
 
@@ -87,6 +111,35 @@ mod tests {
         // 前方一致はディレクトリ自身にも効く
         assert!(m.is_ignored(Path::new(".config/secret")));
         assert!(!m.is_ignored(Path::new(".config/public/token")));
+    }
+
+    fn with_modes(pairs: &[(&str, &str)]) -> Manifest {
+        let mut m = manifest(&[]);
+        for (k, v) in pairs {
+            m.modes.insert(k.to_string(), v.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn mode_is_read_as_octal() {
+        let m = with_modes(&[(".npmrc", "600")]);
+        assert_eq!(m.mode_for(Path::new(".npmrc")), Some(0o600));
+    }
+
+    /// 前方一致で最も長い宣言を採る。ディレクトリ全体に指定しつつ、
+    /// その中の 1 つだけ変えられるように。
+    #[test]
+    fn the_longest_matching_declaration_wins() {
+        let m = with_modes(&[(".ssh", "700"), (".ssh/config", "600")]);
+        assert_eq!(m.mode_for(Path::new(".ssh/config")), Some(0o600));
+        assert_eq!(m.mode_for(Path::new(".ssh/known_hosts")), Some(0o700));
+    }
+
+    #[test]
+    fn no_declaration_means_no_opinion() {
+        let m = manifest(&[]);
+        assert_eq!(m.mode_for(Path::new(".npmrc")), None);
     }
 
     #[test]

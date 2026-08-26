@@ -1,5 +1,6 @@
 mod audit;
 mod detect;
+mod hooks;
 mod manifest;
 mod packages;
 mod plan;
@@ -124,7 +125,7 @@ fn run() -> Result<()> {
             // 生成物はコミットしないので、配置の前に必ず作る
             render_all(&root, &manifest, secrets)?;
             let plan = Plan::build(&root, &home, &manifest)?;
-            apply(&plan, &home, dry_run, !no_backup)
+            apply(&plan, &root, &home, &manifest, dry_run, !no_backup)
         }
         Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
@@ -239,7 +240,12 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
     if manifest.render.is_empty() {
         return Ok(());
     }
-    let vars = render::load_vars(&root.join("theme.toml"))?;
+    let data: Vec<PathBuf> = if manifest.data.is_empty() {
+        vec![root.join("theme.toml")]
+    } else {
+        manifest.data.iter().map(|d| root.join(d)).collect()
+    };
+    let vars = render::load_vars(&data)?;
     let mut cache = render::SecretCache::default();
     let mut deferred = Vec::new();
 
@@ -265,8 +271,14 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&out_path, &rendered)
-            .with_context(|| format!("failed to write {}", out_path.display()))?;
+        let declared = manifest.mode_for(Path::new(out_rel));
+        write_rendered(
+            &out_path,
+            &rendered,
+            render::needs_secrets(&template),
+            declared,
+        )
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
     }
 
@@ -282,16 +294,36 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
     Ok(())
 }
 
-fn apply(plan: &Plan, home: &Path, dry_run: bool, backup: bool) -> Result<()> {
+/// 生成物を書く。秘密を含むものは 0600 にする。
+///
+/// 既定の umask 022 では 0644 になり、トークンが誰でも読める状態で置かれる。
+/// 手で管理していた頃の ~/.npmrc は 0600 だったので、これは劣化にあたる。
+/// 内容ではなく権限で守る。
+fn write_rendered(path: &Path, contents: &str, secret: bool, declared: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents)?;
+    // 宣言があればそれに従う。無くても秘密を含むなら 0600 にする。
+    // 既定の umask 022 では 0644 になり、トークンが誰でも読める。
+    if let Some(mode) = declared.or(if secret { Some(0o600) } else { None }) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+fn apply(
+    plan: &Plan,
+    root: &Path,
+    home: &Path,
+    manifest: &Manifest,
+    dry_run: bool,
+    backup: bool,
+) -> Result<()> {
     let previous = state::State::load(home)?;
     let current: Vec<PathBuf> = plan.entries.iter().map(|e| e.rel.clone()).collect();
     let stale = previous.stale(&current);
 
     let changes: Vec<_> = plan.changes().collect();
-    if changes.is_empty() && stale.is_empty() {
-        println!("already up to date ({} links)", plan.entries.len());
-        return Ok(());
-    }
+    let nothing_to_link = changes.is_empty() && stale.is_empty();
 
     let mut backups = Vec::new();
 
@@ -345,6 +377,10 @@ fn apply(plan: &Plan, home: &Path, dry_run: bool, backup: bool) -> Result<()> {
             .with_context(|| format!("failed to link {}", e.dest.display()))?;
     }
 
+    // 配置のあとにフックを走らせる。設定を置いてから取り込む処理なので、
+    // 順序が逆だと参照先がまだ無い。
+    let hooks = hooks::run_all(root, &manifest.hooks, &previous.hooks, dry_run)?;
+
     if dry_run {
         println!(
             "\n{} change(s), {} prune(s), nothing written (--dry-run)",
@@ -354,9 +390,15 @@ fn apply(plan: &Plan, home: &Path, dry_run: bool, backup: bool) -> Result<()> {
         return Ok(());
     }
 
+    if nothing_to_link && hooks == previous.hooks {
+        println!("already up to date ({} links)", plan.entries.len());
+        return Ok(());
+    }
+
     state::State {
         links: current,
         backups: backups.clone(),
+        hooks,
     }
     .save(home)?;
 

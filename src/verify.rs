@@ -58,6 +58,28 @@ pub fn compare(a: &Path, b: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 宣言したモードと実際のモードを突き合わせる。
+///
+/// トークンを含むファイルが 0644 で置かれていても何も壊れないので、
+/// 気づく機会が無い。宣言してあれば検査できる。
+fn check_modes(root: &Path, manifest: &crate::manifest::Manifest) -> Vec<(String, u32, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut wrong = Vec::new();
+    for (rel, want) in &manifest.modes {
+        let Ok(want) = u32::from_str_radix(want, 8) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(root.join(rel)) else {
+            continue;
+        };
+        let got = meta.permissions().mode() & 0o777;
+        if got != want {
+            wrong.push((rel.clone(), want, got));
+        }
+    }
+    wrong
+}
+
 pub fn verify(root: &Path, export: Option<PathBuf>) -> Result<()> {
     let packages = Packages::load(&root.join("packages.toml"))?;
 
@@ -114,9 +136,18 @@ pub fn verify(root: &Path, export: Option<PathBuf>) -> Result<()> {
         println!("  \x1b[31mmissing\x1b[0m  {pkg}  (looked for: {names})");
     }
 
-    if missing.is_empty() {
+    let manifest = crate::manifest::Manifest::load(&root.join("sennit.toml"))?;
+    let wrong_modes = check_modes(root, &manifest);
+    for (rel, want, got) in &wrong_modes {
+        println!("  \x1b[31mmode\x1b[0m     {rel}  (declared {want:o}, found {got:o})");
+    }
+
+    if missing.is_empty() && wrong_modes.is_empty() {
         println!("\x1b[32mok\x1b[0m  everything verifiable is present");
         return Ok(());
+    }
+    if missing.is_empty() {
+        bail!("{} file(s) with the wrong mode", wrong_modes.len());
     }
     bail!(
         "{} declared package(s) not found on this machine",

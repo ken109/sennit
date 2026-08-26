@@ -14,6 +14,9 @@ pub struct State {
     /// 退避したファイル。apply の巻き戻しに使う
     #[serde(default)]
     pub backups: Vec<Backup>,
+    /// フック名 -> 最後に走らせたときの監視対象の指紋
+    #[serde(default)]
+    pub hooks: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

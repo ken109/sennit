@@ -142,6 +142,22 @@ It also remembers what it linked. A path that was linked last time and is no lon
 declared gets its symlink removed, so dropping a config from the repository does not leave
 a dangling link behind in `$HOME`.
 
+## Running things after placing them
+
+Placing a file is often only half of it. `.config/bat/themes/` is useless until
+`bat cache --build` has registered what is in it, and until then `BAT_THEME` silently does
+not resolve and everything downstream falls back to default colours. That relationship
+lived in a shell script, ran unconditionally, and was written down nowhere.
+
+```toml
+[hooks.bat-themes]
+when-changed = [".config/bat/themes"]
+run = "bat cache --build"
+```
+
+`apply` runs a hook after linking, and only when what it watches has changed. A hook with
+no `when-changed` runs every time.
+
 ## Per-machine variation
 
 `os = ["darwin"]` restricts a declaration to one platform. `profiles` restricts it to a
@@ -156,6 +172,31 @@ profiles = ["work"]
 The profile comes from `SENNIT_PROFILE`, which takes a comma-separated list. A declaration
 with no `profiles` always applies; one with `profiles` applies only when it overlaps, so
 an unset `SENNIT_PROFILE` installs less rather than more.
+
+Templates see the same context, alongside whatever is in your data files:
+
+| | |
+|---|---|
+| `{{ sennit.os }}` | `darwin` or `linux` |
+| `{{ sennit.hostname }}` | short hostname |
+| `{{ sennit.profile }}` | the current profile list |
+| `{{ env.ANYTHING }}` | environment variables |
+
+`[data]` in `sennit.toml` lists which files to read; it defaults to `theme.toml` alone.
+
+## File modes
+
+A config holding a token still works perfectly at mode 0644, which is exactly why nobody
+notices. Declare what it should be and `apply` sets it, `verify` checks it:
+
+```toml
+[modes]
+".npmrc" = "600"
+```
+
+The longest matching prefix wins, so a directory can be declared once and one file inside
+it overridden. Rendered output containing a secret is set to 0600 even without a
+declaration, since the default umask would otherwise publish it.
 
 ## Drift detection
 
