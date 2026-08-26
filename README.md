@@ -102,10 +102,23 @@ background = "{{ ui.bg }}"
 foreground = "{{ ui.fg }}"
 ```
 
-Templates do substitution and nothing else. There are deliberately no conditionals or
-loops: the moment a template gains control flow, it stops being readable as the config
-file it produces. An unknown variable is an error rather than an empty string, so a typo
-cannot quietly ship a broken config.
+Templates substitute values and, where a platform genuinely differs, drop a block:
+
+```
+{{ if sennit.os == "darwin" }}
+option_as_alt = "Both"
+{{ else }}
+option_as_alt = "None"
+{{ end }}
+```
+
+`==`, `!=`, and a bare variable meaning "not empty". No loops, no functions, no pipelines
+— those are what turn a template into something you can no longer read as the file it
+produces. A block that disappears leaves the rest intact.
+
+Only what is inside `{{ }}` is interpreted, so a config containing a literal `[end]` or
+`{ if }` is left alone. An unknown variable is an error rather than an empty string, both
+in a substitution and in a condition, so a typo cannot quietly ship a broken config.
 
 Generated files are not meant to be committed. `apply` renders before it links, so a fresh
 clone produces them, and adding them to git would only mean the same change showing up
@@ -117,8 +130,28 @@ nothing it produces reaches the repository.
 token = "{{ op://Personal/GitHub/token }}"
 ```
 
-Any `{{ op://... }}` is read through the 1Password CLI at render time — but only when you
-ask for it. `apply` skips those templates and says so; `apply --secrets` renders them.
+Providers are declared rather than built in, since they all have the same shape — run a
+command, read what it prints:
+
+```toml
+[providers.op]
+command = "op read --no-newline {}"
+
+[providers.pass]
+command = "pass show {}"
+
+[providers.vault]
+command = "vault kv get -field=value {}"
+
+[providers.keychain]
+command = "security find-generic-password -s {} -w"
+```
+
+`{}` becomes the part after `://`, passed as an argument rather than through a shell. With
+nothing declared, `op` is assumed. A reference to an undeclared scheme fails and lists the
+ones that are.
+
+Any such reference is read at render time — but only when you ask for it. `apply` skips those templates and says so; `apply --secrets` renders them.
 
 That split is not a convenience. 1Password needs a person to sign in, enable the CLI
 integration, and unlock the app, none of which can happen partway through an unattended

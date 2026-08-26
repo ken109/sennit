@@ -62,6 +62,16 @@ fn flatten(value: &toml::Value, prefix: String, out: &mut BTreeMap<String, Strin
     }
 }
 
+/// `scheme://rest` の形なら分解する。テンプレート変数は `ui.bg` のような
+/// ドット記法なので、`://` の有無で区別できる。
+pub fn split_reference(key: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = key.split_once("://")?;
+    if scheme.is_empty() || rest.is_empty() || scheme.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((scheme, rest))
+}
+
 /// このテンプレートが秘密を参照しているか。
 ///
 /// 宣言させるのではなく中身から判定する。書き忘れると初回セットアップが
@@ -73,7 +83,7 @@ pub fn needs_secrets(template: &str) -> bool {
         let Some(end) = after.find("}}") else {
             return false;
         };
-        if after[..end].trim().starts_with("op://") {
+        if split_reference(after[..end].trim()).is_some() {
             return true;
         }
         rest = &after[end..];
@@ -86,34 +96,238 @@ pub fn needs_secrets(template: &str) -> bool {
 /// 汎用テンプレートエンジンを入れないのは、条件分岐やループを持ち込むと
 /// 生成元が「設定ファイルとして読めるもの」でなくなるため。置換だけに
 /// 限れば *.tmpl は元の設定とほぼ同じ見た目のまま保てる。
-/// op:// で始まる参照は 1Password から取る。1 回の render で同じ参照を
-/// 何度も引かないよう覚えておく。
+/// 秘密の取り出し方。
+///
+/// 主要なプロバイダはどれも「コマンドを実行して標準出力を受け取る」形なので、
+/// プロバイダごとに実装を書かない。scheme とコマンドの対応を宣言してもらう。
+/// こうすると sennit が知らないプロバイダでも動く。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Provider {
+    /// `{}` が参照文字列に置き換わる。`op read --no-newline {}` のように書く。
+    pub command: String,
+    /// 末尾の改行を落とす。多くの CLI は改行を付けて返す。
+    #[serde(default = "yes")]
+    pub trim: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// scheme -> 取り出し方
+pub type Providers = BTreeMap<String, Provider>;
+
+/// 宣言が無いときの既定。1Password だけを知っている。
+pub fn default_providers() -> Providers {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "op".to_string(),
+        Provider {
+            command: "op read --no-newline {}".into(),
+            trim: true,
+        },
+    );
+    m
+}
+
+/// 1 回の render で同じ参照を何度も引かないよう覚えておく。
 #[derive(Default)]
 pub struct SecretCache {
     seen: BTreeMap<String, String>,
+    providers: Providers,
 }
 
 impl SecretCache {
-    fn read(&mut self, reference: &str) -> Result<String> {
-        if let Some(v) = self.seen.get(reference) {
+    pub fn with(providers: Providers) -> Self {
+        Self {
+            seen: BTreeMap::new(),
+            providers,
+        }
+    }
+
+    fn read(&mut self, scheme: &str, reference: &str) -> Result<String> {
+        let key = format!("{scheme}://{reference}");
+        if let Some(v) = self.seen.get(&key) {
             return Ok(v.clone());
         }
-        let out = std::process::Command::new("op")
-            .args(["read", "--no-newline", reference])
+        let Some(provider) = self.providers.get(scheme) else {
+            let known: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+            bail!(
+                "no provider declared for `{scheme}://`. Known: {}",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            );
+        };
+
+        // 参照は引数として渡す。シェルを経由しないので、参照に空白や記号が
+        // あってもそのまま届き、注入の余地も無い。
+        let mut parts = shell_words(&provider.command);
+        if parts.is_empty() {
+            bail!("provider `{scheme}` has an empty command");
+        }
+        for part in parts.iter_mut() {
+            *part = part.replace("{}", reference);
+        }
+        let bin = parts.remove(0);
+
+        let out = std::process::Command::new(&bin)
+            .args(&parts)
             .output()
-            .with_context(|| {
-                format!("failed to run `op`; is the 1Password CLI installed? ({reference})")
-            })?;
+            .with_context(|| format!("failed to run `{bin}` for {scheme}://; is it installed?"))?;
         if !out.status.success() {
             bail!(
-                "`op read {reference}` failed: {}",
+                "`{} {}` failed: {}",
+                bin,
+                parts.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        let value = String::from_utf8(out.stdout)
-            .with_context(|| format!("{reference} is not valid UTF-8"))?;
-        self.seen.insert(reference.to_string(), value.clone());
+        let mut value =
+            String::from_utf8(out.stdout).with_context(|| format!("{key} is not valid UTF-8"))?;
+        if provider.trim {
+            while value.ends_with('\n') || value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        self.seen.insert(key, value.clone());
         Ok(value)
+    }
+}
+
+/// 引用符を尊重した最小の分割。見るのはコマンド定義側の引用だけ。
+fn shell_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut had_quote = false;
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), ch) if ch == q => quote = None,
+            (Some(_), ch) => cur.push(ch),
+            (None, '\'') | (None, '"') => {
+                quote = Some(c);
+                had_quote = true;
+            }
+            (None, ch) if ch.is_whitespace() => {
+                if !cur.is_empty() || had_quote {
+                    out.push(std::mem::take(&mut cur));
+                    had_quote = false;
+                }
+            }
+            (None, ch) => cur.push(ch),
+        }
+    }
+    if !cur.is_empty() || had_quote {
+        out.push(cur);
+    }
+    out
+}
+
+/// 条件ブロックを先に処理して、残らない側を落とす。
+///
+/// ループも関数も入れない。入れた瞬間にテンプレートが「生成先の設定ファイル
+/// として読めるもの」でなくなる。ブロック単位の分岐だけなら、消える行が
+/// 見えるだけで元の形は保たれる。
+///
+///     {{ if sennit.os == "darwin" }}
+///     macos-option-as-alt = true
+///     {{ end }}
+///
+/// 比較は == と != のみ。左辺は変数、右辺は変数か引用符付きの文字列。
+/// `{{ if var }}` は「空でなければ真」。
+fn strip_conditionals(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    source: &str,
+) -> Result<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    // 真の側を出力しているか。ネストのために積む
+    let mut stack: Vec<bool> = Vec::new();
+
+    while let Some(i) = rest.find("{{") {
+        let Some(end_rel) = rest[i + 2..].find("}}") else {
+            break;
+        };
+        let directive = rest[i + 2..i + 2 + end_rel].trim();
+        let before = &rest[..i];
+        let after = &rest[i + 2 + end_rel + 2..];
+
+        let keeping = stack.iter().all(|k| *k);
+        if keeping {
+            out.push_str(before);
+        }
+
+        if let Some(cond) = directive.strip_prefix("if ") {
+            stack.push(evaluate(cond.trim(), vars, source)?);
+            trim_line(&out, after, &mut rest);
+            continue;
+        }
+        if directive == "else" {
+            let Some(top) = stack.pop() else {
+                bail!("{source}: `else` without `if`");
+            };
+            stack.push(!top);
+            trim_line(&out, after, &mut rest);
+            continue;
+        }
+        if directive == "end" {
+            if stack.pop().is_none() {
+                bail!("{source}: `end` without `if`");
+            }
+            trim_line(&out, after, &mut rest);
+            continue;
+        }
+
+        // 条件でないものはそのまま残す。値の置換は次の段でやる
+        if keeping {
+            out.push_str(&rest[i..i + 2 + end_rel + 2]);
+        }
+        rest = after;
+    }
+
+    if !stack.is_empty() {
+        bail!("{source}: unterminated `if`");
+    }
+    if stack.iter().all(|k| *k) {
+        out.push_str(rest);
+    }
+    Ok(out)
+}
+
+/// ディレクティブだけの行は行ごと消す。残すと空行が増える。
+fn trim_line<'a>(out: &str, after: &'a str, rest: &mut &'a str) {
+    if out.ends_with('\n') || out.is_empty() {
+        *rest = after.strip_prefix('\n').unwrap_or(after);
+    } else {
+        *rest = after;
+    }
+}
+
+fn evaluate(cond: &str, vars: &BTreeMap<String, String>, source: &str) -> Result<bool> {
+    for (op, negate) in [("==", false), ("!=", true)] {
+        if let Some((l, r)) = cond.split_once(op) {
+            let l = resolve(l.trim(), vars, source)?;
+            let r = resolve(r.trim(), vars, source)?;
+            return Ok((l == r) != negate);
+        }
+    }
+    // 単体なら「空でなければ真」
+    Ok(!resolve(cond, vars, source)?.is_empty())
+}
+
+fn resolve(token: &str, vars: &BTreeMap<String, String>, source: &str) -> Result<String> {
+    if (token.starts_with('"') && token.ends_with('"') && token.len() >= 2)
+        || (token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2)
+    {
+        return Ok(token[1..token.len() - 1].to_string());
+    }
+    match vars.get(token) {
+        Some(v) => Ok(v.clone()),
+        None => bail!("{source}: unknown variable `{token}` in a condition"),
     }
 }
 
@@ -123,6 +337,9 @@ pub fn expand_with(
     source: &str,
     secrets: &mut SecretCache,
 ) -> Result<String> {
+    let template = strip_conditionals(template, vars, source)?;
+    let template = template.as_str();
+
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -133,9 +350,8 @@ pub fn expand_with(
             bail!("{source}: unterminated `{{{{`");
         };
         let key = after[..end].trim();
-        if let Some(reference) = key.strip_prefix("op://") {
-            let value = secrets.read(&format!("op://{reference}"))?;
-            out.push_str(&value);
+        if let Some((scheme, reference)) = split_reference(key) {
+            out.push_str(&secrets.read(scheme, reference)?);
         } else {
             match vars.get(key) {
                 Some(v) => out.push_str(v),
@@ -210,6 +426,73 @@ mod tests {
     #[test]
     fn unterminated_placeholder_is_an_error() {
         assert!(expand_with_test("{{ ui.bg", &vars(), "t").is_err());
+    }
+
+    fn cond(t: &str) -> Result<String> {
+        let mut v = vars();
+        v.insert("sennit.os".into(), "darwin".into());
+        v.insert("sennit.profile".into(), String::new());
+        strip_conditionals(t, &v, "t")
+    }
+
+    #[test]
+    fn keeps_the_true_branch() {
+        let out = cond("{{ if sennit.os == \"darwin\" }}\nmac\n{{ end }}\n").unwrap();
+        assert_eq!(out, "mac\n");
+    }
+
+    #[test]
+    fn drops_the_false_branch() {
+        let out = cond("{{ if sennit.os == \"linux\" }}\nlinux\n{{ end }}\n").unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn handles_else() {
+        let out = cond("{{ if sennit.os == \"linux\" }}\na\n{{ else }}\nb\n{{ end }}\n").unwrap();
+        assert_eq!(out, "b\n");
+    }
+
+    #[test]
+    fn not_equal_works() {
+        let out = cond("{{ if sennit.os != \"linux\" }}\nmac\n{{ end }}\n").unwrap();
+        assert_eq!(out, "mac\n");
+    }
+
+    /// 単体の変数は「空でなければ真」。profile 未設定を素直に書けるように。
+    #[test]
+    fn a_bare_variable_is_true_when_not_empty() {
+        assert_eq!(cond("{{ if sennit.os }}\nx\n{{ end }}\n").unwrap(), "x\n");
+        assert_eq!(cond("{{ if sennit.profile }}\nx\n{{ end }}\n").unwrap(), "");
+    }
+
+    /// 設定ファイル側に [end] のようなリテラルがあっても壊さない。
+    /// 見るのは {{ }} の中だけ。
+    #[test]
+    fn literal_text_resembling_directives_is_untouched() {
+        let out = cond("[end]\nname = 1\n").unwrap();
+        assert_eq!(out, "[end]\nname = 1\n");
+    }
+
+    #[test]
+    fn nesting_works() {
+        let out =
+            cond("{{ if sennit.os == \"darwin\" }}\n{{ if sennit.os }}\ny\n{{ end }}\n{{ end }}\n")
+                .unwrap();
+        assert_eq!(out, "y\n");
+    }
+
+    #[test]
+    fn unbalanced_blocks_are_errors() {
+        assert!(cond("{{ if sennit.os }}\nx\n").is_err());
+        assert!(cond("x\n{{ end }}\n").is_err());
+        assert!(cond("{{ else }}\n").is_err());
+    }
+
+    /// 条件に出てくる未知の変数も黙って偽にしない。
+    #[test]
+    fn unknown_variable_in_a_condition_is_an_error() {
+        assert!(cond("{{ if nope == \"x\" }}\ny\n{{ end }}\n").is_err());
     }
 
     /// op:// を含むかどうかで、初回セットアップで展開するかが変わる。

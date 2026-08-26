@@ -15,6 +15,9 @@ pub struct Manifest {
     /// テンプレートに渡すデータファイル。既定は theme.toml。
     #[serde(default)]
     pub data: Vec<String>,
+    /// 秘密の取り出し方。scheme -> コマンド。宣言が無ければ op のみ。
+    #[serde(default)]
+    pub providers: crate::render::Providers,
     /// パス -> 8進のモード。
     ///
     /// symlink 方式なのでリポジトリ側の権限がそのまま見える。宣言しておくと
@@ -92,6 +95,7 @@ mod tests {
             },
             render: Default::default(),
             hooks: Default::default(),
+            providers: Default::default(),
             data: Default::default(),
             modes: Default::default(),
         }

@@ -246,7 +246,13 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
         manifest.data.iter().map(|d| root.join(d)).collect()
     };
     let vars = render::load_vars(&data)?;
-    let mut cache = render::SecretCache::default();
+    // 宣言があればそれを、無ければ op だけを既定にする
+    let providers = if manifest.providers.is_empty() {
+        render::default_providers()
+    } else {
+        manifest.providers.clone()
+    };
+    let mut cache = render::SecretCache::with(providers);
     let mut deferred = Vec::new();
 
     for (out_rel, tmpl_rel) in &manifest.render {
