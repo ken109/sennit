@@ -148,8 +148,10 @@ fn verifiable(name: &str, pkg: &Package) -> Option<Vec<(Kind, String)>> {
         Kind::Library => return None,
     }
 
-    // フォント以外の cask は GUI アプリ。PATH に出ないのが普通
-    if pkg.manager_of() == Manager::BrewCask {
+    // cask は普通 GUI アプリで PATH に出ないが、コマンドを提供するものもある
+    // (1password-cli の op)。provides を書いているなら、それは
+    // 「これが見つかるはず」という宣言なので検証する。
+    if pkg.manager_of() == Manager::BrewCask && pkg.provides.is_empty() {
         return None;
     }
     // mise が入れるものは shim 経由で、mise を有効化したシェルでしか
@@ -267,6 +269,15 @@ mod tests {
     fn gui_casks_are_not_verifiable() {
         let p = pkg("manager = \"brew-cask\"\n");
         assert!(verifiable("slack", &p).is_none());
+    }
+
+    /// ただし provides を書いた cask は検証する。1password-cli は cask だが
+    /// op を提供するので、無ければ秘密の展開が落ちる。
+    #[test]
+    fn casks_that_declare_a_command_are_verified() {
+        let p = pkg("manager = \"brew-cask\"\nprovides = [\"op\"]\n");
+        let got = verifiable("1password-cli", &p).unwrap();
+        assert_eq!(got, vec![(Kind::Command, "op".to_string())]);
     }
 
     /// フォントの cask は検証できる。ファミリ名の宣言がある場合に限る。

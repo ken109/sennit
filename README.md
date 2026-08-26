@@ -117,7 +117,19 @@ nothing it produces reaches the repository.
 token = "{{ op://Personal/GitHub/token }}"
 ```
 
-Any `{{ op://... }}` is read through the 1Password CLI at render time.
+Any `{{ op://... }}` is read through the 1Password CLI at render time — but only when you
+ask for it. `apply` skips those templates and says so; `apply --secrets` renders them.
+
+That split is not a convenience. 1Password needs a person to sign in, enable the CLI
+integration, and unlock the app, none of which can happen partway through an unattended
+install, and none of which exist at all on a headless Linux box or inside a container. If
+secrets were rendered by default, the first run on a new machine would always fail. This
+way `apply` always succeeds, and the secret-bearing files simply are not there until you
+run it again with `--secrets`.
+
+A template that references `op://` also makes `check` require the `op` command, so the
+dependency shows up the moment it exists rather than on whichever machine first tries to
+use it.
 
 ## What apply will not do
 

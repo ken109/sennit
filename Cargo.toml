@@ -1,6 +1,6 @@
 [package]
 name = "sennit"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "A dotfiles manager that keeps symlink semantics, and adds templating and drift detection"
 repository = "https://github.com/ken109/sennit"

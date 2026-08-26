@@ -23,6 +23,7 @@ pub fn scan(root: &Path) -> Result<Vec<Requirement>> {
     zsh(root, &mut reqs)?;
     config_dirs(root, &mut reqs)?;
     annotations(root, &mut reqs)?;
+    secret_templates(root, &mut reqs)?;
     reqs.sort_by(|a, b| (a.kind.label(), &a.name).cmp(&(b.kind.label(), &b.name)));
     reqs.dedup_by(|a, b| a.kind == b.kind && a.name == b.name);
     Ok(reqs)
@@ -162,6 +163,36 @@ fn zsh(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// {{ op://... }} を含むテンプレートは 1Password CLI を要求する。
+///
+/// テンプレートに書いた瞬間に op への依存が生まれるが、それはどの設定
+/// ファイルにも現れない。宣言し忘れると、秘密を使うマシンでだけ失敗する。
+fn secret_templates(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
+    let mut files = Vec::new();
+    walk(&root.join(".config"), &mut files, 0);
+
+    for path in files {
+        if path.extension().is_none_or(|e| e != "tmpl") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !crate::render::needs_secrets(&text) {
+            continue;
+        }
+        out.push(Requirement {
+            kind: Kind::Command,
+            name: "op".to_string(),
+            source: format!(
+                "{} (op:// reference)",
+                path.strip_prefix(root).unwrap_or(&path).display()
+            ),
+        });
     }
     Ok(())
 }

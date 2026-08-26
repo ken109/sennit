@@ -44,6 +44,9 @@ enum Command {
         /// symlink でない実体を、退避せずに削除する
         #[arg(long)]
         no_backup: bool,
+        /// 1Password を参照するテンプレートも展開する
+        #[arg(long)]
+        secrets: bool,
     },
     /// 適用したときに何が変わるかを表示する
     Diff,
@@ -70,7 +73,13 @@ enum Command {
         dry_run: bool,
     },
     /// theme.toml からテンプレートを展開して設定ファイルを生成する
-    Render,
+    Render {
+        /// 1Password を参照するテンプレートも展開する。
+        /// 既定では飛ばす。op はログインとロック解除を人手に要求するので、
+        /// 自動セットアップの途中では必ず失敗するため。
+        #[arg(long)]
+        secrets: bool,
+    },
     /// 直前の apply が退避したファイルを元に戻す
     Rollback {
         /// 実際には戻さず、何を戻すかだけ表示する
@@ -107,9 +116,13 @@ fn run() -> Result<()> {
     let plan = Plan::build(&root, &home, &manifest)?;
 
     match cli.command {
-        Command::Apply { dry_run, no_backup } => {
+        Command::Apply {
+            dry_run,
+            no_backup,
+            secrets,
+        } => {
             // 生成物はコミットしないので、配置の前に必ず作る
-            render_all(&root, &manifest)?;
+            render_all(&root, &manifest, secrets)?;
             let plan = Plan::build(&root, &home, &manifest)?;
             apply(&plan, &home, dry_run, !no_backup)
         }
@@ -119,7 +132,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Check => check(&root),
-        Command::Render => render_all(&root, &manifest),
+        Command::Render { secrets } => render_all(&root, &manifest, secrets),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
         Command::Verify { export } => verify::verify(&root, export),
         Command::Compare { a, b } => verify::compare(&a, &b),
@@ -222,18 +235,28 @@ fn check(root: &Path) -> Result<()> {
 /// 生成後のファイルを読め、新規 clone でも設定が揃っているため。
 /// 代わりに「テンプレートを直したが生成し忘れる」ことが起きうるので、
 /// --check を CI に置いて食い違いを落とす。
-fn render_all(root: &Path, manifest: &Manifest) -> Result<()> {
+fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
     if manifest.render.is_empty() {
         return Ok(());
     }
     let vars = render::load_vars(&root.join("theme.toml"))?;
+    let mut cache = render::SecretCache::default();
+    let mut deferred = Vec::new();
 
     for (out_rel, tmpl_rel) in &manifest.render {
         let tmpl_path = root.join(tmpl_rel);
         let out_path = root.join(out_rel);
         let template = std::fs::read_to_string(&tmpl_path)
             .with_context(|| format!("failed to read template {}", tmpl_path.display()))?;
-        let rendered = render::expand(&template, &vars, tmpl_rel)?;
+
+        // 秘密を参照するものは既定で飛ばす。1Password はサインインと
+        // ロック解除を人手に要求するので、初回セットアップや CI、
+        // コンテナでは原理的に成立しない。そこを異常扱いにしない。
+        if !secrets && render::needs_secrets(&template) {
+            deferred.push(out_rel.clone());
+            continue;
+        }
+        let rendered = render::expand_with(&template, &vars, tmpl_rel, &mut cache)?;
 
         // 中身が同じなら触らない。mtime が動くと apply が無駄に張り直す
         if std::fs::read_to_string(&out_path).ok().as_deref() == Some(rendered.as_str()) {
@@ -245,6 +268,16 @@ fn render_all(root: &Path, manifest: &Manifest) -> Result<()> {
         std::fs::write(&out_path, &rendered)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
+    }
+
+    if !deferred.is_empty() {
+        for out_rel in &deferred {
+            println!("  \x1b[36mdeferred\x1b[0m   {out_rel}  (needs 1Password)");
+        }
+        println!(
+            "{} template(s) not rendered; run `sennit apply --secrets` once 1Password is unlocked",
+            deferred.len()
+        );
     }
     Ok(())
 }

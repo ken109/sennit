@@ -35,15 +35,30 @@ fn flatten(value: &toml::Value, prefix: String, out: &mut BTreeMap<String, Strin
     }
 }
 
+/// このテンプレートが秘密を参照しているか。
+///
+/// 宣言させるのではなく中身から判定する。書き忘れると初回セットアップが
+/// 落ちる種類の宣言は、そもそも人間に書かせない方がよい。
+pub fn needs_secrets(template: &str) -> bool {
+    let mut rest = template;
+    while let Some(i) = rest.find("{{") {
+        let after = &rest[i + 2..];
+        let Some(end) = after.find("}}") else {
+            return false;
+        };
+        if after[..end].trim().starts_with("op://") {
+            return true;
+        }
+        rest = &after[end..];
+    }
+    false
+}
+
 /// `{{ key }}` を差し替えるだけの最小のテンプレート展開。
 ///
 /// 汎用テンプレートエンジンを入れないのは、条件分岐やループを持ち込むと
 /// 生成元が「設定ファイルとして読めるもの」でなくなるため。置換だけに
 /// 限れば *.tmpl は元の設定とほぼ同じ見た目のまま保てる。
-pub fn expand(template: &str, vars: &BTreeMap<String, String>, source: &str) -> Result<String> {
-    expand_with(template, vars, source, &mut SecretCache::default())
-}
-
 /// op:// で始まる参照は 1Password から取る。1 回の render で同じ参照を
 /// 何度も引かないよう覚えておく。
 #[derive(Default)]
@@ -110,6 +125,15 @@ pub fn expand_with(
 mod tests {
     use super::*;
 
+    /// 秘密を使わないテンプレートの展開。テストは 1Password を叩かない。
+    fn expand_with_test(
+        template: &str,
+        vars: &BTreeMap<String, String>,
+        source: &str,
+    ) -> Result<String> {
+        expand_with(template, vars, source, &mut SecretCache::default())
+    }
+
     fn vars() -> BTreeMap<String, String> {
         let mut v = BTreeMap::new();
         v.insert("ui.bg".into(), "#1a1b26".into());
@@ -119,39 +143,60 @@ mod tests {
 
     #[test]
     fn expands_known_variables() {
-        let out = expand("bg = \"{{ ui.bg }}\"", &vars(), "t").unwrap();
+        let out = expand_with_test("bg = \"{{ ui.bg }}\"", &vars(), "t").unwrap();
         assert_eq!(out, "bg = \"#1a1b26\"");
     }
 
     #[test]
     fn expands_multiple_occurrences() {
-        let out = expand("{{ ui.bg }}/{{ normal.red }}/{{ ui.bg }}", &vars(), "t").unwrap();
+        let out =
+            expand_with_test("{{ ui.bg }}/{{ normal.red }}/{{ ui.bg }}", &vars(), "t").unwrap();
         assert_eq!(out, "#1a1b26/#f7768e/#1a1b26");
     }
 
     #[test]
     fn leaves_text_without_placeholders_untouched() {
         let src = "no placeholders here";
-        assert_eq!(expand(src, &vars(), "t").unwrap(), src);
+        assert_eq!(expand_with_test(src, &vars(), "t").unwrap(), src);
     }
 
     #[test]
     fn tolerates_whitespace_in_placeholder() {
-        assert_eq!(expand("{{ui.bg}}", &vars(), "t").unwrap(), "#1a1b26");
-        assert_eq!(expand("{{   ui.bg   }}", &vars(), "t").unwrap(), "#1a1b26");
+        assert_eq!(
+            expand_with_test("{{ui.bg}}", &vars(), "t").unwrap(),
+            "#1a1b26"
+        );
+        assert_eq!(
+            expand_with_test("{{   ui.bg   }}", &vars(), "t").unwrap(),
+            "#1a1b26"
+        );
     }
 
     /// 未知の変数は黙って空文字にせず落とす。設定が壊れたまま配置されるのを防ぐ。
     #[test]
     fn unknown_variable_is_an_error() {
-        let err = expand("{{ nope }}", &vars(), "t.tmpl").unwrap_err();
+        let err = expand_with_test("{{ nope }}", &vars(), "t.tmpl").unwrap_err();
         assert!(err.to_string().contains("unknown template variable"));
         assert!(err.to_string().contains("t.tmpl"));
     }
 
     #[test]
     fn unterminated_placeholder_is_an_error() {
-        assert!(expand("{{ ui.bg", &vars(), "t").is_err());
+        assert!(expand_with_test("{{ ui.bg", &vars(), "t").is_err());
+    }
+
+    /// op:// を含むかどうかで、初回セットアップで展開するかが変わる。
+    #[test]
+    fn detects_secret_references() {
+        assert!(needs_secrets("token = {{ op://Vault/Item/field }}"));
+        assert!(!needs_secrets("bg = {{ ui.bg }}"));
+        assert!(!needs_secrets("no placeholders"));
+    }
+
+    /// 閉じていない {{ を秘密ありと誤判定しない。
+    #[test]
+    fn unterminated_placeholder_is_not_a_secret() {
+        assert!(!needs_secrets("{{ op://Vault"));
     }
 
     #[test]
