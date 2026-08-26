@@ -175,12 +175,7 @@ mod tests {
         write(&elsewhere, "y");
         let wrong = d.join("wrong.conf");
         std::os::unix::fs::symlink(&elsewhere, &wrong).unwrap();
-        assert_eq!(
-            inspect(&src, &wrong),
-            State::Wrong {
-                current: elsewhere
-            }
-        );
+        assert_eq!(inspect(&src, &wrong), State::Wrong { current: elsewhere });
     }
 
     /// リンク先が消えていても、リンクそのものは張られている。

@@ -204,10 +204,8 @@ mod tests {
     #[test]
     fn a_misspelled_key_is_rejected() {
         // when_changed と書くと、監視付きのフックが毎回走るフックに変わる
-        let e = load(
-            "[link]\ncommon = []\n\n[hooks.h]\nwhen_changed = [\"a\"]\nrun = \"true\"\n",
-        )
-        .unwrap_err();
+        let e = load("[link]\ncommon = []\n\n[hooks.h]\nwhen_changed = [\"a\"]\nrun = \"true\"\n")
+            .unwrap_err();
         assert!(format!("{e:#}").contains("when_changed"), "{e:#}");
     }
 

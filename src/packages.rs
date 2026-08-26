@@ -62,7 +62,6 @@ impl Manager {
             _ => Manager::Unknown,
         }
     }
-
 }
 
 #[derive(Debug, Deserialize, Default)]

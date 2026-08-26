@@ -329,13 +329,14 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool, dry_run: bool) ->
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mode = manifest
-            .mode_for(Path::new(out_rel))
-            .unwrap_or(if render::needs_secrets(&template) {
-                0o400
-            } else {
-                0o444
-            });
+        let mode =
+            manifest
+                .mode_for(Path::new(out_rel))
+                .unwrap_or(if render::needs_secrets(&template) {
+                    0o400
+                } else {
+                    0o444
+                });
         write_generated(&out_path, rendered.as_bytes(), mode)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
@@ -520,7 +521,11 @@ fn apply(
         match std::fs::read_link(&dest) {
             Ok(target) if target.starts_with(root) => {}
             _ => {
-                println!("  {:>8}  {}  (points outside the repository; left alone)", "keep", rel.display());
+                println!(
+                    "  {:>8}  {}  (points outside the repository; left alone)",
+                    "keep",
+                    rel.display()
+                );
                 continue;
             }
         }
@@ -644,11 +649,7 @@ fn apply(
         return Ok(());
     }
 
-    println!(
-        "\n{} link(s) updated, {} pruned",
-        changes.len(),
-        pruned
-    );
+    println!("\n{} link(s) updated, {} pruned", changes.len(), pruned);
     if !kept.is_empty() {
         println!(
             "{} file(s) moved aside; `sennit rollback` puts them back",
@@ -862,10 +863,16 @@ mod tests {
         assert_eq!(backup_path(&dest).unwrap(), d.join("a.conf.sennit-backup"));
 
         std::fs::write(d.join("a.conf.sennit-backup"), "first").unwrap();
-        assert_eq!(backup_path(&dest).unwrap(), d.join("a.conf.sennit-backup.1"));
+        assert_eq!(
+            backup_path(&dest).unwrap(),
+            d.join("a.conf.sennit-backup.1")
+        );
 
         std::fs::write(d.join("a.conf.sennit-backup.1"), "second").unwrap();
-        assert_eq!(backup_path(&dest).unwrap(), d.join("a.conf.sennit-backup.2"));
+        assert_eq!(
+            backup_path(&dest).unwrap(),
+            d.join("a.conf.sennit-backup.2")
+        );
     }
 
     #[test]
