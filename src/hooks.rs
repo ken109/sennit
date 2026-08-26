@@ -13,6 +13,7 @@ use std::process::Command;
 /// 実例: .config/bat/themes/ を配置しても、bat cache --build を踏まないと
 /// テーマ名が解決できず、delta まで既定色に落ちる。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hook {
     /// このパスが変わったときだけ走らせる。空なら毎回走る。
     #[serde(default, rename = "when-changed")]

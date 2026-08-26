@@ -14,6 +14,7 @@ use std::process::Command;
 /// 1Password が「人間のロック解除を必要とする」という理由で初回に使えない
 /// のに対し、これはその制約が無い。両方あると穴が埋まる。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Encryption {
     /// `{}` が暗号文ファイルのパスに置き換わる。標準出力が平文。
     pub command: String,

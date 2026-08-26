@@ -1,9 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
 /// sennit.toml の表現。
+///
+/// 知らないキーは受け付けない。`when_changed` を `when-changed` の代わりに
+/// 書くと、監視付きのフックが毎回走るフックに黙って変わる。綴りの誤りが
+/// 無言の挙動変化になるくらいなら、読み込みで落とす方がよい。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub link: Link,
     /// 出力パス -> テンプレートパス
@@ -33,6 +38,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Link {
     #[serde(default)]
     pub common: Vec<String>,
@@ -48,8 +54,66 @@ impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read manifest: {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("failed to parse manifest: {}", path.display()))
+        let m: Manifest = toml::from_str(&text)
+            .with_context(|| format!("failed to parse manifest: {}", path.display()))?;
+        m.validate()
+            .with_context(|| format!("invalid manifest: {}", path.display()))?;
+        Ok(m)
+    }
+
+    /// 宣言そのものの検査。配置を始める前に落とす。
+    fn validate(&self) -> Result<()> {
+        let mut paths: Vec<(&str, &str)> = Vec::new();
+        for p in self
+            .link
+            .common
+            .iter()
+            .chain(&self.link.darwin)
+            .chain(&self.link.linux)
+        {
+            paths.push(("link", p));
+        }
+        for (out, src) in &self.render {
+            paths.push(("render output", out));
+            paths.push(("render template", src));
+        }
+        for (out, src) in &self.encrypted {
+            paths.push(("encrypted output", out));
+            paths.push(("encrypted source", src));
+        }
+        for p in self.modes.keys() {
+            paths.push(("modes", p));
+        }
+
+        // 相対パスは $HOME とリポジトリの両方の基準になる。絶対パスを混ぜると
+        // join がそちらを採ってリポジトリの外を指し、`..` は $HOME の外へ出る。
+        // どちらも「利用者の設定を置く」の範囲を越えるので宣言の時点で断る。
+        for (what, p) in paths {
+            let path = Path::new(p);
+            if path.is_absolute() {
+                bail!("{what} `{p}` is an absolute path; declarations are relative to the repository root");
+            }
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!("{what} `{p}` contains `..`; declarations may not leave the repository");
+            }
+            if p.is_empty() {
+                bail!("{what} has an empty path");
+            }
+        }
+
+        // 綴りを誤った 8 進は、宣言したはずの制限が黙って無くなる。
+        // verify も同じ理由で読み飛ばすので、誰も気づけない。
+        for (path, mode) in &self.modes {
+            let m = u32::from_str_radix(mode, 8)
+                .with_context(|| format!("mode `{mode}` for `{path}` is not octal"))?;
+            if m > 0o7777 {
+                bail!("mode `{mode}` for `{path}` is out of range");
+            }
+        }
+        Ok(())
     }
 
     /// 現在の OS で配置対象になるトップレベルのパス。
@@ -80,6 +144,7 @@ impl Manifest {
             .iter()
             .filter(|(pat, _)| rel.starts_with(pat))
             .max_by_key(|(pat, _)| pat.len())
+            // 8 進として読めることは load の検査で保証済み
             .and_then(|(_, m)| u32::from_str_radix(m, 8).ok())
     }
 
@@ -100,6 +165,60 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(toml: &str) -> Result<Manifest> {
+        let p = std::env::temp_dir().join(format!(
+            "sennit-manifest-{}.toml",
+            toml.len() as u64 * 31 + toml.bytes().map(u64::from).sum::<u64>()
+        ));
+        std::fs::write(&p, toml).unwrap();
+        Manifest::load(&p)
+    }
+
+    #[test]
+    fn an_absolute_declaration_is_rejected() {
+        // join が絶対パスを採るので、リポジトリの外を指してしまう
+        let e = load("[link]\ncommon = [\"/etc/passwd\"]\n").unwrap_err();
+        assert!(format!("{e:#}").contains("absolute"), "{e:#}");
+    }
+
+    #[test]
+    fn leaving_the_repository_is_rejected() {
+        let e = load("[link]\ncommon = [\"../secret\"]\n").unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
+    }
+
+    #[test]
+    fn a_template_path_that_escapes_is_rejected() {
+        let e = load("[link]\ncommon = []\n\n[render]\n\"a.conf\" = \"../a.tmpl\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
+    }
+
+    #[test]
+    fn a_mode_that_is_not_octal_is_rejected() {
+        // 黙って読み飛ばすと、宣言した制限が誰にも適用されないまま ok になる
+        let e = load("[link]\ncommon = []\n\n[modes]\n\".npmrc\" = \"0o600\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("octal"), "{e:#}");
+    }
+
+    #[test]
+    fn a_misspelled_key_is_rejected() {
+        // when_changed と書くと、監視付きのフックが毎回走るフックに変わる
+        let e = load(
+            "[link]\ncommon = []\n\n[hooks.h]\nwhen_changed = [\"a\"]\nrun = \"true\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("when_changed"), "{e:#}");
+    }
+
+    #[test]
+    fn a_valid_manifest_loads() {
+        let m = load(
+            "[link]\ncommon = [\".config\"]\nignore = [\"*.tmpl\"]\n\n[modes]\n\".npmrc\" = \"600\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.mode_for(Path::new(".npmrc")), Some(0o600));
+    }
 
     fn manifest(ignore: &[&str]) -> Manifest {
         Manifest {

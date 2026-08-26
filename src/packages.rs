@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,6 +43,8 @@ pub enum Manager {
     ZedExtension,
     /// sennit は導入に関与しない
     None,
+    /// 綴りが宣言に無いもの。load で落とすのでここまで来ない
+    Unknown,
 }
 
 impl Manager {
@@ -55,9 +57,12 @@ impl Manager {
             Some("yay") => Manager::Yay,
             // Zed 拡張は settings.json の auto_install_extensions が入れる
             Some("zed-extension") => Manager::ZedExtension,
-            _ => Manager::None,
+            Some("none") => Manager::None,
+            // 綴りの誤りと「関与しない」の宣言は区別する。load が弾く。
+            _ => Manager::Unknown,
         }
     }
+
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -152,7 +157,12 @@ impl Packages {
             .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
             .filter(|(_, p)| matches_profile(&p.profiles))
             .filter_map(|(name, p)| resolve(name, p, linux_pm))
-            .filter(|i| !matches!(i.manager, Manager::None | Manager::ZedExtension))
+            .filter(|i| {
+                !matches!(
+                    i.manager,
+                    Manager::None | Manager::Unknown | Manager::ZedExtension
+                )
+            })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -161,7 +171,43 @@ impl Packages {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        let p: Packages =
+            toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        p.validate()
+            .with_context(|| format!("invalid {}", path.display()))?;
+        Ok(p)
+    }
+
+    /// 綴りの誤りを黙って通さない。
+    ///
+    /// `manager` を打ち間違えると sync の対象から静かに外れ、それでいて
+    /// verify は「入っていない」と言い続ける。宣言したはずのものが
+    /// 誰にも導入されない状態になるので、読み込みで落とす。
+    fn validate(&self) -> Result<()> {
+        for (name, pkg) in &self.packages {
+            if let Some(m) = pkg.manager.as_deref() {
+                if Manager::parse(Some(m)) == Manager::Unknown {
+                    bail!(
+                        "package `{name}` has an unknown manager `{m}`; \
+                         expected one of: brew, brew-cask, mise, apt, yay, zed-extension, none"
+                    );
+                }
+            }
+            if let Some(k) = pkg.kind.as_deref() {
+                if !matches!(k, "command" | "font" | "extension" | "library") {
+                    bail!(
+                        "package `{name}` has an unknown kind `{k}`; \
+                         expected one of: command, font, extension, library"
+                    );
+                }
+            }
+            for os in &pkg.os {
+                if !matches!(os.as_str(), "darwin" | "linux") {
+                    bail!("package `{name}` has an unknown os `{os}`; expected darwin or linux");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 宣言されている名前 -> optional かどうか。
@@ -419,5 +465,46 @@ mod tests {
         let i = p.installable();
         assert_eq!(i.len(), 1);
         assert_eq!(i[0].manager, Manager::Brew);
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn load(toml: &str) -> Result<Packages> {
+        let p = std::env::temp_dir().join(format!(
+            "sennit-packages-{}.toml",
+            toml.bytes().map(u64::from).sum::<u64>()
+        ));
+        std::fs::write(&p, toml).unwrap();
+        Packages::load(&p)
+    }
+
+    /// 打ち間違えると sync の対象から静かに外れる。それでいて verify は
+    /// 「入っていない」と言い続けるので、誰も導入しないまま残る。
+    #[test]
+    fn an_unknown_manager_is_rejected() {
+        let e = load("[packages]\nripgrep = { manager = \"brew-casks\" }\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown manager"), "{e:#}");
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected() {
+        let e = load("[packages]\ncica = { kind = \"fonts\" }\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown kind"), "{e:#}");
+    }
+
+    #[test]
+    fn an_unknown_os_is_rejected() {
+        let e = load("[packages]\ntrash = { os = [\"macos\"] }\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown os"), "{e:#}");
+    }
+
+    /// 「関与しない」の宣言は綴りの誤りではない
+    #[test]
+    fn declaring_no_manager_is_allowed() {
+        let p = load("[packages]\nsomething = { manager = \"none\" }\n").unwrap();
+        assert_eq!(p.packages["something"].manager_of(), Manager::None);
     }
 }

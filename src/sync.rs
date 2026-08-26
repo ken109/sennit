@@ -70,7 +70,7 @@ fn label(m: Manager) -> &'static str {
         Manager::Apt => "apt",
         Manager::Yay => "yay",
         Manager::ZedExtension => "zed",
-        Manager::None => "-",
+        Manager::None | Manager::Unknown => "-",
     }
 }
 
