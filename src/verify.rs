@@ -25,10 +25,14 @@ pub struct Report {
 /// verify は 1 台しか見ない。複数マシンを使っていると、片方だけ古い、
 /// 片方だけ手で入れた、という差は誰も教えてくれない。
 pub fn compare(a: &Path, b: &Path) -> Result<()> {
-    let ra: Report = serde_json::from_str(&std::fs::read_to_string(a)?)
-        .with_context(|| format!("failed to parse {}", a.display()))?;
-    let rb: Report = serde_json::from_str(&std::fs::read_to_string(b)?)
-        .with_context(|| format!("failed to parse {}", b.display()))?;
+    let ta = std::fs::read_to_string(a)
+        .with_context(|| format!("failed to read {}", a.display()))?;
+    let tb = std::fs::read_to_string(b)
+        .with_context(|| format!("failed to read {}", b.display()))?;
+    let ra: Report =
+        serde_json::from_str(&ta).with_context(|| format!("failed to parse {}", a.display()))?;
+    let rb: Report =
+        serde_json::from_str(&tb).with_context(|| format!("failed to parse {}", b.display()))?;
 
     let sa: std::collections::BTreeSet<_> = ra.present.iter().collect();
     let sb: std::collections::BTreeSet<_> = rb.present.iter().collect();

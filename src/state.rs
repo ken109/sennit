@@ -62,3 +62,52 @@ impl State {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_lists_what_left_the_manifest() {
+        let st = State {
+            links: vec![PathBuf::from("a"), PathBuf::from("b")],
+            ..Default::default()
+        };
+        assert_eq!(st.stale(&[PathBuf::from("a")]), vec![PathBuf::from("b")]);
+        assert!(st
+            .stale(&[PathBuf::from("a"), PathBuf::from("b")])
+            .is_empty());
+    }
+
+    #[test]
+    fn a_missing_state_file_reads_as_empty() {
+        let home = std::env::temp_dir().join("sennit-state-empty");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let st = State::load(&home).unwrap();
+        assert!(st.links.is_empty());
+        assert!(st.backups.is_empty());
+    }
+
+    #[test]
+    fn what_is_saved_comes_back() {
+        let home = std::env::temp_dir().join("sennit-state-roundtrip");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        State {
+            links: vec![PathBuf::from("a")],
+            backups: vec![Backup {
+                dest: PathBuf::from("/h/a"),
+                kept_at: PathBuf::from("/h/a.sennit-backup"),
+            }],
+            hooks: Default::default(),
+        }
+        .save(&home)
+        .unwrap();
+
+        let st = State::load(&home).unwrap();
+        assert_eq!(st.links, vec![PathBuf::from("a")]);
+        assert_eq!(st.backups.len(), 1);
+    }
+}
