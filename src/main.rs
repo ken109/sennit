@@ -485,10 +485,20 @@ fn apply(
     backup: bool,
 ) -> Result<()> {
     let previous = state::State::load(home)?;
-    let current: Vec<PathBuf> = plan.entries.iter().map(|e| e.rel.clone()).collect();
+    // 記録に載せるのは実際に張ったものだけ。まだ作られていない生成物を
+    // 載せると、次の apply がそれを stale と見なして消しにかかる。
+    let current: Vec<PathBuf> = plan
+        .entries
+        .iter()
+        .filter(|e| e.src.exists())
+        .map(|e| e.rel.clone())
+        .collect();
     let stale = previous.stale(&current);
 
-    let changes: Vec<_> = plan.changes().collect();
+    // 宣言されている生成物は、まだ作られていないことがある。秘密を読む
+    // テンプレートは --secrets を渡すまで飛ばされるので、その状態で張ると
+    // 行き先の無い symlink が $HOME に残る。数には出すが、張らない。
+    let (changes, not_yet): (Vec<_>, Vec<_>) = plan.changes().partition(|e| e.src.exists());
 
     let mut backups = Vec::new();
     let mut pruned = 0usize;
@@ -520,6 +530,10 @@ fn apply(
             std::fs::remove_file(&dest)
                 .with_context(|| format!("failed to remove {}", dest.display()))?;
         }
+    }
+
+    for e in &not_yet {
+        println!("  {:>8}  {}  (not generated yet)", "defer", e.rel.display());
     }
 
     for e in &changes {
@@ -574,6 +588,9 @@ fn apply(
         let Some(want) = manifest.mode_for(&e.rel) else {
             continue;
         };
+        if !e.src.exists() {
+            continue;
+        }
         use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(&e.src)
             .with_context(|| format!("failed to stat {}", e.src.display()))?;
