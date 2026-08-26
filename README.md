@@ -4,6 +4,10 @@ A dotfiles manager that keeps symlink semantics, and adds templating and drift d
 
 > *sennit* — braided cordage, made by plaiting many strands into a single line.
 
+[![crates.io](https://img.shields.io/crates/v/sennit.svg)](https://crates.io/crates/sennit)
+[![CI](https://github.com/ken109/sennit/actions/workflows/ci.yml/badge.svg)](https://github.com/ken109/sennit/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/sennit.svg)](LICENSE)
+
 ```sh
 brew install ken109/tap/sennit   # or: cargo install sennit
 ```
