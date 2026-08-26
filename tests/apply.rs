@@ -970,3 +970,49 @@ fn verify_does_not_approve_a_mode_it_could_not_read() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// 配置の途中で落ちても、そこまでに張ったリンクは記録される。
+///
+/// 記録されないと、次の apply はそのリンクを知らない。宣言から外しても
+/// prune の対象にならず、誰も管理していないリンクが $HOME に残る。
+#[test]
+fn a_link_placed_before_a_failure_is_still_recorded() {
+    let r = Repo::new("record-midloop");
+    // a.conf は張れるが、そのあと zz/ を作るところで落ちる
+    r.manifest("[link]\ncommon = [\"a.conf\", \"zz\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write("zz/b.conf", "b\n");
+    r.write_home("zz", "a file, not a directory\n");
+
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
+
+    // 宣言から外せば prune できる = 記録されていた
+    r.manifest("[link]\ncommon = []\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("prune"), "the link was never recorded:\n{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_err());
+}
+
+/// 退避が消えているなら「戻した」と言わない。
+#[test]
+fn rollback_does_not_claim_to_restore_a_backup_that_is_gone() {
+    let r = Repo::new("rollback-gone");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write_home("a.conf", "MINE\n");
+    ok(&r.run(&["apply"]));
+
+    // 利用者が .sennit-backup を掃除した
+    std::fs::remove_file(r.home_path("a.conf.sennit-backup")).unwrap();
+
+    let out = ok(&r.run(&["rollback", "--dry-run"]));
+    assert!(!out.contains("1 file(s) would be restored"), "{out}");
+    let out = ok(&r.run(&["rollback"]));
+    assert!(!out.contains("1 file(s) restored"), "{out}");
+    assert!(
+        out.contains("already gone") || out.contains("nothing to put back"),
+        "{out}"
+    );
+}

@@ -643,6 +643,14 @@ fn apply(
         .collect();
     let mut pruned = 0usize;
 
+    // 途中で落ちても記録できるよう、張れたものを順に積む。既に正しく
+    // 張られていたものが出発点。
+    let mut placed: Vec<PathBuf> = current
+        .iter()
+        .filter(|rel| !plan.changes().any(|e| &&e.rel == rel))
+        .cloned()
+        .collect();
+
     // 前回張ったが今回の宣言から外れたもの。放っておくと管理をやめた設定の
     // リンクが $HOME に残り続ける。
     //
@@ -699,27 +707,45 @@ fn apply(
             continue;
         }
 
-        if let Some(parent) = e.dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        if let Some(at) = remove_dest(&e.dest, &e.state, backup)? {
-            kept.push(state::Backup {
-                dest: e.dest.clone(),
-                kept_at: at,
-            });
-            // 退避したその場で記録する。以降のどこかで落ちると、
-            // 動かしたファイルの在り処だけが分からなくなる。links は
-            // まだ確定していないので前回の値のまま残す。
-            state::State {
-                links: previous.links.clone(),
-                backups: kept.clone(),
-                hooks: previous.hooks.clone(),
+        let step = (|| -> Result<()> {
+            if let Some(parent) = e.dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            .save(home)?;
+            if let Some(at) = remove_dest(&e.dest, &e.state, backup)? {
+                kept.push(state::Backup {
+                    dest: e.dest.clone(),
+                    kept_at: at,
+                });
+                // 退避したその場で記録する。以降のどこかで落ちると、
+                // 動かしたファイルの在り処だけが分からなくなる。
+                state::State {
+                    links: placed.clone(),
+                    backups: kept.clone(),
+                    hooks: previous.hooks.clone(),
+                }
+                .save(home)?;
+            }
+            std::os::unix::fs::symlink(&e.src, &e.dest)
+                .with_context(|| format!("failed to link {}", e.dest.display()))?;
+            Ok(())
+        })();
+
+        match step {
+            Ok(()) => placed.push(e.rel.clone()),
+            Err(err) => {
+                // ここまでに張ったものは $HOME に在る。記録せずに抜けると
+                // 次の apply がそれを知らず、宣言から外しても prune できない
+                // ——誰も管理していないリンクが残り続ける。
+                state::State {
+                    links: placed.clone(),
+                    backups: kept.clone(),
+                    hooks: previous.hooks.clone(),
+                }
+                .save(home)?;
+                return Err(err);
+            }
         }
-        std::os::unix::fs::symlink(&e.src, &e.dest)
-            .with_context(|| format!("failed to link {}", e.dest.display()))?;
     }
 
     if dry_run {
@@ -826,13 +852,19 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
     }
     newest.reverse();
 
+    let mut restored = 0usize;
+    let mut missing = 0usize;
     for b in &newest {
         println!("  {:>8}  {}", "restore", b.dest.display());
-        if dry_run {
+        // 退避そのものが消えていることがある。数に入れると「戻した」と
+        // 言いながら何も戻していない状態になる。
+        if !b.kept_at.exists() {
+            println!("            the backup is gone; nothing to put back");
+            missing += 1;
             continue;
         }
-        if !b.kept_at.exists() {
-            println!("            the backup is gone; skipped");
+        if dry_run {
+            restored += 1;
             continue;
         }
         // 張った symlink を外してから書き戻す。
@@ -854,6 +886,7 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         }
         std::fs::rename(&b.kept_at, &b.dest)
             .with_context(|| format!("failed to restore {}", b.dest.display()))?;
+        restored += 1;
     }
 
     for b in shadowed.iter().rev() {
@@ -866,10 +899,13 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
     }
 
     if dry_run {
-        println!("\n{} file(s) would be restored (--dry-run)", newest.len());
+        println!("\n{restored} file(s) would be restored (--dry-run)");
+        if missing > 0 {
+            println!("{missing} recorded backup(s) are no longer on disk");
+        }
         return Ok(());
     }
-    let n = newest.len();
+    let n = restored;
     let older = shadowed.len();
 
     // 記録は空にする。古い退避を残すと、次の rollback がそれを今戻した
@@ -880,6 +916,10 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
     st.backups.clear();
     st.save(home)?;
     println!("\n{n} file(s) restored");
+    if missing > 0 {
+        // 記録は消す。戻せないものを残しても次の rollback が同じことを言う。
+        println!("{missing} recorded backup(s) were already gone; nothing was put back for them");
+    }
     if older > 0 {
         println!("{older} older copy(ies) left on disk; move them back by hand if you want them");
     }
