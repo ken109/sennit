@@ -7,6 +7,11 @@ repository = "https://github.com/ken109/sennit"
 license = "MIT"
 keywords = ["dotfiles", "symlink", "cli", "config"]
 categories = ["command-line-utilities"]
+readme = "README.md"
+homepage = "https://github.com/ken109/sennit"
+# 実際にビルドとテストを通して確認した下限
+rust-version = "1.90"
+exclude = [".github/"]
 
 [dependencies]
 anyhow = "1"
