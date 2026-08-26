@@ -150,6 +150,12 @@ Only what is inside `{{ }}` is interpreted, so a config containing a literal `[e
 `{ if }` is left alone. An unknown variable is an error rather than an empty string, both
 in a substitution and in a condition, so a typo cannot quietly ship a broken config.
 
+A template sits next to what it produces — `alacritty.toml.tmpl` beside
+`alacritty.toml` — and only the template is committed. Since the generated file is the one
+your editor opens through the symlink, it is written read-only: an edit that would be
+thrown away by the next render fails to save instead. `[modes]` overrides that if
+something really does need to be writable.
+
 Generated files are not meant to be committed. `apply` renders before it links, so a fresh
 clone produces them, and adding them to git would only mean the same change showing up
 twice in every diff. It also keeps secrets out: a template can pull from 1Password, and

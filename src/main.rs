@@ -273,8 +273,15 @@ fn render_all(root: &Path, manifest: &Manifest, secrets: bool) -> Result<()> {
         }
         let rendered = render::expand_with(&template, &vars, tmpl_rel, &mut cache)?;
 
-        // 中身が同じなら触らない。mtime が動くと apply が無駄に張り直す
+        // 中身が同じなら書き直さない。mtime が動くと apply が無駄に張り直す。
+        // ただし権限だけは毎回揃える。中身が変わらない限り読み取り専用に
+        // ならない、という穴があった。
         if std::fs::read_to_string(&out_path).ok().as_deref() == Some(rendered.as_str()) {
+            enforce_mode(
+                &out_path,
+                manifest.mode_for(Path::new(out_rel)),
+                render::needs_secrets(&template),
+            );
             continue;
         }
         if let Some(parent) = out_path.parent() {
@@ -334,17 +341,23 @@ fn decrypt_all(root: &Path, manifest: &Manifest) -> Result<()> {
         let out_path = root.join(out_rel);
         let plain = enc.decrypt(&src)?;
 
-        // 中身が同じなら触らない
+        // 中身が同じでも権限は揃える
         if std::fs::read(&out_path).ok().as_deref() == Some(plain.as_slice()) {
+            enforce_mode(&out_path, manifest.mode_for(Path::new(out_rel)), true);
             continue;
         }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        if out_path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).ok();
+        }
         std::fs::write(&out_path, &plain)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         // 暗号化してあるということは秘密なので、既定で 0600
-        let mode = manifest.mode_for(Path::new(out_rel)).unwrap_or(0o600);
+        // 復号結果も生成物なので読み取り専用。暗号化してあった＝秘密なので 0400
+        let mode = manifest.mode_for(Path::new(out_rel)).unwrap_or(0o400);
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
         println!("  \x1b[35mdecrypted\x1b[0m  {out_rel}");
@@ -357,14 +370,37 @@ fn decrypt_all(root: &Path, manifest: &Manifest) -> Result<()> {
 /// 既定の umask 022 では 0644 になり、トークンが誰でも読める状態で置かれる。
 /// 手で管理していた頃の ~/.npmrc は 0600 だったので、これは劣化にあたる。
 /// 内容ではなく権限で守る。
+/// 生成物を書く。
+///
+/// 既定で読み取り専用にする。生成物はテンプレートの隣に並ぶので、
+/// うっかりそちらを開いて編集してしまう。書けてしまうと次の render で
+/// 黙って消える。書けなくしておけばエディタが保存に失敗し、その場で気づく。
+///
+/// symlink 越しに $HOME から編集した場合も同じく弾かれる。生の編集感を
+/// 保つのがこのツールの主張だが、生成物だけは例外であることを権限で示す。
+/// 生成物のあるべきモードに揃える。
+fn enforce_mode(path: &Path, declared: Option<u32>, secret: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let want = declared.unwrap_or(if secret { 0o400 } else { 0o444 });
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().mode() & 0o777 != want {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(want));
+        }
+    }
+}
+
 fn write_rendered(path: &Path, contents: &str, secret: bool, declared: Option<u32>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, contents)?;
-    // 宣言があればそれに従う。無くても秘密を含むなら 0600 にする。
-    // 既定の umask 022 では 0644 になり、トークンが誰でも読める。
-    if let Some(mode) = declared.or(if secret { Some(0o600) } else { None }) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+
+    // 前回書いたものが読み取り専用だと上書きできない
+    if path.exists() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
     }
+    std::fs::write(path, contents)?;
+
+    // 宣言があればそれに従う。無ければ読み取り専用。秘密なら本人だけ。
+    let mode = declared.unwrap_or(if secret { 0o400 } else { 0o444 });
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 

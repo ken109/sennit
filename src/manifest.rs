@@ -148,6 +148,13 @@ mod tests {
         assert_eq!(m.mode_for(Path::new(".ssh/known_hosts")), Some(0o700));
     }
 
+    /// 宣言があればそれが勝つ。生成物を書き込み可能にしたい場合の逃げ道。
+    #[test]
+    fn a_declared_mode_overrides_the_read_only_default() {
+        let m = with_modes(&[(".npmrc", "600")]);
+        assert_eq!(m.mode_for(Path::new(".npmrc")), Some(0o600));
+    }
+
     #[test]
     fn no_declaration_means_no_opinion() {
         let m = manifest(&[]);
