@@ -57,7 +57,8 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 
 | | |
 |---|---|
-| `sennit apply` | Place symlinks. Only touches entries that need changing. `--dry-run` to preview. |
+| `sennit apply` | Render templates, then place symlinks. Only touches what needs changing. `--dry-run` to preview. |
+| `sennit rollback` | Put back files that the last apply moved aside. |
 | `sennit diff` | Show what an apply would change, before it happens. |
 | `sennit list` | Show the current state of every managed path. |
 | `sennit render` | Expand templates from a single source of truth. `--check` fails if the committed output is stale. |
@@ -65,6 +66,7 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 | `sennit verify` | Verify that everything declared actually resolves on this machine. |
 | `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. |
 | `sennit sync` | Install declared packages that are missing. |
+| `sennit compare` | Diff two `verify --export` reports, to see how two machines differ. |
 
 Every path is classified as one of four states, and only the ones that need work are
 touched:
@@ -105,8 +107,43 @@ loops: the moment a template gains control flow, it stops being readable as the 
 file it produces. An unknown variable is an error rather than an empty string, so a typo
 cannot quietly ship a broken config.
 
-Generated files are meant to be committed. Run `sennit render --check` in CI to catch the
-case where a template was edited but the output was not regenerated.
+Generated files are not meant to be committed. `apply` renders before it links, so a fresh
+clone produces them, and adding them to git would only mean the same change showing up
+twice in every diff. It also keeps secrets out: a template can pull from 1Password, and
+nothing it produces reaches the repository.
+
+```toml
+# .config/something.tmpl
+token = "{{ op://Personal/GitHub/token }}"
+```
+
+Any `{{ op://... }}` is read through the 1Password CLI at render time.
+
+## What apply will not do
+
+`apply` never destroys a file you wrote. When something that is not a symlink is sitting
+where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
+`sennit rollback` puts it back. `--no-backup` opts out, and is the only way to lose
+anything.
+
+It also remembers what it linked. A path that was linked last time and is no longer
+declared gets its symlink removed, so dropping a config from the repository does not leave
+a dangling link behind in `$HOME`.
+
+## Per-machine variation
+
+`os = ["darwin"]` restricts a declaration to one platform. `profiles` restricts it to a
+purpose:
+
+```toml
+[packages.slack]
+manager  = "brew-cask"
+profiles = ["work"]
+```
+
+The profile comes from `SENNIT_PROFILE`, which takes a comma-separated list. A declaration
+with no `profiles` always applies; one with `profiles` applies only when it overlaps, so
+an unset `SENNIT_PROFILE` installs less rather than more.
 
 ## Drift detection
 
@@ -139,6 +176,14 @@ commands = ["brew", "git", "curl"]   # provided by the system or the bootstrap
 - editor extensions declared for auto-install
 - commands used in shell startup files
 - the mere existence of `.config/<tool>/`, which is sometimes the *only* evidence of a dependency
+
+Detectors are written per format, so a format nobody wrote one for is invisible. Rather
+than wait for that, a config can say so itself, in whatever passes for a comment there:
+
+```
+# sennit: requires command hunk
+# sennit: requires font "Hack Nerd Font Mono"
+```
 
 Anything you deliberately do not install is declared `optional = true`, so the file records
 what is intentional rather than hiding it in an ignore list.
@@ -222,7 +267,7 @@ or `sudo`, before sennit can run at all.
 
 ## Status
 
-v0.5. Minimum supported Rust version is 1.90.
+v0.6. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`

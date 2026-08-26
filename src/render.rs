@@ -41,6 +41,46 @@ fn flatten(value: &toml::Value, prefix: String, out: &mut BTreeMap<String, Strin
 /// 生成元が「設定ファイルとして読めるもの」でなくなるため。置換だけに
 /// 限れば *.tmpl は元の設定とほぼ同じ見た目のまま保てる。
 pub fn expand(template: &str, vars: &BTreeMap<String, String>, source: &str) -> Result<String> {
+    expand_with(template, vars, source, &mut SecretCache::default())
+}
+
+/// op:// で始まる参照は 1Password から取る。1 回の render で同じ参照を
+/// 何度も引かないよう覚えておく。
+#[derive(Default)]
+pub struct SecretCache {
+    seen: BTreeMap<String, String>,
+}
+
+impl SecretCache {
+    fn read(&mut self, reference: &str) -> Result<String> {
+        if let Some(v) = self.seen.get(reference) {
+            return Ok(v.clone());
+        }
+        let out = std::process::Command::new("op")
+            .args(["read", "--no-newline", reference])
+            .output()
+            .with_context(|| {
+                format!("failed to run `op`; is the 1Password CLI installed? ({reference})")
+            })?;
+        if !out.status.success() {
+            bail!(
+                "`op read {reference}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let value = String::from_utf8(out.stdout)
+            .with_context(|| format!("{reference} is not valid UTF-8"))?;
+        self.seen.insert(reference.to_string(), value.clone());
+        Ok(value)
+    }
+}
+
+pub fn expand_with(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    source: &str,
+    secrets: &mut SecretCache,
+) -> Result<String> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
 
@@ -51,9 +91,14 @@ pub fn expand(template: &str, vars: &BTreeMap<String, String>, source: &str) -> 
             bail!("{source}: unterminated `{{{{`");
         };
         let key = after[..end].trim();
-        match vars.get(key) {
-            Some(v) => out.push_str(v),
-            None => bail!("{source}: unknown template variable `{key}`"),
+        if let Some(reference) = key.strip_prefix("op://") {
+            let value = secrets.read(&format!("op://{reference}"))?;
+            out.push_str(&value);
+        } else {
+            match vars.get(key) {
+                Some(v) => out.push_str(v),
+                None => bail!("{source}: unknown template variable `{key}`"),
+            }
         }
         rest = &after[end + 2..];
     }

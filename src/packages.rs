@@ -74,6 +74,10 @@ pub struct Package {
     /// setup では入れないが、設定が存在を前提に分岐しているもの
     #[serde(default)]
     pub optional: bool,
+    /// このプロファイルのときだけ対象にする。空なら常に対象。
+    /// OS は環境で決まるが、profile は用途で決まる(work / personal など)。
+    #[serde(default)]
+    pub profiles: Vec<String>,
     #[serde(default)]
     pub manager: Option<String>,
     /// Debian 系での パッケージ名。指定があると Linux では apt を使う
@@ -120,6 +124,7 @@ impl Packages {
             .iter()
             .filter(|(_, p)| !p.optional)
             .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
+            .filter(|(_, p)| matches_profile(&p.profiles))
             .map(|(n, p)| (n.clone(), p))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -145,6 +150,7 @@ impl Packages {
             .iter()
             .filter(|(_, p)| !p.optional)
             .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
+            .filter(|(_, p)| matches_profile(&p.profiles))
             .filter_map(|(name, p)| resolve(name, p, linux_pm))
             .filter(|i| !matches!(i.manager, Manager::None | Manager::ZedExtension))
             .collect();
@@ -169,7 +175,9 @@ impl Packages {
         for (name, pkg) in &self.packages {
             // OS を限定している宣言は、対象外の OS では optional 扱いにする。
             // 設定は全 OS に配置されるが本体は入らない、という状態を可視化するため。
-            let os_mismatch = !pkg.os.is_empty() && !pkg.os.iter().any(|o| o == current_os);
+            // プロファイル外のものは宣言としては存在するが導入対象ではない
+            let os_mismatch = (!pkg.os.is_empty() && !pkg.os.iter().any(|o| o == current_os))
+                || !matches_profile(&pkg.profiles);
             let optional = pkg.optional || os_mismatch;
             let kind = pkg.kind_of();
             // パッケージ名も提供名として数える。コマンドは大抵パッケージ名と
@@ -190,6 +198,29 @@ impl Packages {
         }
         out
     }
+}
+
+/// 現在のプロファイル。SENNIT_PROFILE で指定する。未指定なら制約なしとみなす。
+pub fn current_profiles() -> Vec<String> {
+    std::env::var("SENNIT_PROFILE")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// profiles が空なら常に真。指定があれば、現在のプロファイルと 1 つでも
+/// 重なれば真。SENNIT_PROFILE を設定していない環境では、プロファイル付きの
+/// 宣言は対象外になる。取りこぼすより余計に入れない方を選ぶ。
+pub fn matches_profile(profiles: &[String]) -> bool {
+    if profiles.is_empty() {
+        return true;
+    }
+    let current = current_profiles();
+    profiles.iter().any(|p| current.contains(p))
 }
 
 pub fn current_os() -> &'static str {

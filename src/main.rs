@@ -4,6 +4,7 @@ mod manifest;
 mod packages;
 mod plan;
 mod render;
+mod state;
 mod sync;
 mod verify;
 
@@ -40,6 +41,9 @@ enum Command {
         /// 実際には変更せず、何をするかだけ表示する
         #[arg(long)]
         dry_run: bool,
+        /// symlink でない実体を、退避せずに削除する
+        #[arg(long)]
+        no_backup: bool,
     },
     /// 適用したときに何が変わるかを表示する
     Diff,
@@ -52,7 +56,13 @@ enum Command {
         history: Option<PathBuf>,
     },
     /// 宣言したものがこのマシンで実際に解決できるか確かめる
-    Verify,
+    Verify {
+        /// 結果を JSON で書き出す(マシン間の比較用)
+        #[arg(long)]
+        export: Option<PathBuf>,
+    },
+    /// 2 台分の verify --export を比べる
+    Compare { a: PathBuf, b: PathBuf },
     /// packages.toml の宣言をもとに未導入のパッケージを入れる
     Sync {
         /// 実際には入れず、何を入れるかだけ表示する
@@ -60,10 +70,12 @@ enum Command {
         dry_run: bool,
     },
     /// theme.toml からテンプレートを展開して設定ファイルを生成する
-    Render {
-        /// 生成せず、コミット済みの内容と一致するかだけ検証する
+    Render,
+    /// 直前の apply が退避したファイルを元に戻す
+    Rollback {
+        /// 実際には戻さず、何を戻すかだけ表示する
         #[arg(long)]
-        check: bool,
+        dry_run: bool,
     },
     /// 配置状況を一覧する
     List {
@@ -95,15 +107,22 @@ fn run() -> Result<()> {
     let plan = Plan::build(&root, &home, &manifest)?;
 
     match cli.command {
-        Command::Apply { dry_run } => apply(&plan, dry_run),
+        Command::Apply { dry_run, no_backup } => {
+            // 生成物はコミットしないので、配置の前に必ず作る
+            render_all(&root, &manifest)?;
+            let plan = Plan::build(&root, &home, &manifest)?;
+            apply(&plan, &home, dry_run, !no_backup)
+        }
+        Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
             print_diff(&plan);
             Ok(())
         }
         Command::Check => check(&root),
-        Command::Render { check } => render_all(&root, &manifest, check),
+        Command::Render => render_all(&root, &manifest),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
-        Command::Verify => verify::verify(&root),
+        Command::Verify { export } => verify::verify(&root, export),
+        Command::Compare { a, b } => verify::compare(&a, &b),
         Command::Audit { history } => audit::audit(&root, history),
         Command::List { changed } => {
             print_list(&plan, changed);
@@ -203,9 +222,11 @@ fn check(root: &Path) -> Result<()> {
 /// 生成後のファイルを読め、新規 clone でも設定が揃っているため。
 /// 代わりに「テンプレートを直したが生成し忘れる」ことが起きうるので、
 /// --check を CI に置いて食い違いを落とす。
-fn render_all(root: &Path, manifest: &Manifest, check_only: bool) -> Result<()> {
+fn render_all(root: &Path, manifest: &Manifest) -> Result<()> {
+    if manifest.render.is_empty() {
+        return Ok(());
+    }
     let vars = render::load_vars(&root.join("theme.toml"))?;
-    let mut stale = Vec::new();
 
     for (out_rel, tmpl_rel) in &manifest.render {
         let tmpl_path = root.join(tmpl_rel);
@@ -214,40 +235,61 @@ fn render_all(root: &Path, manifest: &Manifest, check_only: bool) -> Result<()> 
             .with_context(|| format!("failed to read template {}", tmpl_path.display()))?;
         let rendered = render::expand(&template, &vars, tmpl_rel)?;
 
-        let current = std::fs::read_to_string(&out_path).unwrap_or_default();
-        if current == rendered {
-            println!("  \x1b[32munchanged\x1b[0m  {out_rel}");
+        // 中身が同じなら触らない。mtime が動くと apply が無駄に張り直す
+        if std::fs::read_to_string(&out_path).ok().as_deref() == Some(rendered.as_str()) {
             continue;
         }
-
-        if check_only {
-            println!("  \x1b[31mstale\x1b[0m      {out_rel}");
-            stale.push(out_rel.clone());
-        } else {
-            std::fs::write(&out_path, &rendered)
-                .with_context(|| format!("failed to write {}", out_path.display()))?;
-            println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-    }
-
-    if !stale.is_empty() {
-        bail!("{} file(s) out of date; run `sennit render`", stale.len());
+        std::fs::write(&out_path, &rendered)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+        println!("  \x1b[33mrendered\x1b[0m   {out_rel}");
     }
     Ok(())
 }
 
-fn apply(plan: &Plan, dry_run: bool) -> Result<()> {
+fn apply(plan: &Plan, home: &Path, dry_run: bool, backup: bool) -> Result<()> {
+    let previous = state::State::load(home)?;
+    let current: Vec<PathBuf> = plan.entries.iter().map(|e| e.rel.clone()).collect();
+    let stale = previous.stale(&current);
+
     let changes: Vec<_> = plan.changes().collect();
-    if changes.is_empty() {
+    if changes.is_empty() && stale.is_empty() {
         println!("already up to date ({} links)", plan.entries.len());
         return Ok(());
+    }
+
+    let mut backups = Vec::new();
+
+    // 前回張ったが今回の宣言から外れたもの。放っておくと管理をやめた設定の
+    // リンクが $HOME に残り続ける。壊れたリンクだけを消し、実体は触らない。
+    for rel in &stale {
+        let dest = home.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        println!("  {:>8}  {}", "prune", rel.display());
+        if !dry_run {
+            std::fs::remove_file(&dest)
+                .with_context(|| format!("failed to remove {}", dest.display()))?;
+        }
     }
 
     for e in &changes {
         let verb = match &e.state {
             State::Missing => "link",
             State::Wrong { .. } => "relink",
-            State::Occupied => "replace",
+            State::Occupied => {
+                if backup {
+                    "backup"
+                } else {
+                    "replace"
+                }
+            }
             State::Linked => unreachable!(),
         };
         println!("  {:>8}  {}", verb, e.rel.display());
@@ -260,36 +302,141 @@ fn apply(plan: &Plan, dry_run: bool) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        remove_dest(&e.dest, &e.state)?;
+        if let Some(kept) = remove_dest(&e.dest, &e.state, backup)? {
+            backups.push(state::Backup {
+                dest: e.dest.clone(),
+                kept_at: kept,
+            });
+        }
         std::os::unix::fs::symlink(&e.src, &e.dest)
             .with_context(|| format!("failed to link {}", e.dest.display()))?;
     }
 
     if dry_run {
-        println!("\n{} change(s), nothing written (--dry-run)", changes.len());
-    } else {
-        println!("\n{} link(s) updated", changes.len());
+        println!(
+            "\n{} change(s), {} prune(s), nothing written (--dry-run)",
+            changes.len(),
+            stale.len()
+        );
+        return Ok(());
+    }
+
+    state::State {
+        links: current,
+        backups: backups.clone(),
+    }
+    .save(home)?;
+
+    println!(
+        "\n{} link(s) updated, {} pruned",
+        changes.len(),
+        stale.len()
+    );
+    if !backups.is_empty() {
+        println!(
+            "{} file(s) moved aside; `sennit rollback` puts them back",
+            backups.len()
+        );
     }
     Ok(())
 }
 
-/// 既存の dest を退ける。symlink でない実体は消す前に種別を確かめる。
-fn remove_dest(dest: &Path, state: &State) -> Result<()> {
+/// 直前の apply が退避したファイルを元に戻す。
+///
+/// 退避した実体を書き戻し、その上に張った symlink を外す。apply 全体を
+/// 巻き戻すのではなく、「利用者のファイルを置き換えた」部分だけを戻す。
+fn rollback(home: &Path, dry_run: bool) -> Result<()> {
+    let mut st = state::State::load(home)?;
+    if st.backups.is_empty() {
+        println!("nothing to roll back");
+        return Ok(());
+    }
+
+    for b in &st.backups {
+        println!("  {:>8}  {}", "restore", b.dest.display());
+        if dry_run {
+            continue;
+        }
+        if !b.kept_at.exists() {
+            println!("            the backup is gone; skipped");
+            continue;
+        }
+        // 張った symlink を外してから書き戻す
+        if let Ok(meta) = std::fs::symlink_metadata(&b.dest) {
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(&b.dest)?;
+            }
+        }
+        std::fs::rename(&b.kept_at, &b.dest)
+            .with_context(|| format!("failed to restore {}", b.dest.display()))?;
+    }
+
+    if dry_run {
+        println!(
+            "\n{} file(s) would be restored (--dry-run)",
+            st.backups.len()
+        );
+        return Ok(());
+    }
+    let n = st.backups.len();
+    st.backups.clear();
+    st.save(home)?;
+    println!("\n{n} file(s) restored");
+    Ok(())
+}
+
+/// 既存の dest を退ける。
+///
+/// symlink でない実体は利用者が書いたものかもしれない。既定では消さずに
+/// 隣へ退避する。注意書きで防ぐのではなく、消せない作りにしておく。
+fn remove_dest(dest: &Path, state: &State, backup: bool) -> Result<Option<PathBuf>> {
     match state {
-        State::Missing => Ok(()),
-        State::Wrong { .. } => std::fs::remove_file(dest)
-            .with_context(|| format!("failed to remove symlink {}", dest.display())),
+        State::Missing | State::Linked => Ok(None),
+        // 別の場所を指す symlink は、それ自体に中身が無いので消してよい
+        State::Wrong { .. } => {
+            std::fs::remove_file(dest)
+                .with_context(|| format!("failed to remove symlink {}", dest.display()))?;
+            Ok(None)
+        }
         State::Occupied => {
+            if backup {
+                let to = backup_path(dest)?;
+                std::fs::rename(dest, &to).with_context(|| {
+                    format!(
+                        "failed to move {} aside to {}",
+                        dest.display(),
+                        to.display()
+                    )
+                })?;
+                println!("            kept the old file at {}", to.display());
+                return Ok(Some(to));
+            }
             let meta = std::fs::symlink_metadata(dest)?;
             if meta.is_dir() {
                 std::fs::remove_dir_all(dest)
             } else {
                 std::fs::remove_file(dest)
             }
-            .with_context(|| format!("failed to remove {}", dest.display()))
+            .with_context(|| format!("failed to remove {}", dest.display()))?;
+            Ok(None)
         }
-        State::Linked => Ok(()),
     }
+}
+
+/// 退避先。既にあれば連番を足して、退避で退避を潰さないようにする。
+fn backup_path(dest: &Path) -> Result<PathBuf> {
+    let base = format!("{}.sennit-backup", dest.display());
+    let first = PathBuf::from(&base);
+    if !first.exists() {
+        return Ok(first);
+    }
+    for n in 1..1000 {
+        let p = PathBuf::from(format!("{base}.{n}"));
+        if !p.exists() {
+            return Ok(p);
+        }
+    }
+    bail!("too many backups next to {}", dest.display())
 }
 
 fn print_diff(plan: &Plan) {

@@ -1,6 +1,6 @@
 [package]
 name = "sennit"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "A dotfiles manager that keeps symlink semantics, and adds templating and drift detection"
 repository = "https://github.com/ken109/sennit"
@@ -17,6 +17,7 @@ exclude = [".github/"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 walkdir = "2"
 

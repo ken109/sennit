@@ -22,13 +22,20 @@ pub fn scan(root: &Path) -> Result<Vec<Requirement>> {
     zed(root, &mut reqs)?;
     zsh(root, &mut reqs)?;
     config_dirs(root, &mut reqs)?;
+    annotations(root, &mut reqs)?;
     reqs.sort_by(|a, b| (a.kind.label(), &a.name).cmp(&(b.kind.label(), &b.name)));
     reqs.dedup_by(|a, b| a.kind == b.kind && a.name == b.name);
     Ok(reqs)
 }
 
+/// 設定ファイルを読む。生成物がまだ無ければテンプレートを読む。
+///
+/// 生成物はコミットしない方針なので、clone 直後や CI では実体が存在しない。
+/// テンプレートは置換前でも、フォント名のような値はそのまま書かれている。
 fn read(root: &Path, rel: &str) -> Option<String> {
-    std::fs::read_to_string(root.join(rel)).ok()
+    std::fs::read_to_string(root.join(rel))
+        .or_else(|_| std::fs::read_to_string(root.join(format!("{rel}.tmpl"))))
+        .ok()
 }
 
 /// 先頭の `!`(git のシェル実行記法)と引数を落として、実行されるコマンド名を取る。
@@ -159,6 +166,77 @@ fn zsh(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     Ok(())
 }
 
+/// 設定ファイル自身に書かれた宣言を読む。
+///
+/// 検出器はフォーマットごとに手書きなので、新しい種類の設定が増えるたびに
+/// コードが要る。実際 *.tmpl と .config/theme/ で 2 回穴が開いた。
+/// 設定の側が自分の依存を書けるなら、パースも対応も要らない。
+///
+///     # sennit: requires command hunk
+///     # sennit: requires font "Hack Nerd Font Mono"
+///
+/// コメント記号は問わない。行のどこかにこの並びがあればよい。
+fn annotations(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
+    let mut files = Vec::new();
+    walk(&root.join(".config"), &mut files, 0);
+    files.push(root.join(".zshenv"));
+
+    for path in files {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() > 512 * 1024 {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+
+        for line in text.lines() {
+            let Some(idx) = line.find("sennit: requires ") else {
+                continue;
+            };
+            let rest = line[idx + "sennit: requires ".len()..].trim();
+            let (kind, value) = match rest.split_once(char::is_whitespace) {
+                Some(("command", v)) => (Kind::Command, v),
+                Some(("font", v)) => (Kind::Font, v),
+                Some(("extension", v)) => (Kind::Extension, v),
+                _ => continue,
+            };
+            let value = value.trim().trim_matches('"').trim();
+            if value.is_empty() {
+                continue;
+            }
+            out.push(Requirement {
+                kind,
+                name: value.to_string(),
+                source: format!("{rel} (annotation)"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, out, depth + 1);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
 /// .config/<name> の存在そのものが、そのツールへの依存を表す。
 ///
 /// direnv のように「設定ディレクトリはあるが、どの設定ファイルからも
@@ -171,10 +249,17 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
     };
     for entry in dir.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        // テンプレートは生成元。生成物の側で既に検出されるので見ない
-        if name.ends_with(".tmpl") {
-            continue;
-        }
+        // テンプレートは生成元。生成物があるならそちらで検出されるので飛ばすが、
+        // 生成物がまだ無ければ .tmpl を剥がした名前で拾う。
+        let name = match name.strip_suffix(".tmpl") {
+            Some(base) => {
+                if entry.path().with_file_name(base).exists() {
+                    continue;
+                }
+                base.to_string()
+            }
+            None => name,
+        };
         // starship.toml のような単一ファイル形式も拾う
         let name = name.strip_suffix(".toml").unwrap_or(&name).to_string();
         if name.starts_with('.') {
