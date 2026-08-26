@@ -80,6 +80,11 @@ fn verifiable(name: &str, pkg: &Package) -> Option<Vec<(Kind, String)>> {
     if pkg.manager_of() == Manager::BrewCask {
         return None;
     }
+    // mise が入れるものは shim 経由で、mise を有効化したシェルでしか
+    // PATH に現れない。存在しないことが異常を意味しないので判定しない。
+    if pkg.manager_of() == Manager::Mise {
+        return None;
+    }
 
     let mut out: Vec<(Kind, String)> = pkg
         .provides
@@ -199,6 +204,13 @@ mod tests {
             pkg("manager = \"brew-cask\"\nkind = \"font\"\nprovides = [\"Hack Nerd Font Mono\"]\n");
         let got = verifiable("font-hack-nerd-font", &p).unwrap();
         assert_eq!(got, vec![(Kind::Font, "Hack Nerd Font Mono".to_string())]);
+    }
+
+    /// mise の shim は mise を有効化したシェルにしか出ない。
+    #[test]
+    fn mise_managed_tools_are_not_verifiable() {
+        let p = pkg("manager = \"mise\"\n");
+        assert!(verifiable("go", &p).is_none());
     }
 
     /// ライブラリは実行ファイルを持たない。
