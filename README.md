@@ -302,7 +302,7 @@ command, read what it prints:
 
 ```toml
 [providers.op]
-command = "op read --no-newline {}"
+command = "op read --no-newline op://{}"
 
 [providers.pass]
 command = "pass show {}"

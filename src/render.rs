@@ -125,7 +125,8 @@ pub fn schemes_used(template: &str) -> Vec<String> {
 /// こうすると sennit が知らないプロバイダでも動く。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Provider {
-    /// `{}` が参照文字列に置き換わる。`op read --no-newline {}` のように書く。
+    /// `{}` が参照の `://` の後ろの部分に置き換わる。`op read --no-newline op://{}` のように、
+    /// scheme が要るコマンドは自分で付ける。
     pub command: String,
     /// 末尾の改行を落とす。多くの CLI は改行を付けて返す。
     #[serde(default = "yes")]
@@ -145,7 +146,7 @@ pub fn default_providers() -> Providers {
     m.insert(
         "op".to_string(),
         Provider {
-            command: "op read --no-newline {}".into(),
+            command: "op read --no-newline op://{}".into(),
             trim: true,
         },
     );

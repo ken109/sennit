@@ -810,6 +810,66 @@ command = "echo {}"
     assert_eq!(mode_of(&r.root_path("conf")), 0o400);
 }
 
+/// 宣言が無いときの既定の `op` は、`op://` を付けた参照で呼ぶ。
+///
+/// `{}` は `://` の後ろに置き換わるので、既定の command 側で `op://` を補う。
+/// 補わないと実物の `op read` が "secret reference should start with 'op://'" で落ちる。
+/// 実物の `op` は呼ばず、PATH の先頭に置いた偽の `op` が引数を検査する。
+#[test]
+fn the_default_op_provider_passes_an_op_scheme_reference() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let r = Repo::new("default-op");
+    r.manifest(
+        r#"
+[link]
+common = ["conf"]
+ignore = ["*.tmpl"]
+
+[render]
+"conf" = "conf.tmpl"
+"#,
+    );
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("conf.tmpl", "token = {{ op://Vault/Item/field }}\n");
+
+    let fakebin = r.root.parent().unwrap().join("fakebin");
+    std::fs::create_dir_all(&fakebin).unwrap();
+    let op = fakebin.join("op");
+    // 実物と同じく、op:// で始まらない参照は断る。
+    std::fs::write(
+        &op,
+        "#!/bin/sh\n\
+         [ \"$1\" = read ] && [ \"$2\" = --no-newline ] || { echo \"unexpected args: $*\" >&2; exit 2; }\n\
+         case \"$3\" in\n\
+           op://*) printf 'got:%s' \"$3\" ;;\n\
+           *) echo \"secret reference should start with 'op://': $3\" >&2; exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        fakebin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(bin())
+        .env("PATH", path)
+        .arg("--root")
+        .arg(&r.root)
+        .arg("--home")
+        .arg(&r.home)
+        .args(["apply", "--secrets"])
+        .output()
+        .unwrap();
+    ok(&out);
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("conf")).unwrap(),
+        "token = got:op://Vault/Item/field\n"
+    );
+}
+
 /// 宣言の無い scheme は、名指しで断る。
 #[test]
 fn an_undeclared_scheme_is_named() {
