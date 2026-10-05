@@ -153,6 +153,18 @@ pub fn default_providers() -> Providers {
     m
 }
 
+/// 宣言があればそれを、無ければ既定(op のみ)を使う。
+///
+/// 秘密を引く側が複数になっても、「何を宣言していない」の解釈が
+/// 食い違わないよう、判定をここに 1 つだけ置く。
+pub fn effective_providers(declared: &Providers) -> Providers {
+    if declared.is_empty() {
+        default_providers()
+    } else {
+        declared.clone()
+    }
+}
+
 /// 1 回の render で同じ参照を何度も引かないよう覚えておく。
 #[derive(Default)]
 pub struct SecretCache {

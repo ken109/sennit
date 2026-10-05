@@ -287,12 +287,7 @@ fn render_all(
     };
     let vars = render::load_vars(&data)?;
     // 宣言があればそれを、無ければ op だけを既定にする
-    let providers = if manifest.providers.is_empty() {
-        render::default_providers()
-    } else {
-        manifest.providers.clone()
-    };
-    let mut cache = render::SecretCache::with(providers);
+    let mut cache = render::SecretCache::with(render::effective_providers(&manifest.providers));
     let mut deferred = Vec::new();
 
     for (out_rel, tmpl_rel) in &manifest.render {
