@@ -5,6 +5,7 @@ mod hooks;
 mod manifest;
 mod packages;
 mod plan;
+mod probe;
 mod render;
 mod state;
 mod sync;
@@ -67,6 +68,12 @@ enum Command {
         /// Write the result as JSON, for comparing machines
         #[arg(long)]
         export: Option<PathBuf>,
+        /// Also check that the secrets declared under `[probes]` are still accepted.
+        ///
+        /// Skipped by default for the same reason `apply` skips secrets: a secret
+        /// manager needs a person to unlock it, and the check goes to the network.
+        #[arg(long)]
+        secrets: bool,
     },
     /// Diff two `verify --export` reports
     Compare { a: PathBuf, b: PathBuf },
@@ -153,7 +160,7 @@ fn run() -> Result<()> {
         Command::Check => check(&root),
         Command::Render { secrets } => render_all(&root, &manifest, secrets, false).map(|_| ()),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
-        Command::Verify { export } => verify::verify(&root, export),
+        Command::Verify { export, secrets } => verify::verify(&root, export, secrets),
         // 先に捌いてある
         Command::Compare { .. } => unreachable!(),
         Command::Audit { history } => audit::audit(&root, history),

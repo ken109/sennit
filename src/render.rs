@@ -180,7 +180,7 @@ impl SecretCache {
         }
     }
 
-    fn read(&mut self, scheme: &str, reference: &str) -> Result<String> {
+    pub fn read(&mut self, scheme: &str, reference: &str) -> Result<String> {
         let key = format!("{scheme}://{reference}");
         if let Some(v) = self.seen.get(&key) {
             return Ok(v.clone());

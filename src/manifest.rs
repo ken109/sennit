@@ -23,6 +23,9 @@ pub struct Manifest {
     /// 秘密の取り出し方。scheme -> コマンド。宣言が無ければ op のみ。
     #[serde(default)]
     pub providers: crate::render::Providers,
+    /// 秘密がまだ効くかの確かめ方。`verify --secrets` が走らせる。
+    #[serde(default)]
+    pub probes: std::collections::BTreeMap<String, crate::probe::Probe>,
     /// 出力パス -> リポジトリ内の暗号文ファイル
     #[serde(default)]
     pub encrypted: std::collections::BTreeMap<String, String>,
@@ -113,6 +116,10 @@ impl Manifest {
             if p.is_empty() {
                 bail!("{what} has an empty path");
             }
+        }
+
+        for (name, probe) in &self.probes {
+            probe.validate(name)?;
         }
 
         // 綴りを誤った 8 進は、宣言したはずの制限が黙って無くなる。
@@ -252,6 +259,7 @@ mod tests {
             render: Default::default(),
             hooks: Default::default(),
             providers: Default::default(),
+            probes: Default::default(),
             encrypted: Default::default(),
             encryption: None,
             data: Default::default(),
