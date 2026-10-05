@@ -21,6 +21,7 @@ brew install ken109/tap/sennit   # or: cargo install sennit
 - [Running things after placing them](#running-things-after-placing-them)
 - [File modes](#file-modes)
 - [Secrets](#secrets)
+- [Checking that secrets still work](#checking-that-secrets-still-work)
 - [Encrypted files](#encrypted-files)
 - [Installing packages](#installing-packages)
 - [Three ways of being wrong](#three-ways-of-being-wrong)
@@ -95,7 +96,7 @@ and `sync`; `apply` does not read it. What was linked is recorded in
 | `sennit list` | Show the current state of every managed path. `--changed`. |
 | `sennit render` | Expand templates and decrypt encrypted files. `--secrets`. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
-| `sennit verify` | Verify that everything declared actually resolves on this machine. `--export`. |
+| `sennit verify` | Verify that everything declared actually resolves on this machine. `--export`, `--secrets`. |
 | `sennit audit` | Cross-check declarations against shell history, to find ones nothing uses. `--history`. |
 | `sennit sync` | Install declared packages that are missing. `--dry-run`. |
 | `sennit compare` | Diff two `verify --export` reports, to see how two machines differ. |
@@ -332,6 +333,48 @@ run it again with `--secrets`.
 A template that references `op://` also makes `check` require the `op` command, so the
 dependency shows up the moment it exists rather than on whichever machine first tries to
 use it.
+
+## Checking that secrets still work
+
+A secret being present and a secret being accepted are different facts. A token that was
+revoked sits in your vault, in the generated file, and on the machine, and nothing that
+only looks will notice. Declare how to ask the service, and `verify --secrets` asks:
+
+```toml
+[probes.github]
+secret  = "op://Cloud/GitHub PAT/token"
+command = "curl -fsS --max-time 10 -o /dev/null -H @- https://api.github.com/user"
+input   = "Authorization: Bearer {}"
+invalid-exit = [22]
+```
+
+`secret` is a reference resolved through `[providers]`, the same as in a template. The
+check is a command, run without a shell, and an exit status of 0 means the secret is
+accepted. What counts as "accepted" depends on the service, so sennit does not know any
+of them; the command is yours.
+
+The value reaches the command on standard input only, shaped by `input` with `{}` standing
+for the secret. It is never an argument, which other processes can read with `ps`, and
+never printed: the command's output is discarded, and the report names the probe and the
+result, nothing else.
+
+Three outcomes, because they mean different things:
+
+| | |
+|---|---|
+| accepted | the command exited 0 |
+| `invalid` | the command exited with a status in `invalid-exit` (any non-zero status, if the list is empty) |
+| `unchecked` | the secret could not be read, the command could not run or timed out, or it exited with a status `invalid-exit` does not list |
+
+`invalid-exit` is what keeps "the network is down" from being reported as "the token was
+revoked": curl exits 22 on an HTTP error and a different status when it cannot connect.
+Both `invalid` and `unchecked` fail the command. A check that could not run is not a pass;
+otherwise a CI job with a locked vault would be green without having checked anything.
+`timeout` (seconds, default 30) stops a check that hangs.
+
+Like `apply --secrets`, this is opt-in. Reading the secret may need someone to unlock the
+manager, and the check goes over the network, so plain `verify` does neither. With
+`--secrets` the package and mode checks still run, and both sets of results are reported.
 
 ## Encrypted files
 
