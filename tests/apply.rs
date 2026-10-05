@@ -1293,3 +1293,174 @@ command = "false {}"
     assert!(out.contains("link(s) updated"), "{out}");
     assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
 }
+
+// ---- verify --secrets ----
+
+/// 検査対象の秘密を `cat` で読むリポジトリを用意する。参照は値ではなく
+/// ファイルのパスなので、失敗の表示に参照が出ても秘密の値は出ない。
+fn probe_repo(name: &str, secret: &str, probe_body: &str) -> Repo {
+    let r = Repo::new(name);
+    r.write("vault/token", secret);
+    let token = r.root_path("vault/token");
+    r.manifest(&format!(
+        r#"
+[link]
+common = []
+
+[providers.file]
+command = "cat {{}}"
+
+[probes.svc]
+secret = "file://{}"
+{probe_body}
+"#,
+        token.display()
+    ));
+    r
+}
+
+fn both(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// 通常の verify は秘密に触れない。op のロック解除や外部への通信を、
+/// 頼まれていないのに起こさない。
+#[test]
+fn plain_verify_does_not_fetch_or_probe_secrets() {
+    let r = probe_repo("probe-off", "tok\n", "command = \"false\"");
+    let out = r.run(&["verify"]);
+    let text = both(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("probed"), "{text}");
+}
+
+/// 検査コマンドが 0 で終われば有効。値は標準入力に届く。
+#[test]
+fn verify_secrets_accepts_a_secret_the_check_accepts() {
+    let r = probe_repo(
+        "probe-ok",
+        "good-token\n",
+        "command = \"grep -qx 'Bearer good-token'\"\ninput = \"Bearer {}\"",
+    );
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("probed 1 secret(s): 1 accepted"), "{text}");
+    assert!(!text.contains("good-token"), "{text}");
+}
+
+/// 拒否された秘密は名前で報告して失敗する。値は画面に出ない。
+/// 検査コマンドが値を標準出力に吐いても、sennit はそれを読まない。
+#[test]
+fn verify_secrets_fails_on_a_rejected_secret_without_printing_it() {
+    let r = probe_repo(
+        "probe-rejected",
+        "s3cr3t-LEAKCHECK\n",
+        "command = \"sh -c 'cat; cat >&2; exit 1'\"",
+    );
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("invalid"), "{text}");
+    assert!(text.contains("svc"), "{text}");
+    assert!(text.contains("1 secret(s) rejected"), "{text}");
+    assert!(!text.contains("s3cr3t-LEAKCHECK"), "secret leaked:\n{text}");
+}
+
+/// 値を取れなかったものを「問題なし」にしない。ロックされたままの
+/// 1Password を相手にした CI が、何も確かめずに緑になる。
+#[test]
+fn verify_secrets_fails_when_the_secret_cannot_be_read() {
+    let r = Repo::new("probe-unreadable");
+    r.manifest(
+        r#"
+[link]
+common = []
+
+[providers.never]
+command = "false {}"
+
+[probes.svc]
+secret = "never://a/b"
+command = "true"
+"#,
+    );
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("unchecked"), "{text}");
+    assert!(text.contains("could not be checked"), "{text}");
+}
+
+/// invalid-exit に無い失敗は「失効」ではなく「確かめられなかった」。
+#[test]
+fn verify_secrets_does_not_call_an_unlisted_failure_a_revocation() {
+    let r = probe_repo(
+        "probe-unlisted",
+        "tok\n",
+        "command = \"sh -c 'exit 7'\"\ninvalid-exit = [22]",
+    );
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("unchecked"), "{text}");
+    // 理由の文に invalid-exit という語が出るので、見るのは結果の印のほう
+    assert!(!text.contains("\x1b[31minvalid"), "{text}");
+    assert!(!text.contains("rejected"), "{text}");
+}
+
+/// 宣言が無ければ、何も確かめていないと言う。黙って「ok」とは言わない。
+#[test]
+fn verify_secrets_says_so_when_nothing_is_declared() {
+    let r = Repo::new("probe-none");
+    r.manifest("[link]\ncommon = []\n");
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("no [probes] declared"), "{text}");
+}
+
+/// パッケージ側の失敗と秘密側の失敗は、どちらも出す。片方が隠れると、
+/// 直して再実行するたびに次の失敗が出てくる。
+#[test]
+fn verify_secrets_reports_machine_and_secret_failures_together() {
+    let r = probe_repo("probe-both", "tok\n", "command = \"false\"");
+    // 宣言したモードと食い違うファイルを足す
+    let mut m = std::fs::read_to_string(r.root_path("sennit.toml")).unwrap();
+    m.push_str("\n[modes]\n\"vault/token\" = \"600\"\n");
+    r.manifest(&m);
+    std::fs::set_permissions(
+        r.root_path("vault/token"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+
+    let out = r.run(&["verify", "--secrets"]);
+    let text = both(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("mode"), "{text}");
+    assert!(text.contains("invalid"), "{text}");
+}
+
+/// 参照の形になっていない secret は、宣言を読んだ時点で断る。
+#[test]
+fn a_probe_whose_secret_is_not_a_reference_is_refused() {
+    let r = Repo::new("probe-bad-secret");
+    r.manifest(
+        r#"
+[link]
+common = []
+
+[probes.svc]
+secret = "plain-token"
+command = "true"
+"#,
+    );
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("scheme://"), "{}", both(&out));
+}

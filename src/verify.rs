@@ -99,7 +99,29 @@ fn check_modes(root: &Path, manifest: &crate::manifest::Manifest) -> Vec<(String
 /// モードを読めなかったことを表す番兵。8 進 3 桁には収まらない値を使う。
 pub const UNREADABLE: u32 = u32::MAX;
 
-pub fn verify(root: &Path, export: Option<PathBuf>) -> Result<()> {
+/// `secrets` なら、宣言された秘密がまだ効くかも確かめる。
+///
+/// パッケージとモードの検査は常に走らせ、秘密の検査は後から足す。
+/// どちらかが落ちても、もう一方の結果は出す。片方の失敗がもう片方を
+/// 隠すと、直して再実行するたびに次の失敗が出てくることになる。
+pub fn verify(root: &Path, export: Option<PathBuf>, secrets: bool) -> Result<()> {
+    let machine = verify_machine(root, export);
+    if !secrets {
+        return machine;
+    }
+
+    // 秘密の検査は外部に問い合わせるので、通常の検査と区切って見せる
+    println!();
+    let probed = crate::manifest::Manifest::load(&root.join("sennit.toml"))
+        .and_then(|manifest| crate::probe::run(&manifest));
+    match (machine, probed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(a), Err(b)) => bail!("{a:#}; {b:#}"),
+    }
+}
+
+fn verify_machine(root: &Path, export: Option<PathBuf>) -> Result<()> {
     let packages = Packages::load(&root.join("packages.toml"))?;
 
     let mut missing = Vec::new();
