@@ -12,6 +12,11 @@ A dotfiles manager that keeps symlink semantics, and adds templating and drift d
 brew install ken109/tap/sennit   # or: cargo install sennit
 ```
 
+On Windows, download `sennit-x86_64-pc-windows-msvc.zip` from the
+[latest release](https://github.com/ken109/sennit/releases/latest) (`sennit.exe` is at the
+root of the zip, with a `.sha256` beside it), or run `cargo install sennit`. See
+[Windows](#windows) for what differs there.
+
 - [Why another one?](#why-another-one)
 - [Quick start](#quick-start)
 - [Commands](#commands)
@@ -21,6 +26,7 @@ brew install ken109/tap/sennit   # or: cargo install sennit
 - [Files that cannot be symlinks](#files-that-cannot-be-symlinks)
 - [Running things after placing them](#running-things-after-placing-them)
 - [File modes](#file-modes)
+- [Windows](#windows)
 - [Secrets](#secrets)
 - [Checking that secrets still work](#checking-that-secrets-still-work)
 - [Encrypted files](#encrypted-files)
@@ -125,7 +131,7 @@ and `sync`; `apply` does not read it. What was linked is recorded in
 | `sennit compare` | Diff two `verify --export` reports, to see how two machines differ. |
 
 `--root` and `--home` override where the repository is and where files are placed; both
-default to searching upwards for `sennit.toml` and to `$HOME`. `compare` is the one
+default to searching upwards for `sennit.toml` and to `$HOME` (`%USERPROFILE%` on Windows). `compare` is the one
 command that does not need a repository at all.
 
 `--dry-run` writes nothing — not the symlinks, and not the generated files either. It does
@@ -387,6 +393,9 @@ no `when-changed` runs every time. `cwd` sets where it runs, relative to the rep
 root; the default is the root itself. A hook that exits non-zero fails the apply — the
 links are already placed and recorded by then, so `sennit rollback` still works.
 
+Hooks run under `sh -c`. Windows has no `sh`; see [Windows](#windows) for which shell is
+used there.
+
 ## File modes
 
 
@@ -416,6 +425,73 @@ briefly. A mode must be exactly three octal digits — `"60"` would otherwise be
 the manifest loads: a restriction that silently does not apply is worse than one that
 fails loudly. `verify` reports a declared path it could not read rather than passing over
 it.
+
+## Windows
+
+sennit runs on Windows (x86_64, MSVC). The model is the same — files are placed as symbolic
+links, `[merge]` rewrites a real file, `rollback` puts things back — and a few things differ.
+Everything below was exercised on Windows 11 and runs in CI on `windows-latest`.
+
+**Symbolic links need Developer Mode, or an elevated terminal.** Windows only lets an
+ordinary process create a symlink once *Settings > System > For developers > Developer
+Mode* is on. Without it `apply` stops at the first link with the reason and the fix. It
+never falls back to copying: a copy looks placed, then drifts from the repository without
+anyone noticing, which is the failure sennit exists to prevent. Windows also wants to know
+whether a link points at a file or a directory when it is made; sennit looks at the target
+and creates the right kind.
+
+**What goes in `[link]`.** Windows uses `common` and a new `windows` list, the way macOS
+uses `common` and `darwin`:
+
+```toml
+[link]
+common  = [".config", ".claude"]
+windows = [".gitconfig"]
+```
+
+An older sennit rejects the `windows` key along with the rest of the manifest, so upgrade
+every machine before you push a manifest that uses it. (`packages.toml` accepts
+`os = ["windows"]` too.)
+
+**Where `$HOME` is.** `%USERPROFILE%`, then `HOME` if that is unset. `--home` overrides
+either, which is also how to try sennit on a scratch directory.
+
+**Paths.** Link targets are written with backslashes and without the `\\?\` prefix that
+Windows' path resolution adds. A link that already points at the right file is recognised
+whatever its case or separators, so `C:/Repo/a` and `c:\repo\a` are the same place.
+`sennit.toml` still uses forward slashes, as on every platform; a declared path that is
+rooted (`\foo`) or has a drive (`C:foo`) is refused like an absolute one.
+
+**`[modes]` is not applied on Windows.** There are no POSIX permission bits to set, so
+`apply` and `verify` skip every `[modes]` entry and say so once on stderr. The only
+mapping is for generated files (rendered templates, decrypted files): they are still made
+read-only, as the read-only attribute, when their effective mode has no owner write bit —
+the default for generated output, 0444 or 0400. A `[merge]` output keeps the read-only
+attribute of the file it replaces.
+
+**Hooks run under Git for Windows' bash.** Hook scripts are written for a POSIX shell, so
+sennit runs `bash.exe -c "<run>"` from the first of these it finds:
+
+1. the file named by the `SENNIT_SHELL` environment variable (any `bash.exe` or `sh.exe`);
+2. Git for Windows' `bin\bash.exe`, found from `git.exe` on `PATH`, then from
+   `%ProgramFiles%\Git` and `%LOCALAPPDATA%\Programs\Git`;
+3. any other `bash.exe` or `sh.exe` on `PATH` (MSYS2, Cygwin).
+
+The `bash.exe` in `System32` or `WindowsApps` is skipped on purpose: on a machine with WSL it
+is the WSL launcher, which would run the hook inside a Linux VM where the repository's
+Windows paths mean nothing. If none is found, a hook fails with an error that says so; a
+manifest without hooks needs no shell at all. A hook's `cwd` and the environment are
+passed through as they are.
+
+**Not supported on Windows.**
+
+- `sennit sync` exits with an error saying so. There is no package manager it knows how to
+  drive; `verify` therefore treats packages as not verifiable instead of reporting every
+  one of them missing, and still checks fonts, `[merge]` outputs and secrets.
+- sennit never schedules anything: there is no `autosync`-style timer to port. If you want
+  `apply` on a schedule, create a Task Scheduler task that runs `sennit apply` yourself.
+- Directory junctions. Windows reports a junction as a mount point, not a symbolic link,
+  so sennit sees an ordinary directory there and never replaces it. Use symbolic links.
 
 ## Secrets
 
@@ -660,7 +736,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.20. Minimum supported Rust version is 1.90.
+v0.21. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`
