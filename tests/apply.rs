@@ -2203,3 +2203,33 @@ fn a_link_below_a_kept_top_level_directory_is_still_replaced() {
         .unwrap()
         .is_dir());
 }
+
+// ---------------------------------------------------------------------------
+// what counts as "inside the repository"
+// ---------------------------------------------------------------------------
+
+/// prune removes a link only when it points into the repository. A target that
+/// climbs out with `..` starts with the repository's path as text but is not
+/// in it.
+#[test]
+fn prune_leaves_a_link_alone_when_its_target_climbs_out_with_dotdot() {
+    let r = Repo::new("prune-dotdot");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+    ok(&r.run(&["apply"]));
+
+    // the user repointed it, at a path that begins with the repository's path
+    let theirs = r.home.parent().unwrap().join("theirs.conf");
+    std::fs::write(&theirs, "theirs\n").unwrap();
+    std::fs::remove_file(r.home_path("a.conf")).unwrap();
+    let sneaky = std::fs::canonicalize(&r.root)
+        .unwrap()
+        .join("../theirs.conf");
+    std::os::unix::fs::symlink(&sneaky, r.home_path("a.conf")).unwrap();
+
+    r.manifest("[link]\ncommon = []\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("left alone"), "{out}");
+    assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
+    assert_eq!(read(&theirs), "theirs\n");
+}

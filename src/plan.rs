@@ -246,6 +246,10 @@ pub fn note_outside_top_levels(root: &Path, home: &Path, manifest: &Manifest) {
 }
 
 /// その symlink の向き先がリポジトリの中か。
+///
+/// 向き先を解決できればその実体で、できなければ(リンク先が消えている)
+/// 字句で比べる。`repo/../other` は文字としては `repo` で始まるが外なので、
+/// 字句の比較の前に `..` を畳む。
 pub fn link_into_repo(root: &Path, link: &Path) -> bool {
     let Ok(target) = std::fs::read_link(link) else {
         return false;
@@ -258,10 +262,28 @@ pub fn link_into_repo(root: &Path, link: &Path) -> bool {
             None => return false,
         }
     };
-    target.starts_with(root)
-        || std::fs::canonicalize(&target)
-            .map(|t| t.starts_with(root))
-            .unwrap_or(false)
+    match std::fs::canonicalize(&target) {
+        Ok(real) => real.starts_with(root),
+        Err(_) => collapse(&target).starts_with(root),
+    }
+}
+
+/// `.` と `..` を字句で畳む。symlink は解決しない。
+fn collapse(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// 祖先の symlink のうち、リポジトリの中を指すものだけ。
@@ -490,5 +512,32 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         assert_eq!(ancestor_link(&root, &home, rel, &m), None);
         let m = manifest_from("[link]\ncommon = [\"skills/gog/SKILL.md\"]\n");
         assert_eq!(ancestor_link(&root, &home, rel, &m), None);
+    }
+
+    /// `repo/../other` starts with `repo` as text but is not inside it.
+    #[test]
+    fn a_target_that_climbs_out_of_the_repository_is_outside() {
+        let d = scratch("dotdot");
+        let root = std::fs::canonicalize(&d).unwrap().join("repo");
+        let home = d.join("home");
+        write(&root.join("a"), "x\n");
+        write(&d.join("other/p"), "x\n");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // the target exists, so it can be resolved
+        let to_existing = root.join("../other/p");
+        std::os::unix::fs::symlink(&to_existing, home.join("existing")).unwrap();
+        assert!(!link_into_repo(&root, &home.join("existing")));
+        // the target is gone, so only the text is left; `..` still has to count
+        let to_missing = root.join("../nowhere/p");
+        std::os::unix::fs::symlink(&to_missing, home.join("dangling")).unwrap();
+        assert!(!link_into_repo(&root, &home.join("dangling")));
+        // a `..` that stays inside is inside
+        let inside = root.join("sub/../a");
+        std::os::unix::fs::symlink(&inside, home.join("inside")).unwrap();
+        assert!(link_into_repo(&root, &home.join("inside")));
+        let gone = root.join("sub/../gone");
+        std::os::unix::fs::symlink(&gone, home.join("inside-gone")).unwrap();
+        assert!(link_into_repo(&root, &home.join("inside-gone")));
     }
 }

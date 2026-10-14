@@ -717,16 +717,13 @@ fn apply(
         if !meta.file_type().is_symlink() {
             continue;
         }
-        match std::fs::read_link(&dest) {
-            Ok(target) if target.starts_with(root) => {}
-            _ => {
-                println!(
-                    "  {:>8}  {}  (points outside the repository; left alone)",
-                    "keep",
-                    rel.display()
-                );
-                continue;
-            }
+        if !plan::link_into_repo(root, &dest) {
+            println!(
+                "  {:>8}  {}  (points outside the repository; left alone)",
+                "keep",
+                rel.display()
+            );
+            continue;
         }
         println!("  {:>8}  {}", "prune", rel.display());
         pruned += 1;
