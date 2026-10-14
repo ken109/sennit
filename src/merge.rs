@@ -273,6 +273,8 @@ pub fn describe_keys(keys: &[String]) -> String {
 }
 
 struct Prepared {
+    /// What the target said when it was read; `None` if it did not exist
+    old: Option<String>,
     text: String,
     existed: bool,
     unchanged: bool,
@@ -304,6 +306,7 @@ fn prepare(p: &Planned, env: &Env, dry_run: bool) -> Result<Prepared> {
     let merged = merge_value(base, &p.shared);
     let text = render(&merged);
     Ok(Prepared {
+        old: current.as_ref().map(|t| t.text.clone()),
         keys: changed_paths(&p.shared, base),
         unchanged: current.as_ref().is_some_and(|t| t.text == text),
         existed: current.is_some(),
@@ -319,7 +322,13 @@ fn prepare(p: &Planned, env: &Env, dry_run: bool) -> Result<Prepared> {
 
 /// Write to a temporary file beside the target and rename it over.
 /// The mode of an existing target is kept; a new file is private.
-fn write_atomic(dest: &Path, text: &str, mode: u32) -> Result<()> {
+///
+/// `expected` is the text the merge was computed from (`None` for a target that
+/// did not exist). The tool that owns the file rewrites it on its own schedule,
+/// so it is read once more right before the rename; if it is no longer what was
+/// merged, nothing is renamed and the answer is `false`, and the caller merges
+/// again from what is there now.
+fn write_atomic(dest: &Path, text: &str, mode: u32, expected: Option<&str>) -> Result<bool> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = dest.parent() {
@@ -329,7 +338,7 @@ fn write_atomic(dest: &Path, text: &str, mode: u32) -> Result<()> {
     let name = dest.file_name().context("merge target has no file name")?;
     let tmp = dest.with_file_name(format!("{}.sennit-tmp", name.to_string_lossy()));
     let _ = std::fs::remove_file(&tmp);
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<bool> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -341,9 +350,22 @@ fn write_atomic(dest: &Path, text: &str, mode: u32) -> Result<()> {
         drop(f);
         // The umask can have narrowed it
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-        std::fs::rename(&tmp, dest).with_context(|| format!("failed to replace {}", dest.display()))
+        let now = match std::fs::read_to_string(dest) {
+            Ok(t) => Some(t),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("failed to read {}", dest.display()))
+            }
+        };
+        if now.as_deref() != expected {
+            return Ok(false);
+        }
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("failed to replace {}", dest.display()))?;
+        Ok(true)
     })();
-    if result.is_err() {
+    if !matches!(result, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -412,13 +434,18 @@ pub fn apply_all(
             println!("            {}", describe_keys(&prep.keys));
         }
         if dry_run {
-            if first_touch && backup {
+            let has_backup = Path::new(&format!("{}.sennit-backup", p.dest.display())).exists();
+            if first_touch && backup && !has_backup {
                 println!("            the existing file would be kept at <name>.sennit-backup");
             }
             continue;
         }
 
-        if first_touch && backup {
+        // A backup already sitting next to it is the user's original, from an
+        // earlier apply. A state that forgot about it (an older sennit rewrote
+        // it) must not make the merged file the new "original".
+        let has_backup = Path::new(&format!("{}.sennit-backup", p.dest.display())).exists();
+        if first_touch && backup && !has_backup {
             let to = crate::backup_path(&p.dest)?;
             std::fs::copy(&p.dest, &to).with_context(|| {
                 format!(
@@ -438,7 +465,23 @@ pub fn apply_all(
         }
         // The copy and the claim go on record before the file is touched
         save(kept, merged)?;
-        write_atomic(&p.dest, &prep.text, prep.mode)?;
+        // The tool may rewrite the file while this runs: merge again from what
+        // is there if so, a few times, then give up rather than overwrite it.
+        let mut prep = prep;
+        let mut attempts = 1;
+        while !write_atomic(&p.dest, &prep.text, prep.mode, prep.old.as_deref())? {
+            if attempts >= 3 {
+                bail!(
+                    "{} kept changing while it was being merged; it was left as it is",
+                    p.dest.display()
+                );
+            }
+            attempts += 1;
+            prep = prepare(p, env, false)?;
+            if prep.unchanged {
+                break;
+            }
+        }
     }
     Ok(changed)
 }
@@ -571,12 +614,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let d = scratch("atomic");
         let p = d.join("settings.json");
-        write_atomic(&p, "{}\n", 0o600).unwrap();
+        write_atomic(&p, "{}\n", 0o600, None).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        write_atomic(&p, "{\"a\": 1}\n", 0o640).unwrap();
+        write_atomic(&p, "{\"a\": 1}\n", 0o640, Some("{}\n")).unwrap();
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o640
@@ -587,5 +630,31 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["settings.json"]);
+    }
+
+    /// If the target changed after it was read, nothing is renamed over it.
+    #[test]
+    fn a_target_that_changed_since_it_was_read_is_not_overwritten() {
+        let d = scratch("changed-under-us");
+        let p = d.join("settings.json");
+        std::fs::write(&p, "{\"a\": 1}\n").unwrap();
+        // read as `{"a": 1}`, but the tool has written something else since
+        std::fs::write(&p, "{\"a\": 2}\n").unwrap();
+        let wrote = write_atomic(&p, "{}\n", 0o600, Some("{\"a\": 1}\n")).unwrap();
+        assert!(!wrote);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\": 2}\n");
+        // a file that appeared where there was none counts as changed too
+        let q = d.join("new.json");
+        std::fs::write(&q, "{}\n").unwrap();
+        assert!(!write_atomic(&q, "{\"b\": 1}\n", 0o600, None).unwrap());
+        // and neither left a temporary file behind
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        // unchanged: it goes through
+        assert!(write_atomic(&p, "{}\n", 0o600, Some("{\"a\": 2}\n")).unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}\n");
     }
 }

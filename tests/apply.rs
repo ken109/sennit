@@ -2339,3 +2339,40 @@ fn a_declared_mode_wins_over_the_mode_of_an_existing_merge_target() {
     ok(&r.run(&["apply"]));
     assert_eq!(mode_of(&target), 0o640);
 }
+
+// ---------------------------------------------------------------------------
+// merge: not losing the original, and not racing the tool
+// ---------------------------------------------------------------------------
+
+/// An older sennit rewrites state.json without the `merged` list. The next run
+/// must not mistake the already merged file for the user's original and file it
+/// away as a second backup next to the real one.
+#[test]
+fn a_forgotten_merge_claim_does_not_produce_a_second_backup() {
+    let r = merge_repo("merge-forgotten-claim");
+    let original = "{\"mine\": true}\n";
+    r.write_home(".claude/settings.json", original);
+    ok(&r.run(&["apply"]));
+    let backup = r.home_path(".claude/settings.json.sennit-backup");
+    assert_eq!(read(&backup), original);
+
+    // what 0.19 does to the state: it knows nothing of `merged`
+    let state = r.home_path(".local/state/sennit/state.json");
+    let mut v: serde_json::Value = serde_json::from_str(&read(&state)).unwrap();
+    v.as_object_mut().unwrap().remove("merged");
+    std::fs::write(&state, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    r.write(
+        ".claude/settings.shared.json",
+        &SHARED.replace("opus", "haiku"),
+    );
+    ok(&r.run(&["apply"]));
+    assert_eq!(
+        json(&r.home_path(".claude/settings.json"))["model"],
+        "haiku"
+    );
+    assert_eq!(read(&backup), original, "the original was overwritten");
+    assert!(!r
+        .home_path(".claude/settings.json.sennit-backup.1")
+        .exists());
+}
