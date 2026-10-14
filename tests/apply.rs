@@ -1655,3 +1655,383 @@ fn a_link_that_leaves_the_repository_is_not_removed() {
     assert_eq!(read(&old.join("SKILL.md")), "from life\n");
     assert_eq!(read(&r.home_path(".claude/skills/new/SKILL.md")), "new\n");
 }
+
+// ---------------------------------------------------------------------------
+// [merge]
+// ---------------------------------------------------------------------------
+
+const MERGE_MANIFEST: &str = r#"
+[link]
+common = [".claude"]
+ignore = ["*.local.json"]
+
+[merge.".claude/settings.json"]
+from = ".claude/settings.shared.json"
+"#;
+
+const SHARED: &str = r#"{
+  "model": "opus",
+  "env": { "SHARED": "1" },
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "shared-stop" }] }]
+  }
+}
+"#;
+
+fn merge_repo(name: &str) -> Repo {
+    let r = Repo::new(name);
+    r.manifest(MERGE_MANIFEST);
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/settings.shared.json", SHARED);
+    r
+}
+
+fn json(p: &Path) -> serde_json::Value {
+    serde_json::from_str(&read(p)).unwrap()
+}
+
+#[test]
+fn merge_creates_the_target_and_a_second_apply_writes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let r = merge_repo("merge-create");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("merge"), "{out}");
+    assert!(out.contains(".claude/settings.json"), "{out}");
+    let target = r.home_path(".claude/settings.json");
+    let meta = std::fs::symlink_metadata(&target).unwrap();
+    assert!(
+        meta.is_file(),
+        "the target is a file of its own, not a link"
+    );
+    assert_eq!(mode_of(&target), 0o600);
+    assert_eq!(json(&target)["model"], "opus");
+    // two-space indent, trailing newline
+    assert!(
+        read(&target).starts_with("{\n  \"model\""),
+        "{}",
+        read(&target)
+    );
+    assert!(read(&target).ends_with("}\n"));
+    // nothing to back up when there was nothing there
+    assert!(backups_under(&r.home).is_empty());
+
+    let (ino, mtime) = (meta.ino(), meta.mtime_nsec());
+    let again = ok(&r.run(&["apply"]));
+    assert!(again.contains("already up to date"), "{again}");
+    let after = std::fs::metadata(&target).unwrap();
+    assert_eq!((after.ino(), after.mtime_nsec()), (ino, mtime), "rewritten");
+}
+
+#[test]
+fn the_merge_source_is_never_linked() {
+    let r = merge_repo("merge-source-not-linked");
+    ok(&r.run(&["apply"]));
+    assert!(exists(&r.home_path(".claude/CLAUDE.md")));
+    assert!(!exists(&r.home_path(".claude/settings.shared.json")));
+    let list = ok(&r.run(&["list"]));
+    assert!(!list.contains("settings.shared.json"), "{list}");
+}
+
+#[test]
+fn merge_keeps_machine_specific_keys_and_replaces_arrays() {
+    let r = merge_repo("merge-rules");
+    r.write_home(
+        ".claude/settings.json",
+        r#"{
+  "zeta": "machine",
+  "env": { "LOCAL": "1" },
+  "model": "sonnet",
+  "hooks": {
+    "Notification": [{ "hooks": [{ "type": "command", "command": "machine-only" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "old-stop" }] }]
+  }
+}
+"#,
+    );
+    ok(&r.run(&["apply"]));
+    let got = json(&r.home_path(".claude/settings.json"));
+    assert_eq!(got["model"], "opus");
+    assert_eq!(got["zeta"], "machine");
+    assert_eq!(got["env"]["LOCAL"], "1");
+    assert_eq!(got["env"]["SHARED"], "1");
+    // an event the shared file names is replaced as a whole ...
+    assert_eq!(
+        got["hooks"]["Stop"][0]["hooks"][0]["command"],
+        "shared-stop"
+    );
+    assert_eq!(got["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    // ... and one it does not name survives
+    assert_eq!(
+        got["hooks"]["Notification"][0]["hooks"][0]["command"],
+        "machine-only"
+    );
+    // the target's own key order comes first
+    let text = read(&r.home_path(".claude/settings.json"));
+    assert!(
+        text.find("\"zeta\"").unwrap() < text.find("\"model\"").unwrap(),
+        "{text}"
+    );
+}
+
+#[test]
+fn merge_moves_an_untouched_target_aside_once_and_rollback_restores_it() {
+    let r = merge_repo("merge-backup");
+    let original = "{\n  \"mine\": true\n}\n";
+    r.write_home(".claude/settings.json", original);
+    let target = r.home_path(".claude/settings.json");
+    let backup = r.home_path(".claude/settings.json.sennit-backup");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("kept the old file"), "{out}");
+    assert_eq!(read(&backup), original);
+    assert_eq!(json(&target)["mine"], true);
+
+    // a changed shared file merges again, without another backup
+    r.write(
+        ".claude/settings.shared.json",
+        &SHARED.replace("opus", "haiku"),
+    );
+    ok(&r.run(&["apply"]));
+    assert_eq!(json(&target)["model"], "haiku");
+    assert_eq!(read(&backup), original);
+    assert!(!r
+        .home_path(".claude/settings.json.sennit-backup.1")
+        .exists());
+
+    let out = ok(&r.run(&["rollback"]));
+    assert!(out.contains("1 file(s) restored"), "{out}");
+    assert_eq!(read(&target), original);
+}
+
+#[test]
+fn no_backup_does_not_keep_a_copy_of_the_target() {
+    let r = merge_repo("merge-no-backup");
+    r.write_home(".claude/settings.json", "{\"mine\": true}\n");
+    ok(&r.run(&["apply", "--no-backup"]));
+    assert!(backups_under(&r.home).is_empty());
+    assert_eq!(json(&r.home_path(".claude/settings.json"))["mine"], true);
+}
+
+#[test]
+fn merge_keeps_the_mode_of_an_existing_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = merge_repo("merge-mode");
+    r.write_home(".claude/settings.json", "{}\n");
+    let target = r.home_path(".claude/settings.json");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    ok(&r.run(&["apply"]));
+    assert_eq!(mode_of(&target), 0o640);
+}
+
+#[test]
+fn merge_dry_run_writes_nothing() {
+    let r = merge_repo("merge-dry-run");
+    let original = "{\"mine\": true}\n";
+    r.write_home(".claude/settings.json", original);
+
+    let out = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(out.contains("would merge"), "{out}");
+    assert!(out.contains("nothing written"), "{out}");
+    assert_eq!(read(&r.home_path(".claude/settings.json")), original);
+    assert!(!r.home_path(".claude/settings.json.sennit-backup").exists());
+    // no link was placed either
+    assert!(!exists(&r.home_path(".claude/CLAUDE.md")));
+}
+
+#[test]
+fn merge_dry_run_fails_on_a_broken_target() {
+    let r = merge_repo("merge-dry-run-broken");
+    r.write_home(".claude/settings.json", "{ not json");
+    let out = r.run(&["apply", "--dry-run"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("not valid JSON"), "{}", both(&out));
+}
+
+#[test]
+fn a_broken_target_is_reported_and_left_exactly_as_it_was() {
+    for (name, body) in [
+        ("garbage", "{ not json"),
+        ("jsonc", "{\n  // comment\n  \"a\": 1\n}\n"),
+        ("array", "[1, 2]\n"),
+    ] {
+        let r = merge_repo(&format!("merge-broken-{name}"));
+        r.write_home(".claude/settings.json", body);
+        let out = r.run(&["apply"]);
+        assert!(!out.status.success(), "{name} should fail");
+        assert_eq!(read(&r.home_path(".claude/settings.json")), body, "{name}");
+        assert!(backups_under(&r.home).is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_symlinked_target_is_refused() {
+    let r = merge_repo("merge-symlink-target");
+    std::fs::create_dir_all(r.home_path(".claude")).unwrap();
+    let real = r.home.join("real-settings.json");
+    std::fs::write(&real, "{}\n").unwrap();
+    std::os::unix::fs::symlink(&real, r.home_path(".claude/settings.json")).unwrap();
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("symlink"), "{}", both(&out));
+    assert_eq!(read(&real), "{}\n");
+}
+
+/// A source that is missing or broken fails the plan, before anything is placed.
+#[test]
+fn a_bad_merge_source_fails_before_anything_is_placed() {
+    let r = merge_repo("merge-bad-source");
+    std::fs::remove_file(r.root_path(".claude/settings.shared.json")).unwrap();
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("does not exist"), "{}", both(&out));
+    assert!(!exists(&r.home_path(".claude/CLAUDE.md")));
+
+    r.write(".claude/settings.shared.json", "{ \"a\": ");
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("not valid JSON"), "{}", both(&out));
+    assert!(!exists(&r.home_path(".claude/CLAUDE.md")));
+    // diff and list read the same plan
+    assert!(!r.run(&["diff"]).status.success());
+}
+
+#[test]
+fn merge_output_only_names_key_paths() {
+    let r = Repo::new("merge-no-values");
+    r.manifest(MERGE_MANIFEST);
+    r.write(
+        ".claude/settings.shared.json",
+        "{\"env\": {\"API_TOKEN\": \"hunter2-shared\"}}\n",
+    );
+    r.write_home(
+        ".claude/settings.json",
+        "{\"env\": {\"API_TOKEN\": \"hunter2-local\"}}\n",
+    );
+    let diff = ok(&r.run(&["diff"]));
+    let dry = ok(&r.run(&["apply", "--dry-run"]));
+    let apply = ok(&r.run(&["apply"]));
+    let verify_after_edit = {
+        std::fs::write(
+            r.home_path(".claude/settings.json"),
+            "{\"env\": {\"API_TOKEN\": \"hunter2-edited\"}}\n",
+        )
+        .unwrap();
+        both(&r.run(&["verify"]))
+    };
+    for text in [&diff, &dry, &apply, &verify_after_edit] {
+        assert!(!text.contains("hunter2"), "a value was printed:\n{text}");
+    }
+    assert!(apply.contains("env.API_TOKEN"), "{apply}");
+}
+
+#[test]
+fn verify_reports_a_stale_or_missing_merge_target() {
+    let r = merge_repo("merge-verify");
+    ok(&r.run(&["apply"]));
+    let out = ok(&r.run(&["verify"]));
+    assert!(out.contains("ok"), "{out}");
+
+    // somebody changed a shared key by hand
+    let target = r.home_path(".claude/settings.json");
+    let mut v = json(&target);
+    v["model"] = serde_json::json!("sonnet");
+    std::fs::write(&target, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success());
+    let text = both(&out);
+    assert!(text.contains("stale"), "{text}");
+    assert!(text.contains("model"), "{text}");
+    // diff and list say so as well
+    assert!(ok(&r.run(&["diff"])).contains("stale"));
+    assert!(ok(&r.run(&["list"])).contains("stale"));
+
+    // apply puts it right, verify agrees
+    ok(&r.run(&["apply"]));
+    assert!(r.run(&["verify"]).status.success());
+
+    // keys only the machine has are not drift
+    let mut v = json(&target);
+    v["machine"] = serde_json::json!(true);
+    std::fs::write(&target, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    assert!(r.run(&["verify"]).status.success());
+
+    std::fs::remove_file(&target).unwrap();
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("missing"), "{}", both(&out));
+}
+
+#[test]
+fn diff_before_and_after_a_merge() {
+    let r = merge_repo("merge-diff");
+    let before = ok(&r.run(&["diff"]));
+    assert!(before.contains(".claude/settings.json"), "{before}");
+    assert!(before.contains("missing"), "{before}");
+    ok(&r.run(&["apply"]));
+    let after = ok(&r.run(&["diff"]));
+    assert!(after.contains("no changes"), "{after}");
+}
+
+#[test]
+fn a_merge_runs_after_the_links_and_before_the_hooks() {
+    let r = Repo::new("merge-order");
+    let seen = r.home.join("hook-saw.json");
+    r.manifest(&format!(
+        "{MERGE_MANIFEST}\n[hooks.after]\nrun = \"cp '{}' '{}'\"\n",
+        r.home_path(".claude/settings.json").display(),
+        seen.display()
+    ));
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/settings.shared.json", SHARED);
+    ok(&r.run(&["apply"]));
+    assert_eq!(json(&seen)["model"], "opus");
+}
+
+#[test]
+fn merging_into_a_directory_that_was_a_link_into_the_repository() {
+    let r = merge_repo("merge-after-relink");
+    std::os::unix::fs::symlink(r.root_path(".claude"), r.home_path(".claude")).unwrap();
+    ok(&r.run(&["apply"]));
+    // the settings went to $HOME, not into the repository through the old link
+    assert!(!r.root_path(".claude/settings.json").exists());
+    assert_eq!(json(&r.home_path(".claude/settings.json"))["model"], "opus");
+    assert_eq!(read(&r.root_path(".claude/CLAUDE.md")), "top\n");
+}
+
+#[test]
+fn removing_a_declaration_leaves_the_target_alone() {
+    let r = merge_repo("merge-undeclared");
+    ok(&r.run(&["apply"]));
+    let target = r.home_path(".claude/settings.json");
+    let before = read(&target);
+
+    r.manifest("[link]\ncommon = [\".claude\"]\nignore = [\"*.shared.json\"]\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("no longer declared"), "{out}");
+    assert_eq!(read(&target), before);
+    // said once
+    let again = ok(&r.run(&["apply"]));
+    assert!(!again.contains("no longer declared"), "{again}");
+}
+
+#[test]
+fn a_merge_output_that_the_repository_also_provides_is_refused() {
+    let r = merge_repo("merge-collides-with-link");
+    r.write(".claude/settings.json", "{}\n");
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("[merge] output"), "{}", both(&out));
+    assert!(!exists(&r.home_path(".claude/settings.json")));
+}
+
+#[test]
+fn a_merge_output_declared_under_link_is_refused_when_the_manifest_loads() {
+    let r = Repo::new("merge-collides-declared");
+    r.manifest(
+        "[link]\ncommon = [\".claude/settings.json\"]\n\n[merge.\".claude/settings.json\"]\nfrom = \"s.json\"\n",
+    );
+    let out = r.run(&["diff"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("[link]"), "{}", both(&out));
+}

@@ -18,6 +18,7 @@ brew install ken109/tap/sennit   # or: cargo install sennit
 - [What apply will not do](#what-apply-will-not-do)
 - [Templating](#templating)
 - [Per-machine variation](#per-machine-variation)
+- [Files that cannot be symlinks](#files-that-cannot-be-symlinks)
 - [Running things after placing them](#running-things-after-placing-them)
 - [File modes](#file-modes)
 - [Secrets](#secrets)
@@ -278,6 +279,62 @@ is a top-level array, so it goes above the first table header:
 ```toml
 data = ["theme.toml", "colors.toml"]
 ```
+
+## Files that cannot be symlinks
+
+
+Some files hold settings that are yours alone next to settings you want everywhere, and the
+tool that owns them rewrites them itself. Claude Code's `settings.json` is the example:
+a hook that only makes sense on one machine sits beside permissions you want on all of
+them. A symlink into the repository would put the machine-specific part in git, or be
+overwritten by the tool. `[merge]` overlays a shared JSON file onto the real file instead:
+
+```toml
+[merge.".claude/settings.json"]     # the output, relative to $HOME like [link]
+from = ".claude/settings.shared.json"
+```
+
+The rules are the ones a hand-written merge script would use:
+
+- objects are merged recursively;
+- arrays and plain values are replaced by the repository's side;
+- keys that exist only in the target are left alone, and the target's key order is kept.
+
+Hooks are keyed by event (`PreToolUse`, `Stop`, ...), each holding an array. So an event the
+shared file names has its array replaced as a whole — list every hook for that event in
+the shared file — while an event only the target has, a machine-specific `Notification`
+hook for instance, survives. A key removed from the shared file stays in each target until
+you remove it by hand.
+
+`apply` merges after linking and before modes and hooks. It reads the target (a missing one
+counts as `{}`), merges, writes it with two-space indent and a trailing newline, and does
+nothing if that is what the file already says. A write goes to a temporary file that is then
+renamed over the target, so the tool never sees a half-written file; an existing file keeps
+its mode and a new one is 0600. The first time sennit touches a target that already exists,
+it keeps a copy at `<name>.sennit-backup` and records it with the other backups, so
+`sennit rollback` puts the original back. Output names key paths only (`merge
+.claude/settings.json (3 key(s))`) and never a value.
+
+`diff`, `list` and `verify` compare the merge result with the target: a target that lacks
+or differs in a shared key is `stale`, an absent one is `missing`. Keys the machine added on
+its own are not drift. `--dry-run` writes nothing, but still fails on a target that cannot
+be merged.
+
+It fails rather than guess:
+
+- a `from` file that is missing, not valid JSON, or not an object fails when the plan is
+  built, before anything is placed;
+- a target that is not valid JSON (comments and trailing commas included), is not an
+  object, or is a symlink is reported and left exactly as it was. A file that does not
+  parse is never overwritten;
+- an output that is also placed by `[link]` (or rendered, or encrypted) is refused.
+
+The `from` file is never linked into `$HOME`, whether or not `ignore` lists it. Removing a
+declaration leaves the target alone; `apply` says once that it is no longer declared.
+
+**Upgrade every machine to 0.20 or later before you push a manifest that uses `[merge]`.**
+An older sennit rejects keys it does not know, so it would refuse to read the whole
+manifest, not just that section.
 
 ## Running things after placing them
 

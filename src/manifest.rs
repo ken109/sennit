@@ -38,6 +38,20 @@ pub struct Manifest {
     /// apply が揃え、verify が検査する。
     #[serde(default)]
     pub modes: std::collections::BTreeMap<String, String>,
+    /// 出力パス -> 重ねる共有設定。出力は $HOME からの相対（link と同じ規則）。
+    ///
+    /// 出力は symlink にしない。マシン固有の設定が同居し、アプリ自身も
+    /// 書き換えるファイル（Claude Code の settings.json など）のためのもの。
+    #[serde(default)]
+    pub merge: std::collections::BTreeMap<String, Merge>,
+}
+
+/// `[merge."<output>"]` の中身。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Merge {
+    /// リポジトリ内の JSON。出力へ重ねる側。
+    pub from: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +101,10 @@ impl Manifest {
         for p in self.modes.keys() {
             paths.push(("modes", p));
         }
+        for (out, m) in &self.merge {
+            paths.push(("merge output", out));
+            paths.push(("merge source", &m.from));
+        }
         for p in &self.data {
             paths.push(("data", p));
         }
@@ -118,6 +136,8 @@ impl Manifest {
             }
         }
 
+        self.validate_merge()?;
+
         for (name, probe) in &self.probes {
             probe.validate(name)?;
         }
@@ -137,6 +157,44 @@ impl Manifest {
             // 受け付けると verify が見る 0o777 と食い違って収束しなくなる。
             if m > 0o777 {
                 bail!("mode `{mode}` for `{path}` is out of range; use three octal digits");
+            }
+        }
+        Ok(())
+    }
+
+    /// [merge] の出力が、ほかの宣言と同じパスを取り合っていないか。
+    ///
+    /// 取り合うと、片方が張った symlink をもう片方が JSON として読んで書き直す。
+    /// symlink を書き換えるとリポジトリの中身が変わるので、宣言の時点で断る。
+    fn validate_merge(&self) -> Result<()> {
+        let outs: Vec<&str> = self.merge.keys().map(String::as_str).collect();
+        for (i, a) in outs.iter().enumerate() {
+            for b in &outs[i + 1..] {
+                let (pa, pb) = (Path::new(a), Path::new(b));
+                if pa.starts_with(pb) || pb.starts_with(pa) {
+                    bail!("merge outputs `{a}` and `{b}` overlap");
+                }
+            }
+        }
+        for out in &outs {
+            let rel = Path::new(out);
+            if self
+                .link
+                .common
+                .iter()
+                .chain(&self.link.darwin)
+                .chain(&self.link.linux)
+                .any(|t| Path::new(t) == rel)
+            {
+                bail!("merge output `{out}` is also declared under [link]; sennit would both link and rewrite it");
+            }
+            if self.render.contains_key(*out) || self.encrypted.contains_key(*out) {
+                bail!("merge output `{out}` is also a [render] or [encrypted] output");
+            }
+        }
+        for (out, m) in &self.merge {
+            if Path::new(&m.from) == Path::new(out.as_str()) {
+                bail!("merge output `{out}` is its own source");
             }
         }
         Ok(())
@@ -162,6 +220,16 @@ impl Manifest {
     /// [encrypted] の入力として宣言されているか。暗号文も配置しない。
     pub fn is_ciphertext(&self, rel: &Path) -> bool {
         self.encrypted.values().any(|t| Path::new(t) == rel)
+    }
+
+    /// [merge] の入力として宣言されているか。配置せず、$HOME にも出さない。
+    pub fn is_merge_source(&self, rel: &Path) -> bool {
+        self.merge.values().any(|m| Path::new(&m.from) == rel)
+    }
+
+    /// [merge] の出力として宣言されているか。
+    pub fn is_merge_output(&self, rel: &Path) -> bool {
+        self.merge.keys().any(|o| Path::new(o) == rel)
     }
 
     /// このパスに宣言されたモード。書いたパスそのものにだけ効く。
@@ -265,6 +333,7 @@ mod tests {
             encryption: None,
             data: Default::default(),
             modes: Default::default(),
+            merge: Default::default(),
         }
     }
 
@@ -414,5 +483,62 @@ mod tests {
         assert!(!m.is_ignored(Path::new(".claude/worktrees-old/b.md")));
         // used to match nothing: only the last extension was looked at
         assert!(m.is_ignored(Path::new("pkg/x.tar.gz")));
+    }
+
+    #[test]
+    fn a_merge_source_is_never_placed_and_an_output_is_recognised() {
+        let m = load(
+            "[link]\ncommon = [\".claude\"]\n\n[merge.\".claude/settings.json\"]\nfrom = \".claude/settings.shared.json\"\n",
+        )
+        .unwrap();
+        assert!(m.is_merge_source(Path::new(".claude/settings.shared.json")));
+        assert!(!m.is_merge_source(Path::new(".claude/settings.json")));
+        assert!(m.is_merge_output(Path::new(".claude/settings.json")));
+    }
+
+    #[test]
+    fn a_merge_output_that_is_also_linked_is_rejected() {
+        let e = load(
+            "[link]\ncommon = [\".claude/settings.json\"]\n\n[merge.\".claude/settings.json\"]\nfrom = \"s.json\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[link]"), "{e:#}");
+    }
+
+    #[test]
+    fn a_merge_output_that_is_also_rendered_is_rejected() {
+        let e = load(
+            "[link]\ncommon = []\n\n[render]\n\"a.json\" = \"a.json.tmpl\"\n\n[merge.\"a.json\"]\nfrom = \"s.json\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[render]"), "{e:#}");
+    }
+
+    #[test]
+    fn overlapping_merge_outputs_are_rejected() {
+        let e = load(
+            "[link]\ncommon = []\n\n[merge.\"a\"]\nfrom = \"x.json\"\n\n[merge.\"a/b\"]\nfrom = \"y.json\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("overlap"), "{e:#}");
+    }
+
+    #[test]
+    fn a_merge_path_that_escapes_is_rejected() {
+        let e =
+            load("[link]\ncommon = []\n\n[merge.\"../x.json\"]\nfrom = \"s.json\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
+        let e = load("[link]\ncommon = []\n\n[merge.\"x.json\"]\nfrom = \"/etc/s.json\"\n")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("absolute"), "{e:#}");
+    }
+
+    #[test]
+    fn an_unknown_merge_key_is_rejected() {
+        // `own` is not supported yet; silently ignoring it would be worse
+        let e =
+            load("[link]\ncommon = []\n\n[merge.\"x.json\"]\nfrom = \"s.json\"\nown = [\"a\"]\n")
+                .unwrap_err();
+        assert!(format!("{e:#}").contains("own"), "{e:#}");
     }
 }

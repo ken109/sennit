@@ -134,8 +134,23 @@ impl Plan {
         // テンプレートは生成の入力であって配置対象ではない。ignore の宣言に
         // 頼ると書き忘れたときに、未展開の {{ }} を含むファイルがそのまま
         // $HOME に置かれる。[render] の入力は自明に対象外なので自動で外す。
-        if manifest.is_template(rel) || manifest.is_ciphertext(rel) || manifest.is_ignored(rel) {
+        //
+        // [merge] の入力も同じ。共有設定そのものを $HOME に出す理由が無い。
+        if manifest.is_template(rel)
+            || manifest.is_ciphertext(rel)
+            || manifest.is_merge_source(rel)
+            || manifest.is_ignored(rel)
+        {
             return Ok(());
+        }
+        // [merge] の出力は symlink にしない。リポジトリに同じパスのファイルが
+        // あると、link が張った symlink を merge が JSON として書き直す。
+        if manifest.is_merge_output(rel) {
+            anyhow::bail!(
+                "`{}` is a [merge] output and also a file under [link]; \
+                 remove it from the repository or from [link]",
+                rel.display()
+            );
         }
         let src = root.join(rel);
         let dest = home.join(rel);

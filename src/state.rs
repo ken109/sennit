@@ -17,6 +17,11 @@ pub struct State {
     /// フック名 -> 最後に走らせたときの監視対象の指紋
     #[serde(default)]
     pub hooks: std::collections::BTreeMap<String, String>,
+    /// `[merge]` の出力のうち、sennit が書いたことのあるもの。
+    ///
+    /// 載っていない既存ファイルは利用者のものとして、最初の 1 回だけ退避する。
+    #[serde(default)]
+    pub merged: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +107,7 @@ mod tests {
                 kept_at: PathBuf::from("/h/a.sennit-backup"),
             }],
             hooks: Default::default(),
+            merged: Default::default(),
         }
         .save(&home)
         .unwrap();

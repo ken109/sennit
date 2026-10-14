@@ -104,8 +104,8 @@ pub const UNREADABLE: u32 = u32::MAX;
 /// パッケージとモードの検査は常に走らせ、秘密の検査は後から足す。
 /// どちらかが落ちても、もう一方の結果は出す。片方の失敗がもう片方を
 /// 隠すと、直して再実行するたびに次の失敗が出てくることになる。
-pub fn verify(root: &Path, export: Option<PathBuf>, secrets: bool) -> Result<()> {
-    let machine = verify_machine(root, export);
+pub fn verify(root: &Path, home: &Path, export: Option<PathBuf>, secrets: bool) -> Result<()> {
+    let machine = verify_machine(root, home, export);
     if !secrets {
         return machine;
     }
@@ -121,7 +121,7 @@ pub fn verify(root: &Path, export: Option<PathBuf>, secrets: bool) -> Result<()>
     }
 }
 
-fn verify_machine(root: &Path, export: Option<PathBuf>) -> Result<()> {
+fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<()> {
     let packages = Packages::load(&root.join("packages.toml"))?;
 
     let mut missing = Vec::new();
@@ -187,17 +187,53 @@ fn verify_machine(root: &Path, export: Option<PathBuf>) -> Result<()> {
         }
     }
 
-    if missing.is_empty() && wrong_modes.is_empty() {
+    // [merge] の出力が、重ねた結果とずれていないか。値は出さず、キーのパスだけ
+    let merges = crate::merge::plan(root, home, &manifest)?;
+    let mut bad_merges = 0usize;
+    for m in &merges {
+        match crate::merge::status(m, root, home) {
+            crate::merge::Status::Ok => {}
+            crate::merge::Status::Missing => {
+                bad_merges += 1;
+                println!(
+                    "  \x1b[31mmissing\x1b[0m  {}  (merge target does not exist)",
+                    m.out
+                );
+            }
+            crate::merge::Status::Stale(keys) => {
+                bad_merges += 1;
+                println!(
+                    "  \x1b[31mstale\x1b[0m    {}  ({} key(s) differ: {})",
+                    m.out,
+                    keys.len(),
+                    crate::merge::describe_keys(&keys)
+                );
+            }
+            crate::merge::Status::Broken(why) => {
+                bad_merges += 1;
+                println!("  \x1b[31mbroken\x1b[0m   {}  ({why})", m.out);
+            }
+        }
+    }
+
+    if missing.is_empty() && wrong_modes.is_empty() && bad_merges == 0 {
         println!("\x1b[32mok\x1b[0m  everything verifiable is present");
         return Ok(());
     }
-    if missing.is_empty() {
-        bail!("{} file(s) with the wrong mode", wrong_modes.len());
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{} declared package(s) not found on this machine",
+            missing.len()
+        ));
     }
-    bail!(
-        "{} declared package(s) not found on this machine",
-        missing.len()
-    )
+    if !wrong_modes.is_empty() {
+        problems.push(format!("{} file(s) with the wrong mode", wrong_modes.len()));
+    }
+    if bad_merges > 0 {
+        problems.push(format!("{bad_merges} merged file(s) out of date"));
+    }
+    bail!("{}", problems.join("; "))
 }
 
 /// このパッケージについて「存在すればこれが見つかるはず」という名前の一覧。

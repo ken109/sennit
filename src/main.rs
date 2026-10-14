@@ -4,6 +4,7 @@ mod encrypted;
 mod glob;
 mod hooks;
 mod manifest;
+mod merge;
 mod packages;
 mod plan;
 mod probe;
@@ -146,27 +147,31 @@ fn run() -> Result<()> {
             no_backup,
             secrets,
         } => {
+            // 共有設定の読み込みは何かを変える前に。壊れていれば何も起きない
+            let merges = merge::plan(&root, &home, &manifest)?;
             // 生成物はコミットしないので、配置の前に必ず作る
             let produced = render_all(&root, &manifest, secrets, dry_run)?;
             let plan = Plan::build(&root, &home, &manifest)?;
             apply(
-                &plan, &root, &home, &manifest, dry_run, !no_backup, &produced,
+                &plan, &merges, &root, &home, &manifest, dry_run, !no_backup, &produced,
             )
         }
         Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
-            print_diff(&plan);
+            let merges = merge::plan(&root, &home, &manifest)?;
+            print_diff(&plan, &merges, &root, &home);
             Ok(())
         }
         Command::Check => check(&root),
         Command::Render { secrets } => render_all(&root, &manifest, secrets, false).map(|_| ()),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
-        Command::Verify { export, secrets } => verify::verify(&root, export, secrets),
+        Command::Verify { export, secrets } => verify::verify(&root, &home, export, secrets),
         // 先に捌いてある
         Command::Compare { .. } => unreachable!(),
         Command::Audit { history } => audit::audit(&root, history),
         Command::List { changed } => {
-            print_list(&plan, changed);
+            let merges = merge::plan(&root, &home, &manifest)?;
+            print_list(&plan, &merges, &root, &home, changed);
             Ok(())
         }
     }
@@ -620,8 +625,10 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
     Ok(fixed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply(
     plan: &Plan,
+    merges: &[merge::Planned],
     root: &Path,
     home: &Path,
     manifest: &Manifest,
@@ -762,6 +769,7 @@ fn apply(
                             links: placed.clone(),
                             backups: kept.clone(),
                             hooks: previous.hooks.clone(),
+                            merged: previous.merged.clone(),
                         }
                         .save(home)?;
                         relinked = true;
@@ -788,6 +796,7 @@ fn apply(
                     links: placed.clone(),
                     backups: kept.clone(),
                     hooks: previous.hooks.clone(),
+                    merged: previous.merged.clone(),
                 }
                 .save(home)?;
             }
@@ -806,6 +815,7 @@ fn apply(
                     links: placed.clone(),
                     backups: kept.clone(),
                     hooks: previous.hooks.clone(),
+                    merged: previous.merged.clone(),
                 }
                 .save(home)?;
                 return Err(err);
@@ -820,9 +830,21 @@ fn apply(
         // 締め出すような宣言をここで断らないと、preview だけ通って apply が
         // 落ちる。README は diff と --dry-run から始めろと書いてある。
         enforce_modes(root, manifest, true)?;
+        let mut merged = previous.merged.clone();
+        let merging = merge::apply_all(
+            root,
+            home,
+            manifest,
+            merges,
+            &mut merged,
+            &mut kept,
+            backup,
+            true,
+            &mut |_, _| Ok(()),
+        )?;
         println!(
             "\n{} change(s), {} prune(s), nothing written (--dry-run)",
-            changes.len() + not_yet.len(),
+            changes.len() + not_yet.len() + merging,
             pruned
         );
         return Ok(());
@@ -836,8 +858,33 @@ fn apply(
         links: current.clone(),
         backups: kept.clone(),
         hooks: previous.hooks.clone(),
+        merged: previous.merged.clone(),
     }
     .save(home)?;
+
+    // 共有設定の重ね書き。リンクのあと(祖先の symlink が実ディレクトリに
+    // 替わっている)で、モードとフックのまえ。フックが取り込む設定は、
+    // 重ねたあとのものでなければならない。
+    let mut merged = previous.merged.clone();
+    let merging = merge::apply_all(
+        root,
+        home,
+        manifest,
+        merges,
+        &mut merged,
+        &mut kept,
+        backup,
+        false,
+        &mut |kept, merged| {
+            state::State {
+                links: current.clone(),
+                backups: kept.to_vec(),
+                hooks: previous.hooks.clone(),
+                merged: merged.to_vec(),
+            }
+            .save(home)
+        },
+    )?;
 
     // 宣言されたモードを揃える。symlink 方式なのでリポジトリ側の実体に
     // かける。生成物は render 側で既に揃っているが、ただ張っただけの
@@ -859,10 +906,11 @@ fn apply(
         links: current,
         backups: kept.clone(),
         hooks: hooks.clone(),
+        merged,
     }
     .save(home)?;
 
-    if changes.is_empty() && pruned == 0 && fixed == 0 && ran.count == 0 {
+    if changes.is_empty() && pruned == 0 && fixed == 0 && ran.count == 0 && merging == 0 {
         if not_yet.is_empty() {
             println!("already up to date ({} links)", plan.entries.len());
         } else {
@@ -876,7 +924,16 @@ fn apply(
         return Ok(());
     }
 
-    println!("\n{} link(s) updated, {} pruned", changes.len(), pruned);
+    if merging > 0 {
+        println!(
+            "\n{} link(s) updated, {} pruned, {} merged",
+            changes.len(),
+            pruned,
+            merging
+        );
+    } else {
+        println!("\n{} link(s) updated, {} pruned", changes.len(), pruned);
+    }
     if !not_yet.is_empty() {
         println!("{} not generated yet, so not linked", not_yet.len());
     }
@@ -951,6 +1008,8 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         }
         std::fs::rename(&b.kept_at, &b.dest)
             .with_context(|| format!("failed to restore {}", b.dest.display()))?;
+        // 元のファイルに戻ったので、次の merge はまた最初の 1 回として退避する
+        st.merged.retain(|m| home.join(m) != b.dest);
         restored += 1;
     }
 
@@ -1055,9 +1114,14 @@ fn backup_path(dest: &Path) -> Result<PathBuf> {
     bail!("too many backups next to {}", dest.display())
 }
 
-fn print_diff(plan: &Plan) {
+fn print_diff(plan: &Plan, merges: &[merge::Planned], root: &Path, home: &Path) {
     let changes: Vec<_> = plan.changes().collect();
-    if changes.is_empty() {
+    let merge_status: Vec<_> = merges
+        .iter()
+        .map(|m| (m, merge::status(m, root, home)))
+        .filter(|(_, st)| *st != merge::Status::Ok)
+        .collect();
+    if changes.is_empty() && merge_status.is_empty() {
         println!("no changes ({} links already in place)", plan.entries.len());
         return;
     }
@@ -1089,14 +1153,38 @@ fn print_diff(plan: &Plan) {
             State::Linked => {}
         }
     }
-    println!("\n{} change(s)", changes.len());
+    for (m, st) in &merge_status {
+        println!("{}", merge_line(&m.out, st));
+    }
+    println!("\n{} change(s)", changes.len() + merge_status.len());
 }
 
-fn print_list(plan: &Plan, changed_only: bool) {
+/// A `[merge]` output that is not in the state a merge would leave it.
+fn merge_line(out: &str, st: &merge::Status) -> String {
+    match st {
+        merge::Status::Ok => format!("\x1b[32mok\x1b[0m {out}  (merged)"),
+        merge::Status::Missing => format!("\x1b[32m+\x1b[0m {out}  (merge: missing)"),
+        merge::Status::Stale(keys) => format!(
+            "\x1b[33m~\x1b[0m {out}  (merge: stale, {} key(s) differ: {})",
+            keys.len(),
+            merge::describe_keys(keys)
+        ),
+        merge::Status::Broken(why) => format!("\x1b[31m!\x1b[0m {out}  (merge: {why})"),
+    }
+}
+
+fn print_list(
+    plan: &Plan,
+    merges: &[merge::Planned],
+    root: &Path,
+    home: &Path,
+    changed_only: bool,
+) {
     let width = plan
         .entries
         .iter()
         .map(|e| e.rel.as_os_str().len())
+        .chain(merges.iter().map(|m| m.out.len()))
         .max()
         .unwrap_or(6)
         .max(6);
@@ -1125,9 +1213,29 @@ fn print_list(plan: &Plan, changed_only: bool) {
         );
     }
 
+    let mut merge_changes = 0usize;
+    for m in merges {
+        let st = merge::status(m, root, home);
+        if st == merge::Status::Ok {
+            if !changed_only {
+                println!("{}", merge_line(&m.out, &st));
+            }
+            continue;
+        }
+        merge_changes += 1;
+        println!("{}", merge_line(&m.out, &st));
+    }
+
     let n = plan.entries.len();
     let c = plan.changes().count();
-    println!("\n{n} link(s), {c} need change");
+    if merges.is_empty() {
+        println!("\n{n} link(s), {c} need change");
+    } else {
+        println!(
+            "\n{n} link(s), {c} need change; {} merge(s), {merge_changes} need change",
+            merges.len()
+        );
+    }
 }
 
 #[cfg(test)]
