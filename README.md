@@ -628,7 +628,7 @@ from the shell without appearing in any config file.
 ## Status
 
 
-v0.18. Minimum supported Rust version is 1.90.
+v0.20. Minimum supported Rust version is 1.90.
 
 The author uses it to manage [ken109/dotfiles](https://github.com/ken109/dotfiles); if you
 adopt it, start with `sennit diff` and `--dry-run` before the first `apply`, since `apply`
