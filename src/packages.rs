@@ -197,8 +197,11 @@ impl Packages {
                 }
             }
             for os in &pkg.os {
-                if !matches!(os.as_str(), "darwin" | "linux") {
-                    bail!("package `{name}` has an unknown os `{os}`; expected darwin or linux");
+                if !matches!(os.as_str(), "darwin" | "linux" | "windows") {
+                    bail!(
+                        "package `{name}` has an unknown os `{os}`; \
+                         expected darwin, linux or windows"
+                    );
                 }
             }
         }
@@ -208,11 +211,7 @@ impl Packages {
     /// 宣言されている名前 -> optional かどうか。
     pub fn provided(&self) -> HashMap<(Kind, String), bool> {
         let mut out = HashMap::new();
-        let current_os = if cfg!(target_os = "macos") {
-            "darwin"
-        } else {
-            "linux"
-        };
+        let current_os = current_os();
         for (name, pkg) in &self.packages {
             // OS を限定している宣言は、対象外の OS では optional 扱いにする。
             // 設定は全 OS に配置されるが本体は入らない、という状態を可視化するため。
@@ -267,6 +266,8 @@ pub fn matches_profile(profiles: &[String]) -> bool {
 pub fn current_os() -> &'static str {
     if cfg!(target_os = "macos") {
         "darwin"
+    } else if cfg!(windows) {
+        "windows"
     } else {
         "linux"
     }
@@ -298,6 +299,10 @@ fn which(bin: &str) -> bool {
 /// この OS で sync が導入経路を持つか。verify はこれを見て、入れようが
 /// ないものを「見つからない」と報告しないようにする。
 pub fn will_install(pkg: &Package) -> bool {
+    // sync does not run on Windows, so nothing is installable there
+    if cfg!(windows) {
+        return false;
+    }
     will_install_with(pkg, current_linux_pm())
 }
 
@@ -538,6 +543,7 @@ mod load_tests {
     ///
     /// Linux では apt / yay の名前が無い cask に導入経路が無い。provides を
     /// 書いていると verify だけが永久に落ち続ける状態になっていた。
+    #[cfg(not(windows))]
     #[test]
     fn a_cask_without_a_distro_name_is_not_installable_on_linux() {
         let cask = pkg("manager = \"brew-cask\"\nprovides = [\"op\"]\n");
@@ -550,6 +556,14 @@ mod load_tests {
         }
         assert!(will_install(&with_apt));
         assert!(will_install(&font));
+    }
+
+    /// sync does not run on Windows, so verify has nothing to hold a package to.
+    #[cfg(windows)]
+    #[test]
+    fn nothing_is_installable_on_windows() {
+        let plain = pkg("manager = \"brew\"\n");
+        assert!(!will_install(&plain));
     }
 
     fn load(toml: &str) -> Result<Packages> {

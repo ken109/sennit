@@ -64,6 +64,8 @@ pub struct Link {
     #[serde(default)]
     pub linux: Vec<String>,
     #[serde(default)]
+    pub windows: Vec<String>,
+    #[serde(default)]
     pub ignore: Vec<String>,
 }
 
@@ -87,6 +89,7 @@ impl Manifest {
             .iter()
             .chain(&self.link.darwin)
             .chain(&self.link.linux)
+            .chain(&self.link.windows)
         {
             paths.push(("link", p));
         }
@@ -122,7 +125,14 @@ impl Manifest {
         // どちらも「利用者の設定を置く」の範囲を越えるので宣言の時点で断る。
         for (what, p) in paths {
             let path = Path::new(p);
-            if path.is_absolute() {
+            // On Windows `\foo` and `C:foo` are not absolute but still escape the
+            // directory they are joined to
+            if path.is_absolute()
+                || path.has_root()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::Prefix(_)))
+            {
                 bail!("{what} `{p}` is an absolute path; declarations are relative to the repository root");
             }
             if path
@@ -184,6 +194,7 @@ impl Manifest {
                 .iter()
                 .chain(&self.link.darwin)
                 .chain(&self.link.linux)
+                .chain(&self.link.windows)
                 .any(|t| Path::new(t) == rel)
             {
                 bail!("merge output `{out}` is also declared under [link]; sennit would both link and rewrite it");
@@ -205,6 +216,8 @@ impl Manifest {
         let mut out: Vec<&str> = self.link.common.iter().map(String::as_str).collect();
         let os_specific = if cfg!(target_os = "macos") {
             &self.link.darwin
+        } else if cfg!(windows) {
+            &self.link.windows
         } else {
             &self.link.linux
         };
@@ -323,6 +336,7 @@ mod tests {
                 common: vec![],
                 darwin: vec![],
                 linux: vec![],
+                windows: vec![],
                 ignore: ignore.iter().map(|s| s.to_string()).collect(),
             },
             render: Default::default(),

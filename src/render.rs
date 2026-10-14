@@ -31,6 +31,14 @@ pub fn load_vars(paths: &[std::path::PathBuf]) -> Result<BTreeMap<String, String
 }
 
 fn hostname() -> String {
+    // hostname.exe has no -s; the name is in the environment
+    if cfg!(windows) {
+        return std::env::var("COMPUTERNAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| "unknown".into());
+    }
     std::process::Command::new("hostname")
         .arg("-s")
         .output()

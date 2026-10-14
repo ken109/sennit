@@ -18,6 +18,12 @@ const ORDER: [Manager; 5] = [
 ];
 
 pub fn sync(root: &Path, dry_run: bool) -> Result<()> {
+    if cfg!(windows) {
+        bail!(
+            "sync is not supported on Windows: there is no package manager it knows how to drive. \
+             Install the declared packages with winget or scoop yourself"
+        );
+    }
     let packages = Packages::load(&root.join("packages.toml"))?;
     let wanted = packages.installable();
 

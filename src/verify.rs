@@ -71,8 +71,12 @@ fn check_modes(
     home: &Path,
     manifest: &crate::manifest::Manifest,
 ) -> Vec<(String, u32, u32)> {
-    use std::os::unix::fs::PermissionsExt;
     let mut wrong = Vec::new();
+    // Windows has no POSIX mode to compare against
+    if !crate::platform::MODES_ENFORCED {
+        crate::platform::note_modes_ignored(manifest.modes.len());
+        return wrong;
+    }
     for (rel, want) in &manifest.modes {
         let Ok(want) = u32::from_str_radix(want, 8) else {
             continue;
@@ -98,7 +102,7 @@ fn check_modes(
                 continue;
             }
         };
-        let got = meta.permissions().mode() & 0o777;
+        let got = crate::platform::mode_of(&meta);
         if got != want {
             wrong.push((rel.clone(), want, got));
         }
@@ -313,25 +317,10 @@ fn resolves(kind: Kind, name: &str) -> bool {
 fn on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let p = dir.join(name);
-                p.is_file() && is_executable(&p)
-            })
+            std::env::split_paths(&paths)
+                .any(|dir| crate::platform::find_in_dir(&dir, name).is_some())
         })
         .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(_p: &Path) -> bool {
-    true
 }
 
 /// フォントのファイル名はファミリ名と一致しない
@@ -355,8 +344,16 @@ fn font_installed(family: &str) -> bool {
 }
 
 fn font_dirs() -> Vec<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if cfg!(target_os = "macos") {
+    let home = crate::platform::home_dir().unwrap_or_default();
+    if cfg!(windows) {
+        let mut dirs = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+        }
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        dirs.push(PathBuf::from(windir).join("Fonts"));
+        dirs
+    } else if cfg!(target_os = "macos") {
         vec![
             PathBuf::from(&home).join("Library/Fonts"),
             PathBuf::from("/Library/Fonts"),
