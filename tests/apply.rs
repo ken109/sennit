@@ -2283,3 +2283,59 @@ fn a_path_moving_from_link_to_merge_previews_cleanly() {
     assert_eq!(json(&target)["model"], "opus");
     assert!(r.run(&["verify"]).status.success());
 }
+
+// ---------------------------------------------------------------------------
+// [modes] on a merge output
+// ---------------------------------------------------------------------------
+
+fn merge_modes_repo(name: &str) -> Repo {
+    let r = Repo::new(name);
+    r.manifest(&format!(
+        "{MERGE_MANIFEST}\n[modes]\n\".claude/settings.json\" = \"640\"\n"
+    ));
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/settings.shared.json", SHARED);
+    r
+}
+
+/// A mode declared for a merge output applies to the file in `$HOME`, which is
+/// not in the repository, and `verify` checks it there.
+#[test]
+fn a_declared_mode_applies_to_a_merge_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = merge_modes_repo("merge-modes");
+    let target = r.home_path(".claude/settings.json");
+
+    ok(&r.run(&["apply"]));
+    assert_eq!(
+        mode_of(&target),
+        0o640,
+        "a new target takes the declared mode"
+    );
+    assert!(r.run(&["verify"]).status.success());
+
+    // loosened by hand: verify notices, a preview says what apply will do
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success());
+    assert!(both(&out).contains("mode"), "{}", both(&out));
+    let dry = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(dry.contains("would set"), "{dry}");
+    assert_eq!(mode_of(&target), 0o644);
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("mode"), "{out}");
+    assert_eq!(mode_of(&target), 0o640);
+    assert!(r.run(&["verify"]).status.success());
+}
+
+#[test]
+fn a_declared_mode_wins_over_the_mode_of_an_existing_merge_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = merge_modes_repo("merge-modes-existing");
+    r.write_home(".claude/settings.json", "{}\n");
+    let target = r.home_path(".claude/settings.json");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    ok(&r.run(&["apply"]));
+    assert_eq!(mode_of(&target), 0o640);
+}

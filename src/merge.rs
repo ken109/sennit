@@ -307,7 +307,12 @@ fn prepare(p: &Planned, env: &Env, dry_run: bool) -> Result<Prepared> {
         keys: changed_paths(&p.shared, base),
         unchanged: current.as_ref().is_some_and(|t| t.text == text),
         existed: current.is_some(),
-        mode: current.as_ref().map_or(0o600, |t| t.mode),
+        // 宣言があればそれ。無ければ既存のモードを保ち、新しいファイルは非公開
+        mode: env
+            .manifest
+            .mode_for(&p.rel)
+            .or(current.as_ref().map(|t| t.mode))
+            .unwrap_or(0o600),
         text,
     })
 }

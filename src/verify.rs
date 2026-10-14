@@ -66,14 +66,24 @@ pub fn compare(a: &Path, b: &Path) -> Result<()> {
 ///
 /// トークンを含むファイルが 0644 で置かれていても何も壊れないので、
 /// 気づく機会が無い。宣言してあれば検査できる。
-fn check_modes(root: &Path, manifest: &crate::manifest::Manifest) -> Vec<(String, u32, u32)> {
+fn check_modes(
+    root: &Path,
+    home: &Path,
+    manifest: &crate::manifest::Manifest,
+) -> Vec<(String, u32, u32)> {
     use std::os::unix::fs::PermissionsExt;
     let mut wrong = Vec::new();
     for (rel, want) in &manifest.modes {
         let Ok(want) = u32::from_str_radix(want, 8) else {
             continue;
         };
-        let path = root.join(rel);
+        // [merge] の出力は $HOME に在るファイルそのもの
+        let base = if manifest.is_merge_output(Path::new(rel)) {
+            home
+        } else {
+            root
+        };
+        let path = base.join(rel);
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             // 無いのは異常ではない。生成物は --secrets を通すまで作られない
@@ -178,7 +188,7 @@ fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<(
     }
 
     let manifest = crate::manifest::Manifest::load(&root.join("sennit.toml"))?;
-    let wrong_modes = check_modes(root, &manifest);
+    let wrong_modes = check_modes(root, home, &manifest);
     for (rel, want, got) in &wrong_modes {
         if *got == UNREADABLE {
             println!("  \x1b[31mmode\x1b[0m     {rel}  (declared {want:o}, could not be read)");

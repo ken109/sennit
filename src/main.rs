@@ -554,18 +554,22 @@ fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Resu
 ///
 /// preview では変えずに、掛けられるかだけ見る。締め出すような宣言を
 /// --dry-run が通してしまうと、preview から始めろという案内が嘘になる。
-fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usize> {
+fn enforce_modes(root: &Path, home: &Path, manifest: &Manifest, preview: bool) -> Result<usize> {
     use std::os::unix::fs::PermissionsExt;
     let mut fixed = 0usize;
     for rel in manifest.modes.keys() {
         let want = manifest
             .mode_for(Path::new(rel))
             .expect("validated when the manifest loaded");
-        let path = root.join(rel);
+        // [merge] の出力はリポジトリに実体が無く、$HOME に在るファイルそのもの
+        let merge_output = manifest.is_merge_output(Path::new(rel));
+        let path = if merge_output { home } else { root }.join(rel);
         // metadata も set_permissions も symlink を辿る。宣言されたパスが
         // リンクなら、chmod が掛かるのはリンク先 — リポジトリの外かもしれない。
         // 宣言は「そのパスそのもの」に効くと書いてあるので、リンクは断る。
         match std::fs::symlink_metadata(&path) {
+            // 移行の途中で、まだ prune されていない旧い link。merge のあとには無い
+            Ok(m) if m.file_type().is_symlink() && merge_output && preview => continue,
             Ok(m) if m.file_type().is_symlink() => bail!(
                 "`{}` is a symlink; a declared mode applies to the path itself, \
                  and following the link would change something else",
@@ -589,7 +593,9 @@ fn enforce_modes(root: &Path, manifest: &Manifest, preview: bool) -> Result<usiz
         };
         // 途中のディレクトリが symlink なら、最後の 1 要素を見るだけでは
         // リポジトリの外に出ていることに気づけない。
-        must_be_inside(root, &path)?;
+        if !merge_output {
+            must_be_inside(root, &path)?;
+        }
         // ディレクトリは所有者の読みと実行の両方が要る。read_dir には読みが、
         // 中のファイルに触るには実行が必要で、どちらを落としても sennit は
         // 二度とそこを歩けない。しかも自分で掛けたモードなので、次の apply は
@@ -862,7 +868,7 @@ fn apply(
         // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
         // 締め出すような宣言をここで断らないと、preview だけ通って apply が
         // 落ちる。README は diff と --dry-run から始めろと書いてある。
-        enforce_modes(root, manifest, true)?;
+        enforce_modes(root, home, manifest, true)?;
         let mut merged = previous.merged.clone();
         let env = merge::Env::new(root, home, manifest, plan, &previous);
         let merging = merge::apply_all(
@@ -920,7 +926,7 @@ fn apply(
     // 宣言されたモードを揃える。symlink 方式なのでリポジトリ側の実体に
     // かける。生成物は render 側で既に揃っているが、ただ張っただけの
     // ファイルはここでしか直せない。
-    let fixed = enforce_modes(root, manifest, false)?;
+    let fixed = enforce_modes(root, home, manifest, false)?;
 
     // 配置のあとにフックを走らせる。設定を置いてから取り込む処理なので、
     // 順序が逆だと参照先がまだ無い。

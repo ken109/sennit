@@ -325,7 +325,8 @@ you remove it by hand.
 counts as `{}`), merges, writes it with two-space indent and a trailing newline, and does
 nothing if that is what the file already says. A write goes to a temporary file that is then
 renamed over the target, so the tool never sees a half-written file; an existing file keeps
-its mode and a new one is 0600. The first time sennit touches a target that already exists,
+its mode and a new one is 0600, unless `[modes]` declares one for the output, in which case
+`apply` sets it and `verify` checks it on the file in `$HOME`. The first time sennit touches a target that already exists,
 it keeps a copy at `<name>.sennit-backup` and records it with the other backups, so
 `sennit rollback` puts the original back. Output names key paths only (`merge
 .claude/settings.json (3 key(s))`) and never a value.
