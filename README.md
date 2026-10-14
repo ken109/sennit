@@ -99,7 +99,10 @@ excluded whether or not you list them, which is what makes a forgotten
 Behaviour change in 0.20, a bug fix: before, only `*.ext` with a single extension was a
 wildcard, and anything else was a prefix. `*.test.ts` and `*.tar.gz` therefore matched
 nothing and the files they named were placed anyway. They now match. If you had such a
-line and relied on it doing nothing, remove it.
+line and relied on it doing nothing, remove it. The same goes for a line that used to match
+nothing because it was not one of the two old shapes, such as `.*`: it was a literal name
+with a star in it, and is now a wildcard that ignores every dotfile and dot-directory at any
+depth, `.claude` included.
 
 `packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
 and `sync`; `apply` does not read it. What was linked is recorded in
@@ -297,7 +300,6 @@ data = ["theme.toml", "colors.toml"]
 
 ## Files that cannot be symlinks
 
-
 Some files hold settings that are yours alone next to settings you want everywhere, and the
 tool that owns them rewrites them itself. Claude Code's `settings.json` is the example:
 a hook that only makes sense on one machine sits beside permissions you want on all of
@@ -341,9 +343,23 @@ It fails rather than guess:
 - a `from` file that is missing, not valid JSON, or not an object fails when the plan is
   built, before anything is placed;
 - a target that is not valid JSON (comments and trailing commas included), is not an
-  object, or is a symlink is reported and left exactly as it was. A file that does not
-  parse is never overwritten;
+  object, is empty (a zero-byte file is not `{}`), or is a symlink is reported and left
+  exactly as it was. A file that does not parse is never overwritten;
 - an output that is also placed by `[link]` (or rendered, or encrypted) is refused.
+
+Known behaviour, so it does not surprise you:
+
+- the file is parsed and written back, so a number may be written differently from how you
+  or the tool wrote it (`1e3` comes back as `1000.0`), and a `\u00e9` escape comes back as
+  the character. The value is the same;
+- `sennit rollback` puts the first-touch backup back and moves the merged file it replaces
+  aside to `<name>.sennit-backup.N`, as it does for any path, so one is left behind;
+- the first-touch backup is skipped if `<name>.sennit-backup` already exists, whatever the
+  state says. Do not run an older sennit (0.19 or earlier) over a merged file: it rewrites
+  the state without knowing about merges.
+- the target is read again just before it is replaced. If the tool that owns it wrote in
+  between, the merge is redone from what is there, up to three times, and fails rather
+  than overwrite it.
 
 The `from` file is never linked into `$HOME`, whether or not `ignore` lists it. Removing a
 declaration leaves the target alone; `apply` says once that it is no longer declared.

@@ -1922,6 +1922,7 @@ fn a_broken_target_is_reported_and_left_exactly_as_it_was() {
         ("garbage", "{ not json"),
         ("jsonc", "{\n  // comment\n  \"a\": 1\n}\n"),
         ("array", "[1, 2]\n"),
+        ("empty", ""),
     ] {
         let r = merge_repo(&format!("merge-broken-{name}"));
         r.write_home(".claude/settings.json", body);
