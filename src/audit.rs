@@ -144,9 +144,9 @@ fn collect(dir: &Path, out: &mut std::collections::HashSet<String>, depth: usize
 }
 
 fn default_history() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
+    let home = crate::platform::home_dir()?;
     for candidate in [".zsh_history", ".bash_history"] {
-        let p = PathBuf::from(&home).join(candidate);
+        let p = home.join(candidate);
         if p.is_file() {
             return Ok(p);
         }

@@ -65,8 +65,8 @@ impl Encryption {
 /// 先頭の ~ を展開する。鍵はリポジトリの外に置くので必要になる。
 fn expand_home(p: &str) -> String {
     match p.strip_prefix("~/") {
-        Some(rest) => match std::env::var("HOME") {
-            Ok(home) => format!("{home}/{rest}"),
+        Some(rest) => match crate::platform::home_dir() {
+            Ok(home) => home.join(rest).display().to_string(),
             Err(_) => p.to_string(),
         },
         None => p.to_string(),
@@ -108,8 +108,8 @@ mod tests {
     /// 鍵はリポジトリの外に置くので ~ を展開できる必要がある。
     #[test]
     fn tilde_is_expanded() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(expand_home("~/x"), format!("{home}/x"));
+        let home = crate::platform::home_dir().unwrap();
+        assert_eq!(expand_home("~/x"), home.join("x").display().to_string());
         assert_eq!(expand_home("/abs/x"), "/abs/x");
     }
 }

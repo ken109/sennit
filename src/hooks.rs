@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 /// 配置したあとに走らせる処理。
 ///
@@ -111,9 +110,8 @@ pub fn run_all(
             Some(c) => root.join(c),
             None => root.to_path_buf(),
         };
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(&hook.run)
+        let status = crate::platform::shell(&hook.run)
+            .with_context(|| format!("hook `{name}`"))?
             .current_dir(&dir)
             .status()
             .with_context(|| format!("hook `{name}`: failed to run"))?;

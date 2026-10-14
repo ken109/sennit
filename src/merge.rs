@@ -70,7 +70,7 @@ pub fn plan(root: &Path, home: &Path, manifest: &Manifest) -> Result<Vec<Planned
         out.push(Planned {
             out: name.clone(),
             rel: PathBuf::from(name),
-            dest: home.join(name),
+            dest: crate::platform::native(&home.join(name)),
             shared,
         });
     }
@@ -143,7 +143,6 @@ pub struct Target {
 /// overwrite: writing over a file that failed to parse destroys whatever the
 /// person had in it.
 pub fn read_target(dest: &Path) -> Result<Option<Target>> {
-    use std::os::unix::fs::PermissionsExt;
     let meta = match std::fs::symlink_metadata(dest) {
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -179,7 +178,7 @@ pub fn read_target(dest: &Path) -> Result<Option<Target>> {
     Ok(Some(Target {
         text,
         value,
-        mode: meta.permissions().mode() & 0o777,
+        mode: crate::platform::mode_of(&meta),
     }))
 }
 
@@ -330,26 +329,24 @@ fn prepare(p: &Planned, env: &Env, dry_run: bool) -> Result<Prepared> {
 /// again from what is there now.
 fn write_atomic(dest: &Path, text: &str, mode: u32, expected: Option<&str>) -> Result<bool> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let name = dest.file_name().context("merge target has no file name")?;
     let tmp = dest.with_file_name(format!("{}.sennit-tmp", name.to_string_lossy()));
-    let _ = std::fs::remove_file(&tmp);
+    let _ = crate::platform::remove_file_force(&tmp);
     let result = (|| -> Result<bool> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        let mut f = crate::platform::create_with_mode(&mut opts, mode)
             .open(&tmp)
             .with_context(|| format!("failed to write {}", tmp.display()))?;
         f.write_all(text.as_bytes())?;
         f.flush()?;
         drop(f);
         // The umask can have narrowed it
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        crate::platform::set_mode(&tmp, mode)?;
         let now = match std::fs::read_to_string(dest) {
             Ok(t) => Some(t),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -361,12 +358,12 @@ fn write_atomic(dest: &Path, text: &str, mode: u32, expected: Option<&str>) -> R
         if now.as_deref() != expected {
             return Ok(false);
         }
-        std::fs::rename(&tmp, dest)
+        crate::platform::replace_file(&tmp, dest)
             .with_context(|| format!("failed to replace {}", dest.display()))?;
         Ok(true)
     })();
     if !matches!(result, Ok(true)) {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = crate::platform::remove_file_force(&tmp);
     }
     result
 }
@@ -604,26 +601,25 @@ mod tests {
     fn a_symlinked_target_is_refused() {
         let d = scratch("symlink");
         std::fs::write(d.join("real.json"), "{}").unwrap();
-        std::os::unix::fs::symlink(d.join("real.json"), d.join("link.json")).unwrap();
+        crate::platform::symlink(d.join("real.json"), d.join("link.json")).unwrap();
         let e = read_target(&d.join("link.json")).err().unwrap();
         assert!(format!("{e:#}").contains("symlink"), "{e:#}");
     }
 
     #[test]
     fn an_atomic_write_keeps_the_mode_and_leaves_no_temp_file() {
-        use std::os::unix::fs::PermissionsExt;
         let d = scratch("atomic");
         let p = d.join("settings.json");
         write_atomic(&p, "{}\n", 0o600, None).unwrap();
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        assert!(crate::platform::mode_matches(
+            &std::fs::metadata(&p).unwrap(),
             0o600
-        );
+        ));
         write_atomic(&p, "{\"a\": 1}\n", 0o640, Some("{}\n")).unwrap();
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        assert!(crate::platform::mode_matches(
+            &std::fs::metadata(&p).unwrap(),
             0o640
-        );
+        ));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\": 1}\n");
         let names: Vec<_> = std::fs::read_dir(&d)
             .unwrap()

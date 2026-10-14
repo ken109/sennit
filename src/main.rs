@@ -7,6 +7,7 @@ mod manifest;
 mod merge;
 mod packages;
 mod plan;
+mod platform;
 mod probe;
 mod render;
 mod state;
@@ -130,7 +131,7 @@ fn run() -> Result<()> {
     };
     let home = match &cli.home {
         Some(p) => p.clone(),
-        None => PathBuf::from(std::env::var("HOME").context("HOME is not set")?),
+        None => platform::home_dir()?,
     };
     // 相対パスのまま symlink を張ると、リンク先が $HOME からの相対として
     // 解釈される。`sennit --root . apply` は .zshrc -> ./.zshrc という
@@ -185,7 +186,7 @@ fn run() -> Result<()> {
 /// 存在しない場合(初回の --home など)はカレントディレクトリを前置するだけに
 /// して、「まだ無い」を失敗にしない。
 fn absolute(p: &Path) -> Result<PathBuf> {
-    if let Ok(c) = std::fs::canonicalize(p) {
+    if let Ok(c) = platform::canonicalize(p) {
         return Ok(c);
     }
     if p.is_absolute() {
@@ -450,7 +451,6 @@ fn decrypt_all(
 /// 失敗を握り潰さない。秘密を含む生成物が誰でも読める状態のまま
 /// コマンドが成功を返すと、権限で守るという前提そのものが崩れる。
 fn enforce_mode(root: &Path, path: &Path, declared: Option<u32>, secret: bool) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let want = declared.unwrap_or(if secret { 0o400 } else { 0o444 });
     must_be_inside(root, path)?;
     // 生成物の置き場が symlink なら、chmod はリンク先に掛かる
@@ -467,8 +467,8 @@ fn enforce_mode(root: &Path, path: &Path, declared: Option<u32>, secret: bool) -
         // まだ無いものは次の書き込みで正しいモードになる
         Err(_) => return Ok(()),
     };
-    if meta.permissions().mode() & 0o777 != want {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(want))
+    if !platform::mode_matches(&meta, want) {
+        platform::set_mode(path, want)
             .with_context(|| format!("failed to set mode on {}", path.display()))?;
     }
     Ok(())
@@ -492,11 +492,11 @@ fn enforce_mode(root: &Path, path: &Path, declared: Option<u32>, secret: bool) -
 /// 書き込みも権限変更も、触る前にここを通す。
 fn must_be_inside(root: &Path, path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or(root);
-    let real = std::fs::canonicalize(parent)
+    let real = platform::canonicalize(parent)
         .with_context(|| format!("failed to resolve {}", parent.display()))?;
-    let real_root = std::fs::canonicalize(root)
+    let real_root = platform::canonicalize(root)
         .with_context(|| format!("failed to resolve {}", root.display()))?;
-    if !real.starts_with(&real_root) {
+    if !platform::path_starts_with(&real, &real_root) {
         bail!(
             "{} resolves to {}, which is outside the repository",
             path.display(),
@@ -508,7 +508,6 @@ fn must_be_inside(root: &Path, path: &Path) -> Result<()> {
 
 fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     must_be_inside(root, path)?;
 
@@ -527,22 +526,19 @@ fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Resu
         ),
         // 前回書いたものが読み取り専用だと開けない
         Ok(_) => {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+            platform::set_mode(path, 0o600).ok();
         }
         Err(_) => {}
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    let mut f = platform::create_with_mode(&mut opts, mode).open(path)?;
     f.write_all(contents)?;
     f.flush()?;
     drop(f);
 
     // 既存ファイルを開いた場合は .mode() が効かないので揃え直す
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    platform::set_mode(path, mode)?;
     Ok(())
 }
 
@@ -555,7 +551,11 @@ fn write_generated(root: &Path, path: &Path, contents: &[u8], mode: u32) -> Resu
 /// preview では変えずに、掛けられるかだけ見る。締め出すような宣言を
 /// --dry-run が通してしまうと、preview から始めろという案内が嘘になる。
 fn enforce_modes(root: &Path, home: &Path, manifest: &Manifest, preview: bool) -> Result<usize> {
-    use std::os::unix::fs::PermissionsExt;
+    // Windows には POSIX のモードが無い。宣言は読むが掛けず、1 回だけ知らせる
+    if !platform::MODES_ENFORCED {
+        platform::note_modes_ignored(manifest.modes.len());
+        return Ok(0);
+    }
     let mut fixed = 0usize;
     for rel in manifest.modes.keys() {
         let want = manifest
@@ -607,7 +607,7 @@ fn enforce_modes(root: &Path, home: &Path, manifest: &Manifest, preview: bool) -
                 rel
             );
         }
-        if meta.permissions().mode() & 0o777 == want {
+        if platform::mode_of(&meta) == want {
             continue;
         }
         if preview {
@@ -615,11 +615,11 @@ fn enforce_modes(root: &Path, home: &Path, manifest: &Manifest, preview: bool) -
             fixed += 1;
             continue;
         }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want))
+        platform::set_mode(&path, want)
             .with_context(|| format!("failed to set mode on {}", path.display()))?;
         // 落ちた先を読み直す。要求どおりにならないまま成功を返すと、
         // 毎回「直した」と言い続けて収束しない。
-        let got = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        let got = platform::mode_of(&std::fs::metadata(&path)?);
         if got != want {
             bail!(
                 "{}: asked for mode {:o} but the filesystem gave {:o}",
@@ -736,7 +736,7 @@ fn apply(
         println!("  {:>8}  {}", "prune", rel.display());
         pruned += 1;
         if !dry_run {
-            std::fs::remove_file(&dest)
+            platform::remove_link(&dest)
                 .with_context(|| format!("failed to remove {}", dest.display()))?;
         }
     }
@@ -802,7 +802,7 @@ fn apply(
                         Some(to) => std::fs::rename(&link, to).with_context(|| {
                             format!("failed to move the symlink {} aside", link.display())
                         }),
-                        None => std::fs::remove_file(&link).with_context(|| {
+                        None => platform::remove_link(&link).with_context(|| {
                             format!("failed to remove the symlink {}", link.display())
                         }),
                     };
@@ -839,7 +839,7 @@ fn apply(
                 }
                 .save(home)?;
             }
-            std::os::unix::fs::symlink(&e.src, &e.dest)
+            platform::symlink(&e.src, &e.dest)
                 .with_context(|| format!("failed to link {}", e.dest.display()))?;
             Ok(())
         })();
@@ -1033,7 +1033,7 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         // 戻す先にあったものを失わせるのでは意味が無いので、そちらも退ける。
         match std::fs::symlink_metadata(&b.dest) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                std::fs::remove_file(&b.dest)?;
+                platform::remove_link(&b.dest)?;
             }
             Ok(_) => {
                 let aside = backup_path(&b.dest)?;
@@ -1098,7 +1098,7 @@ fn remove_dest(dest: &Path, state: &State, backup: bool) -> Result<Option<PathBu
         State::Ancestor { .. } => Ok(None),
         // 別の場所を指す symlink は、それ自体に中身が無いので消してよい
         State::Wrong { .. } => {
-            std::fs::remove_file(dest)
+            platform::remove_link(dest)
                 .with_context(|| format!("failed to remove symlink {}", dest.display()))?;
             Ok(None)
         }
@@ -1272,7 +1272,6 @@ fn print_list(plan: &Plan, merges: &[merge::Planned], env: &merge::Env, changed_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// 使い捨ての作業ディレクトリ。名前で衝突しないようにする。
     fn scratch(name: &str) -> PathBuf {
@@ -1332,7 +1331,7 @@ mod tests {
         let other = d.join("other");
         std::fs::write(&other, "x").unwrap();
         let dest = d.join("a.conf");
-        std::os::unix::fs::symlink(&other, &dest).unwrap();
+        platform::symlink(&other, &dest).unwrap();
 
         let kept = remove_dest(
             &dest,
@@ -1381,10 +1380,10 @@ mod tests {
         let d = scratch("write-generated");
         let p = d.join("out.conf");
         write_generated(&d, &p, b"token", 0o400).unwrap();
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        assert!(platform::mode_matches(
+            &std::fs::metadata(&p).unwrap(),
             0o400
-        );
+        ));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "token");
     }
 
@@ -1396,10 +1395,10 @@ mod tests {
         // 読み取り専用にしたものを次の render が書き直せないと詰む
         write_generated(&d, &p, b"two", 0o444).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "two");
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        assert!(platform::mode_matches(
+            &std::fs::metadata(&p).unwrap(),
             0o444
-        );
+        ));
     }
 
     #[test]
@@ -1407,12 +1406,12 @@ mod tests {
         let d = scratch("enforce-mode");
         let p = d.join("out.conf");
         std::fs::write(&p, "x").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        platform::set_mode(&p, 0o644).unwrap();
 
         enforce_mode(&d, &p, None, true).unwrap();
-        assert_eq!(
-            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        assert!(platform::mode_matches(
+            &std::fs::metadata(&p).unwrap(),
             0o400
-        );
+        ));
     }
 }

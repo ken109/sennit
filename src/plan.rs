@@ -152,8 +152,8 @@ impl Plan {
                 rel.display()
             );
         }
-        let src = root.join(rel);
-        let dest = home.join(rel);
+        let src = crate::platform::native(&root.join(rel));
+        let dest = crate::platform::native(&home.join(rel));
         let state = match ancestor_link(root, home, rel, manifest) {
             Some(link) => State::Ancestor { link },
             None => inspect(&src, &dest),
@@ -262,9 +262,9 @@ pub fn link_into_repo(root: &Path, link: &Path) -> bool {
             None => return false,
         }
     };
-    match std::fs::canonicalize(&target) {
-        Ok(real) => real.starts_with(root),
-        Err(_) => collapse(&target).starts_with(root),
+    match crate::platform::canonicalize(&target) {
+        Ok(real) => crate::platform::path_starts_with(&real, root),
+        Err(_) => crate::platform::path_starts_with(&collapse(&target), root),
     }
 }
 
@@ -305,7 +305,7 @@ fn inspect(src: &Path, dest: &Path) -> State {
                 return State::Occupied;
             }
             match std::fs::read_link(dest) {
-                Ok(current) if current == src => State::Linked,
+                Ok(current) if crate::platform::same_path(&current, src) => State::Linked,
                 Ok(current) => State::Wrong { current },
                 Err(_) => State::Occupied,
             }
@@ -316,6 +316,7 @@ fn inspect(src: &Path, dest: &Path) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::symlink;
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("sennit-plan-{name}"));
@@ -345,13 +346,13 @@ mod tests {
         assert_eq!(inspect(&src, &occupied), State::Occupied);
 
         let linked = d.join("linked.conf");
-        std::os::unix::fs::symlink(&src, &linked).unwrap();
+        symlink(&src, &linked).unwrap();
         assert_eq!(inspect(&src, &linked), State::Linked);
 
         let elsewhere = d.join("elsewhere.conf");
         write(&elsewhere, "y");
         let wrong = d.join("wrong.conf");
-        std::os::unix::fs::symlink(&elsewhere, &wrong).unwrap();
+        symlink(&elsewhere, &wrong).unwrap();
         assert_eq!(inspect(&src, &wrong), State::Wrong { current: elsewhere });
     }
 
@@ -363,7 +364,7 @@ mod tests {
         let src = d.join("src.conf");
         write(&src, "x");
         let dest = d.join("dest.conf");
-        std::os::unix::fs::symlink(&src, &dest).unwrap();
+        symlink(&src, &dest).unwrap();
         std::fs::remove_file(&src).unwrap();
 
         assert_eq!(inspect(&src, &dest), State::Linked);
@@ -422,6 +423,7 @@ common = ["conf"]
     }
 
     /// ignore のディレクトリには入らない。その中が読めなくても落ちない。
+    #[cfg(unix)]
     #[test]
     fn an_ignored_directory_is_not_walked() {
         use std::os::unix::fs::PermissionsExt;
@@ -458,7 +460,7 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         let home = d.join("home");
         write(&root.join("skills/gog/SKILL.md"), "x\n");
         std::fs::create_dir_all(home.join("skills")).unwrap();
-        std::os::unix::fs::symlink(root.join("skills/gog"), home.join("skills/gog")).unwrap();
+        symlink(root.join("skills/gog"), home.join("skills/gog")).unwrap();
 
         let rel = Path::new("skills/gog/SKILL.md");
         let m = manifest_from("[link]\ncommon = [\"skills\"]\n");
@@ -480,8 +482,8 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         let home = d.join("repo/../home");
         write(&root.join("skills/gog/SKILL.md"), "x\n");
         std::fs::create_dir_all(home.join("skills")).unwrap();
-        std::os::unix::fs::symlink("../../repo/skills/gog", home.join("skills/gog")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        symlink("../../repo/skills/gog", home.join("skills/gog")).unwrap();
+        let root = crate::platform::canonicalize(&root).unwrap();
         assert!(repo_ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")).is_some());
     }
 
@@ -496,7 +498,7 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         write(&root.join("skills/gog/SKILL.md"), "x\n");
         write(&elsewhere.join("SKILL.md"), "old\n");
         std::fs::create_dir_all(home.join("skills")).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, home.join("skills/gog")).unwrap();
+        symlink(&elsewhere, home.join("skills/gog")).unwrap();
 
         let rel = Path::new("skills/gog/SKILL.md");
         assert!(!link_into_repo(&root, &home.join("skills/gog")));
@@ -518,7 +520,7 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
     #[test]
     fn a_target_that_climbs_out_of_the_repository_is_outside() {
         let d = scratch("dotdot");
-        let root = std::fs::canonicalize(&d).unwrap().join("repo");
+        let root = crate::platform::canonicalize(&d).unwrap().join("repo");
         let home = d.join("home");
         write(&root.join("a"), "x\n");
         write(&d.join("other/p"), "x\n");
@@ -526,18 +528,18 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
 
         // the target exists, so it can be resolved
         let to_existing = root.join("../other/p");
-        std::os::unix::fs::symlink(&to_existing, home.join("existing")).unwrap();
+        symlink(&to_existing, home.join("existing")).unwrap();
         assert!(!link_into_repo(&root, &home.join("existing")));
         // the target is gone, so only the text is left; `..` still has to count
         let to_missing = root.join("../nowhere/p");
-        std::os::unix::fs::symlink(&to_missing, home.join("dangling")).unwrap();
+        symlink(&to_missing, home.join("dangling")).unwrap();
         assert!(!link_into_repo(&root, &home.join("dangling")));
         // a `..` that stays inside is inside
         let inside = root.join("sub/../a");
-        std::os::unix::fs::symlink(&inside, home.join("inside")).unwrap();
+        symlink(&inside, home.join("inside")).unwrap();
         assert!(link_into_repo(&root, &home.join("inside")));
         let gone = root.join("sub/../gone");
-        std::os::unix::fs::symlink(&gone, home.join("inside-gone")).unwrap();
+        symlink(&gone, home.join("inside-gone")).unwrap();
         assert!(link_into_repo(&root, &home.join("inside-gone")));
     }
 }

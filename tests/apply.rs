@@ -22,7 +22,7 @@ impl Repo {
         let base = std::env::temp_dir().join(format!("sennit-it-{name}"));
         // 前回の実行が権限を狭めたまま終わっていると remove_dir_all が通らない。
         // テストが落ちた後にもう一度走らせられないのは、それ自体が困る。
-        if base.exists() {
+        if cfg!(unix) && base.exists() {
             let _ = Command::new("chmod")
                 .arg("-R")
                 .arg("u+rwX")
@@ -87,6 +87,42 @@ impl Repo {
     }
 }
 
+/// A symlink that works on both Unix and Windows. Windows needs the kind of
+/// target, so it is looked at when the link is made.
+fn symlink(src: impl AsRef<Path>, dest: impl AsRef<Path>) {
+    let (src, dest) = (src.as_ref(), dest.as_ref());
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(src, dest).unwrap();
+    #[cfg(windows)]
+    {
+        let seen = match dest.parent() {
+            Some(d) if src.is_relative() => d.join(src),
+            _ => src.to_path_buf(),
+        };
+        if seen.is_dir() {
+            std::os::windows::fs::symlink_dir(src, dest).unwrap();
+        } else {
+            std::os::windows::fs::symlink_file(src, dest).unwrap();
+        }
+    }
+}
+
+/// A path to put inside a TOML string or a shell command. Backslashes would be
+/// read as escapes there, and Windows takes forward slashes anyway.
+fn tp(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
+/// `canonicalize` without the `\\?\` prefix Windows puts on it, which is not how
+/// sennit writes a link target.
+fn canon(p: &Path) -> PathBuf {
+    let c = std::fs::canonicalize(p).unwrap();
+    match c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => c,
+    }
+}
+
 fn ok(out: &Output) -> String {
     assert!(
         out.status.success(),
@@ -96,6 +132,7 @@ fn ok(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+#[cfg(unix)]
 fn mode_of(p: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -231,7 +268,7 @@ fn prune_leaves_a_foreign_link_alone() {
     std::fs::remove_file(r.home_path("a.conf")).unwrap();
     let elsewhere = r.home.join("elsewhere.conf");
     std::fs::write(&elsewhere, "theirs\n").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, r.home_path("a.conf")).unwrap();
+    symlink(&elsewhere, r.home_path("a.conf"));
 
     r.manifest("[link]\ncommon = []\n");
     let out = ok(&r.run(&["apply"]));
@@ -286,6 +323,7 @@ common = ["conf"]
 }
 
 /// 宣言したモードは、ただ張っただけのファイルにも効く。
+#[cfg(unix)]
 #[test]
 fn a_declared_mode_is_applied_to_a_plain_link() {
     let r = Repo::new("modes");
@@ -309,6 +347,7 @@ fn a_declared_mode_is_applied_to_a_plain_link() {
 }
 
 /// 生成物は読み取り専用で置かれる。
+#[cfg(unix)]
 #[test]
 fn generated_files_are_read_only() {
     let r = Repo::new("read-only");
@@ -409,6 +448,7 @@ fn a_declaration_that_escapes_is_refused() {
 
 /// 読めないディレクトリは失敗にする。黙って飛ばすと、その下のリンクが
 /// 「宣言から外れた」ものとして $HOME から消える。
+#[cfg(unix)]
 #[test]
 fn an_unreadable_directory_fails_instead_of_pruning() {
     use std::os::unix::fs::PermissionsExt;
@@ -432,6 +472,7 @@ fn an_unreadable_directory_fails_instead_of_pruning() {
     assert!(std::fs::symlink_metadata(r.home_path("conf/b.conf")).is_ok());
 }
 
+#[cfg(unix)]
 /// std に euid が無いので id -u で代用する。
 fn euid() -> u32 {
     Command::new("id")
@@ -447,6 +488,7 @@ fn euid() -> u32 {
 ///
 /// Path::exists() は EACCES も false を返す。それを「宣言から外れた」と
 /// 読むと、権限が変わっただけで $HOME のリンクが消える。
+#[cfg(unix)]
 #[test]
 fn an_unreadable_file_is_not_treated_as_removed() {
     use std::os::unix::fs::PermissionsExt;
@@ -544,7 +586,7 @@ ignore = ["*.tmpl"]
 
     let victim = r.home.parent().unwrap().join("victim");
     std::fs::write(&victim, "PRECIOUS\n").unwrap();
-    std::os::unix::fs::symlink(&victim, r.root_path("gen.conf")).unwrap();
+    symlink(&victim, r.root_path("gen.conf"));
 
     let out = r.run(&["apply"]);
     assert!(
@@ -582,6 +624,7 @@ ignore = ["*.tmpl"]
 }
 
 /// 自分が入れなくなるモードをディレクトリに掛けない。
+#[cfg(unix)]
 #[test]
 fn a_directory_mode_that_locks_you_out_is_refused() {
     let r = Repo::new("dir-mode");
@@ -659,6 +702,7 @@ fn a_backup_is_recorded_before_anything_else_can_fail() {
 }
 
 /// 生成物の書き先がディレクトリなら、権限を触る前に断る。
+#[cfg(unix)]
 #[test]
 fn a_generated_output_is_not_written_over_a_directory() {
     let r = Repo::new("dir-output");
@@ -707,6 +751,7 @@ fn no_backup_replaces_without_keeping_a_copy() {
 }
 
 /// 宣言したモードが違えば verify が落ちる。
+#[cfg(unix)]
 #[test]
 fn verify_fails_on_a_wrong_mode() {
     use std::os::unix::fs::PermissionsExt;
@@ -730,6 +775,7 @@ fn verify_fails_on_a_wrong_mode() {
 }
 
 /// 暗号文を復号して置く。鍵が無ければ保留する。
+#[cfg(unix)]
 #[test]
 fn an_encrypted_file_is_decrypted_and_kept_private() {
     let r = Repo::new("encrypted");
@@ -783,6 +829,7 @@ identity = "/nonexistent/key.txt"
 }
 
 /// --secrets を渡すとプロバイダが呼ばれ、結果は本人だけが読める。
+#[cfg(unix)]
 #[test]
 fn a_secret_is_fetched_with_secrets_and_written_private() {
     let r = Repo::new("secrets");
@@ -815,6 +862,7 @@ command = "echo {}"
 /// `{}` は `://` の後ろに置き換わるので、既定の command 側で `op://` を補う。
 /// 補わないと実物の `op read` が "secret reference should start with 'op://'" で落ちる。
 /// 実物の `op` は呼ばず、PATH の先頭に置いた偽の `op` が引数を検査する。
+#[cfg(unix)]
 #[test]
 fn the_default_op_provider_passes_an_op_scheme_reference() {
     use std::os::unix::fs::PermissionsExt;
@@ -914,6 +962,7 @@ fn apply_does_not_claim_nothing_happened_after_running_a_hook() {
 }
 
 /// 締め出すモードは preview の時点で断る。
+#[cfg(unix)]
 #[test]
 fn dry_run_refuses_a_directory_mode_that_locks_you_out() {
     let r = Repo::new("dry-run-dir-mode");
@@ -950,7 +999,7 @@ ignore = ["*.tmpl"]
     );
     r.write("theme.toml", "bg = \"zzz\"\n");
     r.write("gen.conf.tmpl", "x = {{ bg }}\n");
-    std::os::unix::fs::symlink(&outside, r.root_path("out")).unwrap();
+    symlink(&outside, r.root_path("out"));
 
     let out = r.run(&["apply"]);
     assert!(
@@ -964,6 +1013,7 @@ ignore = ["*.tmpl"]
 }
 
 /// ディレクトリから所有者の読みを落とすモードも断る。
+#[cfg(unix)]
 #[test]
 fn a_directory_mode_without_read_is_refused() {
     let r = Repo::new("dir-mode-read");
@@ -983,6 +1033,7 @@ fn a_directory_mode_without_read_is_refused() {
 ///
 /// 記録が無いと、次の apply はそのリンクを知らないので prune もできず、
 /// 宣言から外しても $HOME に残り続ける。
+#[cfg(unix)]
 #[test]
 fn links_are_recorded_even_if_a_later_step_fails() {
     let r = Repo::new("record-before-modes");
@@ -1005,6 +1056,7 @@ fn links_are_recorded_even_if_a_later_step_fails() {
 ///
 /// apply は同じ宣言について「stat できない」で落ちる。片方が拒み、
 /// 片方が承認するなら、宣言した制限は誰にも適用されないまま通る。
+#[cfg(unix)]
 #[test]
 fn verify_does_not_approve_a_mode_it_could_not_read() {
     use std::os::unix::fs::PermissionsExt;
@@ -1129,7 +1181,7 @@ command = "sh -c 'echo decrypt >> {m}; cat' {{}}"
 [providers.fake]
 command = "sh -c 'echo provider >> {m}; echo v'"
 "#,
-        m = marker.display()
+        m = tp(&marker)
     ));
     r.write("theme.toml", "bg = \"zzz\"\n");
     r.write("gen.conf.tmpl", "t = {{ fake://a }}\n");
@@ -1158,6 +1210,7 @@ fn overlapping_link_targets_do_not_break_the_first_apply() {
 }
 
 /// 宣言したモードのパスが symlink なら、リンク先を触らずに断る。
+#[cfg(unix)]
 #[test]
 fn a_declared_mode_does_not_follow_a_symlink_out_of_the_repository() {
     use std::os::unix::fs::PermissionsExt;
@@ -1167,7 +1220,7 @@ fn a_declared_mode_does_not_follow_a_symlink_out_of_the_repository() {
     std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     r.manifest("[link]\ncommon = []\n\n[modes]\n\"keylink\" = \"644\"\n");
-    std::os::unix::fs::symlink(&outside, r.root_path("keylink")).unwrap();
+    symlink(&outside, r.root_path("keylink"));
 
     let out = r.run(&["apply"]);
     assert!(
@@ -1181,6 +1234,7 @@ fn a_declared_mode_does_not_follow_a_symlink_out_of_the_repository() {
 ///
 /// 対象そのものではなくその上のディレクトリが読めなくなる場合、対象の
 /// stat は通るので、対象を狭めるテストでは捕まらない。
+#[cfg(unix)]
 #[test]
 fn an_unreadable_ancestor_does_not_prune() {
     use std::os::unix::fs::PermissionsExt;
@@ -1209,6 +1263,7 @@ fn an_unreadable_ancestor_does_not_prune() {
 
 /// 宣言したモードは、途中のディレクトリが symlink でもリポジトリの外へ
 /// 出ない。最後の 1 要素だけ見ていた頃は素通りしていた。
+#[cfg(unix)]
 #[test]
 fn a_declared_mode_cannot_escape_through_a_symlinked_parent() {
     use std::os::unix::fs::PermissionsExt;
@@ -1220,7 +1275,7 @@ fn a_declared_mode_cannot_escape_through_a_symlinked_parent() {
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     r.manifest("[link]\ncommon = []\n\n[modes]\n\"out/victim\" = \"777\"\n");
-    std::os::unix::fs::symlink(&outside, r.root_path("out")).unwrap();
+    symlink(&outside, r.root_path("out"));
 
     let out = r.run(&["apply"]);
     assert!(
@@ -1314,7 +1369,7 @@ command = "cat {{}}"
 secret = "file://{}"
 {probe_body}
 "#,
-        token.display()
+        tp(&token)
     ));
     r
 }
@@ -1339,6 +1394,7 @@ fn plain_verify_does_not_fetch_or_probe_secrets() {
 }
 
 /// 検査コマンドが 0 で終われば有効。値は標準入力に届く。
+#[cfg(unix)]
 #[test]
 fn verify_secrets_accepts_a_secret_the_check_accepts() {
     let r = probe_repo(
@@ -1355,6 +1411,7 @@ fn verify_secrets_accepts_a_secret_the_check_accepts() {
 
 /// 拒否された秘密は名前で報告して失敗する。値は画面に出ない。
 /// 検査コマンドが値を標準出力に吐いても、sennit はそれを読まない。
+#[cfg(unix)]
 #[test]
 fn verify_secrets_fails_on_a_rejected_secret_without_printing_it() {
     let r = probe_repo(
@@ -1397,6 +1454,7 @@ command = "true"
 }
 
 /// invalid-exit に無い失敗は「失効」ではなく「確かめられなかった」。
+#[cfg(unix)]
 #[test]
 fn verify_secrets_does_not_call_an_unlisted_failure_a_revocation() {
     let r = probe_repo(
@@ -1426,6 +1484,7 @@ fn verify_secrets_says_so_when_nothing_is_declared() {
 
 /// パッケージ側の失敗と秘密側の失敗は、どちらも出す。片方が隠れると、
 /// 直して再実行するたびに次の失敗が出てくる。
+#[cfg(unix)]
 #[test]
 fn verify_secrets_reports_machine_and_secret_failures_together() {
     let r = probe_repo("probe-both", "tok\n", "command = \"false\"");
@@ -1513,6 +1572,7 @@ ignore = ["**/*.test.ts", ".claude/node_modules", ".claude/worktrees", ".claude/
 
 /// An ignored directory is not entered, so something unreadable inside it
 /// cannot fail the plan.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_directory_inside_an_ignored_tree_does_not_fail_apply() {
     use std::os::unix::fs::PermissionsExt;
@@ -1566,11 +1626,10 @@ fn a_directory_link_into_the_repository_becomes_per_file_links() {
     r.write(".claude/skills/gog/SKILL.md", "gog skill\n");
     r.write(".claude/skills/gog/ref/a.md", "ref\n");
     std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
-    std::os::unix::fs::symlink(
+    symlink(
         r.root_path(".claude/skills/gog"),
         r.home_path(".claude/skills/gog"),
-    )
-    .unwrap();
+    );
 
     // the plan says what will happen, and changes nothing
     let diff = ok(&r.run(&["diff"]));
@@ -1603,7 +1662,7 @@ fn a_directory_link_into_the_repository_becomes_per_file_links() {
     assert!(meta.is_dir() && !meta.file_type().is_symlink());
     assert_eq!(
         std::fs::read_link(gog.join("SKILL.md")).unwrap(),
-        std::fs::canonicalize(r.root_path(".claude/skills/gog/SKILL.md")).unwrap()
+        canon(&r.root_path(".claude/skills/gog/SKILL.md"))
     );
     assert_eq!(read(&gog.join("SKILL.md")), "gog skill\n");
     assert_eq!(read(&gog.join("ref/a.md")), "ref\n");
@@ -1621,7 +1680,7 @@ fn a_link_to_the_whole_directory_becomes_a_real_directory() {
     r.write(".claude/CLAUDE.md", "top\n");
     r.write(".claude/skills/a/SKILL.md", "a\n");
     r.write(".claude/worktrees/wt/file.md", "wt\n");
-    std::os::unix::fs::symlink(r.root_path(".claude"), r.home_path(".claude")).unwrap();
+    symlink(r.root_path(".claude"), r.home_path(".claude"));
 
     ok(&r.run(&["apply"]));
     assert_eq!(read(&r.root_path(".claude/CLAUDE.md")), "top\n");
@@ -1648,7 +1707,7 @@ fn a_link_that_leaves_the_repository_is_replaced_without_touching_its_target() {
     std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
     let old_link = r.home_path(".claude/skills/progress");
     std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
-    std::os::unix::fs::symlink(&life, &old_link).unwrap();
+    symlink(&life, &old_link);
 
     let diff = ok(&r.run(&["diff"]));
     assert!(diff.contains("relink-parent"), "{diff}");
@@ -1693,7 +1752,7 @@ fn no_backup_drops_an_outside_link_and_still_leaves_its_target_alone() {
     std::fs::create_dir_all(&life).unwrap();
     std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
     std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
-    std::os::unix::fs::symlink(&life, r.home_path(".claude/skills/progress")).unwrap();
+    symlink(&life, r.home_path(".claude/skills/progress"));
 
     ok(&r.run(&["apply", "--no-backup"]));
     assert_eq!(read(&life.join("SKILL.md")), "from life\n");
@@ -1714,7 +1773,7 @@ fn a_link_above_an_undeclared_path_is_left_alone() {
     std::fs::create_dir_all(&life).unwrap();
     std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
     std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
-    std::os::unix::fs::symlink(&life, r.home_path(".claude/skills/legacy")).unwrap();
+    symlink(&life, r.home_path(".claude/skills/legacy"));
 
     ok(&r.run(&["apply"]));
     assert_eq!(
@@ -1758,6 +1817,7 @@ fn json(p: &Path) -> serde_json::Value {
     serde_json::from_str(&read(p)).unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_creates_the_target_and_a_second_apply_writes_nothing() {
     use std::os::unix::fs::MetadataExt;
@@ -1881,6 +1941,7 @@ fn no_backup_does_not_keep_a_copy_of_the_target() {
     assert_eq!(json(&r.home_path(".claude/settings.json"))["mine"], true);
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_keeps_the_mode_of_an_existing_target() {
     use std::os::unix::fs::PermissionsExt;
@@ -1939,7 +2000,7 @@ fn a_symlinked_target_is_refused() {
     std::fs::create_dir_all(r.home_path(".claude")).unwrap();
     let real = r.home.join("real-settings.json");
     std::fs::write(&real, "{}\n").unwrap();
-    std::os::unix::fs::symlink(&real, r.home_path(".claude/settings.json")).unwrap();
+    symlink(&real, r.home_path(".claude/settings.json"));
     let out = r.run(&["apply"]);
     assert!(!out.status.success());
     assert!(both(&out).contains("symlink"), "{}", both(&out));
@@ -2048,8 +2109,8 @@ fn a_merge_runs_after_the_links_and_before_the_hooks() {
     let seen = r.home.join("hook-saw.json");
     r.manifest(&format!(
         "{MERGE_MANIFEST}\n[hooks.after]\nrun = \"cp '{}' '{}'\"\n",
-        r.home_path(".claude/settings.json").display(),
-        seen.display()
+        tp(&r.home_path(".claude/settings.json")),
+        tp(&seen)
     ));
     r.write(".claude/CLAUDE.md", "top\n");
     r.write(".claude/settings.shared.json", SHARED);
@@ -2060,7 +2121,7 @@ fn a_merge_runs_after_the_links_and_before_the_hooks() {
 #[test]
 fn merging_into_a_directory_that_was_a_link_into_the_repository() {
     let r = merge_repo("merge-after-relink");
-    std::os::unix::fs::symlink(r.root_path(".claude"), r.home_path(".claude")).unwrap();
+    symlink(r.root_path(".claude"), r.home_path(".claude"));
     ok(&r.run(&["apply"]));
     // the settings went to $HOME, not into the repository through the old link
     assert!(!r.root_path(".claude/settings.json").exists());
@@ -2121,7 +2182,7 @@ fn a_parent_link_that_holds_the_state_file_is_replaced() {
     std::fs::create_dir_all(outside.join("sennit")).unwrap();
     std::fs::write(outside.join("keep-me"), "mine\n").unwrap();
     std::fs::create_dir_all(r.home_path(".local")).unwrap();
-    std::os::unix::fs::symlink(&outside, r.home_path(".local/state")).unwrap();
+    symlink(&outside, r.home_path(".local/state"));
 
     let out = r.run(&["apply"]);
     assert!(
@@ -2131,7 +2192,9 @@ fn a_parent_link_that_holds_the_state_file_is_replaced() {
     );
     let state = r.home_path(".local/state/sennit/state.json");
     assert!(
-        read(&state).contains(".local/state/x.conf"),
+        read(&state)
+            .replace("\\\\", "/")
+            .contains(".local/state/x.conf"),
         "{}",
         read(&state)
     );
@@ -2163,7 +2226,7 @@ fn a_declared_top_level_link_that_leaves_the_repository_is_kept() {
     let outside = r.home.parent().unwrap().join("cloud-config");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("theirs.conf"), "theirs\n").unwrap();
-    std::os::unix::fs::symlink(&outside, r.home_path(".config")).unwrap();
+    symlink(&outside, r.home_path(".config"));
 
     let diff = ok(&r.run(&["diff"]));
     assert!(diff.contains("outside the repository"), "{diff}");
@@ -2195,7 +2258,7 @@ fn a_link_below_a_kept_top_level_directory_is_still_replaced() {
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("a.conf"), "old\n").unwrap();
     std::fs::create_dir_all(r.home_path(".config")).unwrap();
-    std::os::unix::fs::symlink(&other, r.home_path(".config/app")).unwrap();
+    symlink(&other, r.home_path(".config/app"));
 
     ok(&r.run(&["apply"]));
     assert_eq!(read(&other.join("a.conf")), "old\n");
@@ -2223,10 +2286,8 @@ fn prune_leaves_a_link_alone_when_its_target_climbs_out_with_dotdot() {
     let theirs = r.home.parent().unwrap().join("theirs.conf");
     std::fs::write(&theirs, "theirs\n").unwrap();
     std::fs::remove_file(r.home_path("a.conf")).unwrap();
-    let sneaky = std::fs::canonicalize(&r.root)
-        .unwrap()
-        .join("../theirs.conf");
-    std::os::unix::fs::symlink(&sneaky, r.home_path("a.conf")).unwrap();
+    let sneaky = canon(&r.root).join("../theirs.conf");
+    symlink(&sneaky, r.home_path("a.conf"));
 
     r.manifest("[link]\ncommon = []\n");
     let out = ok(&r.run(&["apply"]));
@@ -2289,6 +2350,7 @@ fn a_path_moving_from_link_to_merge_previews_cleanly() {
 // [modes] on a merge output
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn merge_modes_repo(name: &str) -> Repo {
     let r = Repo::new(name);
     r.manifest(&format!(
@@ -2301,6 +2363,7 @@ fn merge_modes_repo(name: &str) -> Repo {
 
 /// A mode declared for a merge output applies to the file in `$HOME`, which is
 /// not in the repository, and `verify` checks it there.
+#[cfg(unix)]
 #[test]
 fn a_declared_mode_applies_to_a_merge_output() {
     use std::os::unix::fs::PermissionsExt;
@@ -2330,6 +2393,7 @@ fn a_declared_mode_applies_to_a_merge_output() {
     assert!(r.run(&["verify"]).status.success());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_declared_mode_wins_over_the_mode_of_an_existing_merge_target() {
     use std::os::unix::fs::PermissionsExt;

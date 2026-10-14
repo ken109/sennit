@@ -347,6 +347,7 @@ mod tests {
     }
 
     /// 値は標準入力に流れ、{} が置き換わる。
+    #[cfg(unix)]
     #[test]
     fn the_secret_is_sent_on_stdin() {
         let p = probe(
