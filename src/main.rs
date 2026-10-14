@@ -1,6 +1,7 @@
 mod audit;
 mod detect;
 mod encrypted;
+mod glob;
 mod hooks;
 mod manifest;
 mod packages;

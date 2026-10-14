@@ -68,7 +68,16 @@ impl Plan {
             // パスが「今回の対象」から丸ごと落ち、apply は前回の記録と
             // 突き合わせて $HOME 側のリンクを prune しにかかる。権限を
             // 1 つ間違えただけで利用者の設定が外れる。
-            for e in WalkDir::new(&abs) {
+            //
+            // ignore のディレクトリには入らない。入ると、無関係な木(作業ツリーや
+            // node_modules)を全部歩くうえ、その中の読めないディレクトリで落ちる。
+            let walker = WalkDir::new(&abs).into_iter().filter_entry(|e| {
+                e.path()
+                    .strip_prefix(root)
+                    .map(|rel| !manifest.is_ignored(rel))
+                    .unwrap_or(true)
+            });
+            for e in walker {
                 let e = e.with_context(|| format!("failed to read {}", abs.display()))?;
                 if !e.file_type().is_file() {
                     continue;
@@ -262,5 +271,35 @@ common = ["conf"]
         );
         let plan = Plan::build(&root, &home, &m).unwrap();
         assert!(plan.entries.is_empty());
+    }
+
+    /// ignore のディレクトリには入らない。その中が読めなくても落ちない。
+    #[test]
+    fn an_ignored_directory_is_not_walked() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("pruned-walk");
+        let root = d.join("repo");
+        let home = d.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        write(&root.join("conf/a.conf"), "a\n");
+        write(&root.join("conf/worktrees/x/secret.txt"), "x\n");
+        write(&root.join("conf/hooks/node_modules/dep/index.js"), "x\n");
+        write(&root.join("conf/hooks/a.test.ts"), "x\n");
+        let locked = root.join("conf/worktrees");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let m = manifest_from(
+            r#"
+[link]
+common = ["conf"]
+ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
+"#,
+        );
+        let plan = Plan::build(&root, &home, &m);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // root can read anything, which is fine: the point is that nothing fails
+        let plan = plan.unwrap();
+        let rels: Vec<_> = plan.entries.iter().map(|e| e.rel.clone()).collect();
+        assert_eq!(rels, vec![PathBuf::from("conf/a.conf")]);
     }
 }

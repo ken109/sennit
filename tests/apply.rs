@@ -1464,3 +1464,74 @@ command = "true"
     assert!(!out.status.success());
     assert!(both(&out).contains("scheme://"), "{}", both(&out));
 }
+
+// ---------------------------------------------------------------------------
+// ignore globs, and pruning the walk
+// ---------------------------------------------------------------------------
+
+fn exists(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
+#[test]
+fn ignore_globs_keep_tests_and_dependencies_out_of_home() {
+    let r = Repo::new("ignore-globs");
+    r.manifest(
+        r#"
+[link]
+common = [".claude"]
+ignore = ["**/*.test.ts", ".claude/node_modules", ".claude/worktrees", ".claude/package.json", "*.tar.gz"]
+"#,
+    );
+    r.write(".claude/CLAUDE.md", "keep\n");
+    r.write(".claude/hooks/guard.ts", "keep\n");
+    r.write(".claude/hooks/guard.test.ts", "test\n");
+    r.write(".claude/hooks/deep/more.test.ts", "test\n");
+    r.write(".claude/node_modules/dep/index.js", "dep\n");
+    r.write(".claude/worktrees/wt/file.md", "wt\n");
+    r.write(".claude/package.json", "{}\n");
+    r.write(".claude/skills/x/bundle.tar.gz", "zip\n");
+
+    ok(&r.run(&["apply"]));
+    assert!(exists(&r.home_path(".claude/CLAUDE.md")));
+    assert!(exists(&r.home_path(".claude/hooks/guard.ts")));
+    for gone in [
+        ".claude/hooks/guard.test.ts",
+        ".claude/hooks/deep/more.test.ts",
+        ".claude/node_modules",
+        ".claude/worktrees",
+        ".claude/package.json",
+        ".claude/skills/x/bundle.tar.gz",
+    ] {
+        assert!(!exists(&r.home_path(gone)), "{gone} was placed");
+    }
+
+    // and a second apply does not prune or relink anything
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("already up to date"), "{out}");
+}
+
+/// An ignored directory is not entered, so something unreadable inside it
+/// cannot fail the plan.
+#[test]
+fn an_unreadable_directory_inside_an_ignored_tree_does_not_fail_apply() {
+    use std::os::unix::fs::PermissionsExt;
+    if euid() == 0 {
+        return;
+    }
+    let r = Repo::new("ignored-unreadable");
+    r.manifest("[link]\ncommon = [\".claude\"]\nignore = [\".claude/worktrees\"]\n");
+    r.write(".claude/CLAUDE.md", "keep\n");
+    r.write(".claude/worktrees/wt/inner/file.md", "wt\n");
+    let locked = r.root_path(".claude/worktrees/wt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = r.run(&["apply"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(exists(&r.home_path(".claude/CLAUDE.md")));
+}

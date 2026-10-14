@@ -74,12 +74,31 @@ from anywhere inside your repository.
 Directories are linked file by file rather than as a whole, so that a tool writing into
 `~/.config/something/` does not make untracked files appear inside your repository.
 
-`ignore` takes two kinds of pattern: `*.ext` matches by extension, and anything else is a
-path prefix rooted at the repository — whole components, from the top. `conf/nvim` matches
-`conf/nvim/init.lua` but not `conf/nvim-extra`, and `README.md` matches only a `README.md`
-at the root, not one inside a subdirectory. Declared `[render]` templates and `[encrypted]`
-ciphertexts are excluded whether or not you list them, which is what makes a forgotten
+`ignore` takes glob patterns, matched against paths relative to the repository root:
+
+| Pattern | Matches |
+|---|---|
+| `*.tmpl` | any file ending in `.tmpl`, at any depth |
+| `*.test.ts`, `*.tar.gz` | likewise; the whole name is matched, not just the last extension |
+| `**/node_modules` | a `node_modules` directory anywhere, and everything under it |
+| `.claude/worktrees` | that path from the root, and everything under it |
+| `README.md`, `conf/nvim` | a plain name matches from the root only, as whole components |
+
+`*` and `?` stay within one path component; `**` as a whole component spans any number of
+them. A pattern with a slash is rooted at the repository. A pattern with a wildcard and no
+slash applies at any depth, as in gitignore. A plain name with neither is a rooted prefix
+and nothing more, which is how it always behaved: `conf/nvim` matches `conf/nvim/init.lua`
+but not `conf/nvim-extra`, and `README.md` matches the one at the root, not one inside a
+subdirectory. An ignored directory is not entered at all, so a large or unreadable tree
+inside it (a `node_modules`, a pile of worktrees) costs nothing and cannot fail the run.
+Declared `[render]` templates, `[encrypted]` ciphertexts and `[merge]` sources are
+excluded whether or not you list them, which is what makes a forgotten
 `ignore = ["*.tmpl"]` harmless.
+
+Behaviour change in 0.20, a bug fix: before, only `*.ext` with a single extension was a
+wildcard, and anything else was a prefix. `*.test.ts` and `*.tar.gz` therefore matched
+nothing and the files they named were placed anyway. They now match. If you had such a
+line and relied on it doing nothing, remove it.
 
 `packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
 and `sync`; `apply` does not read it. What was linked is recorded in

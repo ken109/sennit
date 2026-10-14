@@ -178,17 +178,18 @@ impl Manifest {
             .and_then(|(_, m)| u32::from_str_radix(m, 8).ok())
     }
 
-    /// ignore のパターンは 2 種類だけ扱う。
-    /// - `*.ext` : 拡張子一致
-    /// - それ以外: パスの前方一致(同一パスも含む)
+    /// ignore に当たるか。パターンの書き方は `glob` モジュールを参照。
+    ///
+    /// - スラッシュを含む（`.claude/worktrees`, `**/node_modules`）: 根から
+    /// - スラッシュの無いワイルドカード（`*.test.ts`）: どの深さにも
+    /// - スラッシュもワイルドカードも無い名前（`README.md`）: 根からの前方一致
+    ///
+    /// ディレクトリに当たれば、その下もすべて当たる。
     pub fn is_ignored(&self, rel: &Path) -> bool {
-        self.link.ignore.iter().any(|pat| {
-            if let Some(ext) = pat.strip_prefix("*.") {
-                rel.extension().is_some_and(|e| e == ext)
-            } else {
-                rel.starts_with(pat)
-            }
-        })
+        self.link
+            .ignore
+            .iter()
+            .any(|pat| crate::glob::Pattern::new(pat).matches(rel))
     }
 }
 
@@ -396,5 +397,22 @@ mod tests {
     fn empty_ignore_matches_nothing() {
         let m = manifest(&[]);
         assert!(!m.is_ignored(Path::new(".config/anything")));
+    }
+
+    #[test]
+    fn ignore_takes_globs() {
+        let m = manifest(&[
+            "*.test.ts",
+            "**/node_modules",
+            ".claude/worktrees",
+            "*.tar.gz",
+        ]);
+        assert!(m.is_ignored(Path::new(".claude/hooks/a.test.ts")));
+        assert!(!m.is_ignored(Path::new(".claude/hooks/a.ts")));
+        assert!(m.is_ignored(Path::new(".claude/hooks/node_modules/x/y.js")));
+        assert!(m.is_ignored(Path::new(".claude/worktrees/a/b.md")));
+        assert!(!m.is_ignored(Path::new(".claude/worktrees-old/b.md")));
+        // used to match nothing: only the last extension was looked at
+        assert!(m.is_ignored(Path::new("pkg/x.tar.gz")));
     }
 }
