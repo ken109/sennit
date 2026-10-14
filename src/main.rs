@@ -741,6 +741,7 @@ fn apply(
                     "replace"
                 }
             }
+            State::Ancestor { .. } => "relink-parent",
             State::Linked => unreachable!(),
         };
         println!("  {:>8}  {}", verb, e.rel.display());
@@ -750,6 +751,28 @@ fn apply(
         }
 
         let step = (|| -> Result<()> {
+            // 祖先の symlink を実ディレクトリに替える。symlink だけを外す
+            // (remove_file)ので、指していたリポジトリ側には何も起きない。
+            // 外す前に、ここまでの記録を確定させる。
+            if let State::Ancestor { .. } = &e.state {
+                let mut relinked = false;
+                while let Some(link) = plan::ancestor_link(root, home, &e.rel) {
+                    if !relinked {
+                        state::State {
+                            links: placed.clone(),
+                            backups: kept.clone(),
+                            hooks: previous.hooks.clone(),
+                        }
+                        .save(home)?;
+                        relinked = true;
+                    }
+                    std::fs::remove_file(&link).with_context(|| {
+                        format!("failed to remove the symlink {}", link.display())
+                    })?;
+                    std::fs::create_dir(&link)
+                        .with_context(|| format!("failed to create {}", link.display()))?;
+                }
+            }
             if let Some(parent) = e.dest.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -975,6 +998,8 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
 fn remove_dest(dest: &Path, state: &State, backup: bool) -> Result<Option<PathBuf>> {
     match state {
         State::Missing | State::Linked => Ok(None),
+        // 祖先の symlink は apply が先に実ディレクトリへ替えてある
+        State::Ancestor { .. } => Ok(None),
         // 別の場所を指す symlink は、それ自体に中身が無いので消してよい
         State::Wrong { .. } => {
             std::fs::remove_file(dest)
@@ -1055,6 +1080,12 @@ fn print_diff(plan: &Plan) {
                     e.rel.display()
                 )
             }
+            State::Ancestor { link } => println!(
+                "\x1b[33m~\x1b[0m {}  (relink-parent: {} points into the repository; \
+                 it becomes a real directory)",
+                e.rel.display(),
+                link.display()
+            ),
             State::Linked => {}
         }
     }
@@ -1077,14 +1108,19 @@ fn print_list(plan: &Plan, changed_only: bool) {
         let mark = match e.state {
             State::Linked => "\x1b[32mok\x1b[0m",
             State::Missing => "\x1b[33m--\x1b[0m",
-            State::Wrong { .. } => "\x1b[33m~~\x1b[0m",
+            State::Wrong { .. } | State::Ancestor { .. } => "\x1b[33m~~\x1b[0m",
             State::Occupied => "\x1b[31m!!\x1b[0m",
         };
+        let note = match &e.state {
+            State::Ancestor { link } => format!("  (relink-parent: {})", link.display()),
+            _ => String::new(),
+        };
         println!(
-            "{}  {:<width$}  -> {}",
+            "{}  {:<width$}  -> {}{}",
             mark,
             e.rel.display(),
             e.dest.display(),
+            note,
             width = width
         );
     }

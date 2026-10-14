@@ -1535,3 +1535,123 @@ fn an_unreadable_directory_inside_an_ignored_tree_does_not_fail_apply() {
     );
     assert!(exists(&r.home_path(".claude/CLAUDE.md")));
 }
+
+// ---------------------------------------------------------------------------
+// a link above the destination that points into the repository
+// ---------------------------------------------------------------------------
+
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap()
+}
+
+/// Every file name under `dir` that looks like a sennit backup.
+fn backups_under(dir: &Path) -> Vec<String> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".sennit-backup"))
+        .collect()
+}
+
+/// The accident this guards against: an older layout linked a whole skill
+/// directory into the repository. Following that link, the destination of
+/// `SKILL.md` *is* the repository's `SKILL.md`, so apply used to move the
+/// repository's own file aside and link it to itself.
+#[test]
+fn a_directory_link_into_the_repository_becomes_per_file_links() {
+    let r = Repo::new("ancestor-relink");
+    r.manifest("[link]\ncommon = [\".claude\"]\n");
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/skills/gog/SKILL.md", "gog skill\n");
+    r.write(".claude/skills/gog/ref/a.md", "ref\n");
+    std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(
+        r.root_path(".claude/skills/gog"),
+        r.home_path(".claude/skills/gog"),
+    )
+    .unwrap();
+
+    // the plan says what will happen, and changes nothing
+    let diff = ok(&r.run(&["diff"]));
+    assert!(diff.contains("relink-parent"), "{diff}");
+    let list = ok(&r.run(&["list"]));
+    assert!(list.contains("relink-parent"), "{list}");
+    let dry = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(dry.contains("relink-parent"), "{dry}");
+    assert!(std::fs::symlink_metadata(r.home_path(".claude/skills/gog"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    ok(&r.run(&["apply"]));
+
+    // the repository is exactly as it was
+    assert_eq!(
+        read(&r.root_path(".claude/skills/gog/SKILL.md")),
+        "gog skill\n"
+    );
+    assert_eq!(read(&r.root_path(".claude/skills/gog/ref/a.md")), "ref\n");
+    assert!(
+        backups_under(&r.root).is_empty(),
+        "{:?}",
+        backups_under(&r.root)
+    );
+    // the directory is real now, and each file is a link to the repository
+    let gog = r.home_path(".claude/skills/gog");
+    let meta = std::fs::symlink_metadata(&gog).unwrap();
+    assert!(meta.is_dir() && !meta.file_type().is_symlink());
+    assert_eq!(
+        std::fs::read_link(gog.join("SKILL.md")).unwrap(),
+        std::fs::canonicalize(r.root_path(".claude/skills/gog/SKILL.md")).unwrap()
+    );
+    assert_eq!(read(&gog.join("SKILL.md")), "gog skill\n");
+    assert_eq!(read(&gog.join("ref/a.md")), "ref\n");
+    assert!(backups_under(&r.home).is_empty());
+
+    let again = ok(&r.run(&["apply"]));
+    assert!(again.contains("already up to date"), "{again}");
+}
+
+/// The whole directory can be the link (`~/.claude -> repo/.claude`).
+#[test]
+fn a_link_to_the_whole_directory_becomes_a_real_directory() {
+    let r = Repo::new("ancestor-relink-whole");
+    r.manifest("[link]\ncommon = [\".claude\"]\nignore = [\".claude/worktrees\"]\n");
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/skills/a/SKILL.md", "a\n");
+    r.write(".claude/worktrees/wt/file.md", "wt\n");
+    std::os::unix::fs::symlink(r.root_path(".claude"), r.home_path(".claude")).unwrap();
+
+    ok(&r.run(&["apply"]));
+    assert_eq!(read(&r.root_path(".claude/CLAUDE.md")), "top\n");
+    assert!(backups_under(&r.root).is_empty());
+    let meta = std::fs::symlink_metadata(r.home_path(".claude")).unwrap();
+    assert!(meta.is_dir() && !meta.file_type().is_symlink());
+    assert_eq!(read(&r.home_path(".claude/skills/a/SKILL.md")), "a\n");
+    // an ignored tree is no longer reachable from $HOME
+    assert!(!exists(&r.home_path(".claude/worktrees")));
+}
+
+/// A link that does not lead into the repository is somebody else's. It stays,
+/// and so does what it leads to.
+#[test]
+fn a_link_that_leaves_the_repository_is_not_removed() {
+    let r = Repo::new("ancestor-outside");
+    r.manifest("[link]\ncommon = [\".claude\"]\n");
+    r.write(".claude/CLAUDE.md", "top\n");
+    r.write(".claude/skills/new/SKILL.md", "new\n");
+    let old = r.home.parent().unwrap().join("life/skills/old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("SKILL.md"), "from life\n").unwrap();
+    std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(&old, r.home_path(".claude/skills/old")).unwrap();
+
+    ok(&r.run(&["apply"]));
+    assert_eq!(
+        std::fs::read_link(r.home_path(".claude/skills/old")).unwrap(),
+        old
+    );
+    assert_eq!(read(&old.join("SKILL.md")), "from life\n");
+    assert_eq!(read(&r.home_path(".claude/skills/new/SKILL.md")), "new\n");
+}

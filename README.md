@@ -128,7 +128,7 @@ command that does not need a repository at all.
 not call a secret provider or a decryption command, since both can ask a person to unlock
 something, which a command that says it changes nothing has no business doing.
 
-Every path is classified as one of four states, and only the ones that need work are
+Every path is classified as one of five states, and only the ones that need work are
 touched:
 
 | | |
@@ -137,6 +137,19 @@ touched:
 | `missing` | nothing is there |
 | `wrong` | a symlink pointing somewhere else |
 | `occupied` | a real file or directory is in the way |
+| `relink-parent` | a directory above it is a symlink into this repository |
+
+### A directory above the destination that links into the repository
+
+An older layout may have linked a whole directory (`~/.claude/skills/gog`) into the
+repository. Every file below such a link *is* the repository's own file, so placing a link
+there would mean moving the repository's file aside and pointing it at itself. `apply`
+instead removes that one symlink, creates a real directory in its place, and links the
+files inside it one by one. Nothing in the repository is touched, and the state is recorded
+before the symlink goes. `diff`, `list` and `--dry-run` show it as `relink-parent`.
+
+Only a link that leads into the repository is replaced. A link that leads anywhere else is
+somebody else's, and sennit does not remove it.
 
 ## What apply will not do
 

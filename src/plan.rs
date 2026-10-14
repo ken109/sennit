@@ -23,6 +23,13 @@ pub enum State {
     Wrong { current: PathBuf },
     /// symlink ではない実体(ファイル/ディレクトリ)が居座っている
     Occupied,
+    /// dest の祖先に、リポジトリの中を指す symlink がある。
+    ///
+    /// 旧い配置でディレクトリごと張ったものが典型。dest はその symlink を
+    /// 通ってリポジトリの実ファイルに着くので、そのまま進めるとリポジトリの
+    /// ファイルを退避するか、自分自身を指すリンクを作る。祖先の symlink だけを
+    /// 外して実ディレクトリにし、その下に 1 ファイルずつ張り直す。
+    Ancestor { link: PathBuf },
 }
 
 impl State {
@@ -132,7 +139,10 @@ impl Plan {
         }
         let src = root.join(rel);
         let dest = home.join(rel);
-        let state = inspect(&src, &dest);
+        let state = match ancestor_link(root, home, rel) {
+            Some(link) => State::Ancestor { link },
+            None => inspect(&src, &dest),
+        };
         entries.push(Entry {
             rel: rel.to_path_buf(),
             src,
@@ -145,6 +155,38 @@ impl Plan {
     pub fn changes(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.state.needs_change())
     }
+}
+
+/// `rel` の祖先(home の直下から dest の親まで)にある、リポジトリの中を指す
+/// symlink のうち、いちばん外側のもの。
+///
+/// 最初に見つけた symlink で決める。リポジトリの外を指すなら、その先は
+/// 利用者のものなので触らない(None)。
+pub fn ancestor_link(root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut cur = home.to_path_buf();
+    let comps: Vec<_> = rel.components().collect();
+    for c in comps.iter().take(comps.len().saturating_sub(1)) {
+        cur.push(c);
+        let Ok(meta) = std::fs::symlink_metadata(&cur) else {
+            // ここから先は無い。無いものは symlink ではありえない
+            return None;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let target = std::fs::read_link(&cur).ok()?;
+        let target = if target.is_absolute() {
+            target
+        } else {
+            cur.parent()?.join(target)
+        };
+        let inside = target.starts_with(root)
+            || std::fs::canonicalize(&target)
+                .map(|t| t.starts_with(root))
+                .unwrap_or(false);
+        return inside.then_some(cur);
+    }
+    None
 }
 
 /// dest の現状を分類する。symlink_metadata なので、リンク先の有無に
@@ -301,5 +343,56 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         let plan = plan.unwrap();
         let rels: Vec<_> = plan.entries.iter().map(|e| e.rel.clone()).collect();
         assert_eq!(rels, vec![PathBuf::from("conf/a.conf")]);
+    }
+
+    #[test]
+    fn a_link_into_the_repository_above_the_destination_is_found() {
+        let d = scratch("ancestor");
+        let root = d.join("repo");
+        let home = d.join("home");
+        write(&root.join("skills/gog/SKILL.md"), "x\n");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::os::unix::fs::symlink(root.join("skills/gog"), home.join("skills/gog")).unwrap();
+
+        let rel = Path::new("skills/gog/SKILL.md");
+        assert_eq!(
+            ancestor_link(&root, &home, rel),
+            Some(home.join("skills/gog"))
+        );
+        // a path with no link above it
+        assert_eq!(
+            ancestor_link(&root, &home, Path::new("skills/other/a.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_link_into_the_repository_is_found_too() {
+        let d = scratch("ancestor-relative");
+        let root = d.join("repo");
+        let home = d.join("repo/../home");
+        write(&root.join("skills/gog/SKILL.md"), "x\n");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::os::unix::fs::symlink("../../repo/skills/gog", home.join("skills/gog")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        assert!(ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")).is_some());
+    }
+
+    /// A link that leads somewhere else belongs to its owner.
+    #[test]
+    fn a_link_outside_the_repository_is_left_alone() {
+        let d = scratch("ancestor-outside");
+        let root = d.join("repo");
+        let home = d.join("home");
+        let elsewhere = d.join("life/skills/gog");
+        write(&root.join("skills/gog/SKILL.md"), "x\n");
+        write(&elsewhere.join("SKILL.md"), "old\n");
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("skills/gog")).unwrap();
+
+        assert_eq!(
+            ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")),
+            None
+        );
     }
 }
