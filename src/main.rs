@@ -758,13 +758,26 @@ fn apply(
         }
 
         let step = (|| -> Result<()> {
-            // 祖先の symlink を実ディレクトリに替える。symlink だけを外す
-            // (remove_file)ので、指していたリポジトリ側には何も起きない。
+            // 祖先の symlink を実ディレクトリに替える。外すのは symlink だけで、
+            // 向き先の中身には触れない。
+            //
+            // 向き先がリポジトリの外なら、symlink を退避して記録する。rollback が
+            // 元のリンクに戻せる。リポジトリの中なら作り直せるので退避しない。
             // 外す前に、ここまでの記録を確定させる。
             if let State::Ancestor { .. } = &e.state {
-                let mut relinked = false;
-                while let Some(link) = plan::ancestor_link(root, home, &e.rel) {
-                    if !relinked {
+                let mut saved = false;
+                while let Some(link) = plan::ancestor_link(home, &e.rel) {
+                    let keep = backup && !plan::link_into_repo(root, &link);
+                    if keep {
+                        let to = backup_path(&link)?;
+                        std::fs::rename(&link, &to).with_context(|| {
+                            format!("failed to move the symlink {} aside", link.display())
+                        })?;
+                        println!("            kept the old link at {}", to.display());
+                        kept.push(state::Backup {
+                            dest: link.clone(),
+                            kept_at: to,
+                        });
                         state::State {
                             links: placed.clone(),
                             backups: kept.clone(),
@@ -772,11 +785,21 @@ fn apply(
                             merged: previous.merged.clone(),
                         }
                         .save(home)?;
-                        relinked = true;
+                    } else {
+                        if !saved {
+                            state::State {
+                                links: placed.clone(),
+                                backups: kept.clone(),
+                                hooks: previous.hooks.clone(),
+                                merged: previous.merged.clone(),
+                            }
+                            .save(home)?;
+                            saved = true;
+                        }
+                        std::fs::remove_file(&link).with_context(|| {
+                            format!("failed to remove the symlink {}", link.display())
+                        })?;
                     }
-                    std::fs::remove_file(&link).with_context(|| {
-                        format!("failed to remove the symlink {}", link.display())
-                    })?;
                     std::fs::create_dir(&link)
                         .with_context(|| format!("failed to create {}", link.display()))?;
                 }
@@ -1145,7 +1168,7 @@ fn print_diff(plan: &Plan, merges: &[merge::Planned], root: &Path, home: &Path) 
                 )
             }
             State::Ancestor { link } => println!(
-                "\x1b[33m~\x1b[0m {}  (relink-parent: {} points into the repository; \
+                "\x1b[33m~\x1b[0m {}  (relink-parent: {} is a symlink; \
                  it becomes a real directory)",
                 e.rel.display(),
                 link.display()

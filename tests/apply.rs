@@ -1633,27 +1633,95 @@ fn a_link_to_the_whole_directory_becomes_a_real_directory() {
     assert!(!exists(&r.home_path(".claude/worktrees")));
 }
 
-/// A link that does not lead into the repository is somebody else's. It stays,
-/// and so does what it leads to.
+/// An old layout may have linked a skill directory to another repository
+/// (`~/.claude/skills/progress -> life/skills/progress`). Following that link,
+/// the destination is a file in the other tree, which apply used to move aside
+/// and then fill with a link of its own. Only the symlink may change.
 #[test]
-fn a_link_that_leaves_the_repository_is_not_removed() {
+fn a_link_that_leaves_the_repository_is_replaced_without_touching_its_target() {
     let r = Repo::new("ancestor-outside");
     r.manifest("[link]\ncommon = [\".claude\"]\n");
     r.write(".claude/CLAUDE.md", "top\n");
-    r.write(".claude/skills/new/SKILL.md", "new\n");
-    let old = r.home.parent().unwrap().join("life/skills/old");
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join("SKILL.md"), "from life\n").unwrap();
+    r.write(".claude/skills/progress/SKILL.md", "from dotfiles\n");
+    let life = r.home.parent().unwrap().join("life/skills/progress");
+    std::fs::create_dir_all(&life).unwrap();
+    std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
+    let old_link = r.home_path(".claude/skills/progress");
     std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
-    std::os::unix::fs::symlink(&old, r.home_path(".claude/skills/old")).unwrap();
+    std::os::unix::fs::symlink(&life, &old_link).unwrap();
+
+    let diff = ok(&r.run(&["diff"]));
+    assert!(diff.contains("relink-parent"), "{diff}");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("relink-parent"), "{out}");
+    // the other tree is exactly as it was: no backup, no new link
+    assert_eq!(read(&life.join("SKILL.md")), "from life\n");
+    assert_eq!(
+        std::fs::read_dir(&life).unwrap().count(),
+        1,
+        "something was written into the other tree"
+    );
+    assert!(backups_under(life.parent().unwrap().parent().unwrap()).is_empty());
+    // here the directory is real and holds a link to the repository's file
+    let meta = std::fs::symlink_metadata(&old_link).unwrap();
+    assert!(meta.is_dir() && !meta.file_type().is_symlink());
+    assert_eq!(read(&old_link.join("SKILL.md")), "from dotfiles\n");
+    assert_eq!(
+        read(&r.root_path(".claude/skills/progress/SKILL.md")),
+        "from dotfiles\n"
+    );
+    assert!(backups_under(&r.root).is_empty());
+
+    let again = ok(&r.run(&["apply"]));
+    assert!(again.contains("already up to date"), "{again}");
+
+    // rollback puts the original symlink back
+    ok(&r.run(&["rollback"]));
+    assert_eq!(std::fs::read_link(&old_link).unwrap(), life);
+    assert_eq!(read(&life.join("SKILL.md")), "from life\n");
+    assert_eq!(std::fs::read_dir(&life).unwrap().count(), 1);
+}
+
+/// `--no-backup` does not keep the old link; the target is still untouched.
+#[test]
+fn no_backup_drops_an_outside_link_and_still_leaves_its_target_alone() {
+    let r = Repo::new("ancestor-outside-no-backup");
+    r.manifest("[link]\ncommon = [\".claude\"]\n");
+    r.write(".claude/skills/progress/SKILL.md", "from dotfiles\n");
+    let life = r.home.parent().unwrap().join("life-nb/skills/progress");
+    std::fs::create_dir_all(&life).unwrap();
+    std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
+    std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(&life, r.home_path(".claude/skills/progress")).unwrap();
+
+    ok(&r.run(&["apply", "--no-backup"]));
+    assert_eq!(read(&life.join("SKILL.md")), "from life\n");
+    assert!(backups_under(&r.home).is_empty());
+    assert_eq!(
+        read(&r.home_path(".claude/skills/progress/SKILL.md")),
+        "from dotfiles\n"
+    );
+}
+
+/// A link above something the repository does not declare is none of its business.
+#[test]
+fn a_link_above_an_undeclared_path_is_left_alone() {
+    let r = Repo::new("ancestor-undeclared");
+    r.manifest("[link]\ncommon = [\".claude\"]\n");
+    r.write(".claude/CLAUDE.md", "top\n");
+    let life = r.home.parent().unwrap().join("life-keep/skills/legacy");
+    std::fs::create_dir_all(&life).unwrap();
+    std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
+    std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(&life, r.home_path(".claude/skills/legacy")).unwrap();
 
     ok(&r.run(&["apply"]));
     assert_eq!(
-        std::fs::read_link(r.home_path(".claude/skills/old")).unwrap(),
-        old
+        std::fs::read_link(r.home_path(".claude/skills/legacy")).unwrap(),
+        life
     );
-    assert_eq!(read(&old.join("SKILL.md")), "from life\n");
-    assert_eq!(read(&r.home_path(".claude/skills/new/SKILL.md")), "new\n");
+    assert_eq!(read(&life.join("SKILL.md")), "from life\n");
 }
 
 // ---------------------------------------------------------------------------

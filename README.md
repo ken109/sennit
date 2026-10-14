@@ -138,19 +138,25 @@ touched:
 | `missing` | nothing is there |
 | `wrong` | a symlink pointing somewhere else |
 | `occupied` | a real file or directory is in the way |
-| `relink-parent` | a directory above it is a symlink into this repository |
+| `relink-parent` | a directory above it is a symlink |
 
-### A directory above the destination that links into the repository
+### A symlink above the destination
 
-An older layout may have linked a whole directory (`~/.claude/skills/gog`) into the
-repository. Every file below such a link *is* the repository's own file, so placing a link
-there would mean moving the repository's file aside and pointing it at itself. `apply`
-instead removes that one symlink, creates a real directory in its place, and links the
-files inside it one by one. Nothing in the repository is touched, and the state is recorded
-before the symlink goes. `diff`, `list` and `--dry-run` show it as `relink-parent`.
+An older layout may have linked a whole directory (`~/.claude/skills/gog`) somewhere: into
+this repository, or into another one. Every file below such a link is the file it leads to,
+not a path of its own. Into this repository, placing a link there would mean moving the
+repository's file aside and pointing it at itself; into another tree, it would move that
+tree's file aside and put a link inside it. So when a directory above a declared
+destination is a symlink, wherever it leads, `apply` removes that one symlink, creates a
+real directory in its place, and links the files inside it one by one. What the old link
+led to is never touched. The state is recorded before anything changes, and `diff`, `list`
+and `--dry-run` show the path as `relink-parent`.
 
-Only a link that leads into the repository is replaced. A link that leads anywhere else is
-somebody else's, and sennit does not remove it.
+A link that led outside the repository is moved to `<name>.sennit-backup` and recorded, so
+`sennit rollback` puts the original link back (the directory that replaced it is moved
+aside, as with any other path). A link into the repository is simply removed, since it can
+be recreated; `--no-backup` drops either. A symlink above a path the repository does not
+declare is left alone.
 
 ## What apply will not do
 

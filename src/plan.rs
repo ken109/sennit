@@ -23,7 +23,7 @@ pub enum State {
     Wrong { current: PathBuf },
     /// symlink ではない実体(ファイル/ディレクトリ)が居座っている
     Occupied,
-    /// dest の祖先に、リポジトリの中を指す symlink がある。
+    /// dest の祖先に symlink がある。向き先はリポジトリの中でも外でもよい。
     ///
     /// 旧い配置でディレクトリごと張ったものが典型。dest はその symlink を
     /// 通ってリポジトリの実ファイルに着くので、そのまま進めるとリポジトリの
@@ -154,7 +154,7 @@ impl Plan {
         }
         let src = root.join(rel);
         let dest = home.join(rel);
-        let state = match ancestor_link(root, home, rel) {
+        let state = match ancestor_link(home, rel) {
             Some(link) => State::Ancestor { link },
             None => inspect(&src, &dest),
         };
@@ -172,12 +172,14 @@ impl Plan {
     }
 }
 
-/// `rel` の祖先(home の直下から dest の親まで)にある、リポジトリの中を指す
-/// symlink のうち、いちばん外側のもの。
+/// `rel` の祖先(home の直下から dest の親まで)にある symlink のうち、
+/// いちばん外側のもの。向き先はリポジトリの中でも外でもよい。
 ///
-/// 最初に見つけた symlink で決める。リポジトリの外を指すなら、その先は
-/// 利用者のものなので触らない(None)。
-pub fn ancestor_link(root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
+/// 宣言された dest の途中が symlink だと、dest はその先の実ファイルに
+/// 着いてしまう。向き先がリポジトリなら自分自身を、外(旧い配置が向けていた
+/// 別のリポジトリなど)なら他人の木を書き換えることになる。symlink 自体は
+/// 中身を持たないので、外して実ディレクトリにすれば向き先には触れずに済む。
+pub fn ancestor_link(home: &Path, rel: &Path) -> Option<PathBuf> {
     let mut cur = home.to_path_buf();
     let comps: Vec<_> = rel.components().collect();
     for c in comps.iter().take(comps.len().saturating_sub(1)) {
@@ -186,22 +188,39 @@ pub fn ancestor_link(root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
             // ここから先は無い。無いものは symlink ではありえない
             return None;
         };
-        if !meta.file_type().is_symlink() {
-            continue;
+        if meta.file_type().is_symlink() {
+            return Some(cur);
         }
-        let target = std::fs::read_link(&cur).ok()?;
-        let target = if target.is_absolute() {
-            target
-        } else {
-            cur.parent()?.join(target)
-        };
-        let inside = target.starts_with(root)
-            || std::fs::canonicalize(&target)
-                .map(|t| t.starts_with(root))
-                .unwrap_or(false);
-        return inside.then_some(cur);
     }
     None
+}
+
+/// その symlink の向き先がリポジトリの中か。
+pub fn link_into_repo(root: &Path, link: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let target = if target.is_absolute() {
+        target
+    } else {
+        match link.parent() {
+            Some(p) => p.join(target),
+            None => return false,
+        }
+    };
+    target.starts_with(root)
+        || std::fs::canonicalize(&target)
+            .map(|t| t.starts_with(root))
+            .unwrap_or(false)
+}
+
+/// `ancestor_link` のうち、リポジトリの中を指すものだけ。
+///
+/// [merge] の出力が使う。出力は plan の対象ではなく、利用者が自分で外へ
+/// 向けたリンクの先に書くのは従来どおりでよい。中を指すリンクを通すと
+/// リポジトリを書き換えてしまうので、それだけを見つける。
+pub fn repo_ancestor_link(root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
+    ancestor_link(home, rel).filter(|l| link_into_repo(root, l))
 }
 
 /// dest の現状を分類する。symlink_metadata なので、リンク先の有無に
@@ -370,15 +389,9 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         std::os::unix::fs::symlink(root.join("skills/gog"), home.join("skills/gog")).unwrap();
 
         let rel = Path::new("skills/gog/SKILL.md");
-        assert_eq!(
-            ancestor_link(&root, &home, rel),
-            Some(home.join("skills/gog"))
-        );
+        assert_eq!(ancestor_link(&home, rel), Some(home.join("skills/gog")));
         // a path with no link above it
-        assert_eq!(
-            ancestor_link(&root, &home, Path::new("skills/other/a.md")),
-            None
-        );
+        assert_eq!(ancestor_link(&home, Path::new("skills/other/a.md")), None);
     }
 
     #[test]
@@ -390,12 +403,13 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         std::fs::create_dir_all(home.join("skills")).unwrap();
         std::os::unix::fs::symlink("../../repo/skills/gog", home.join("skills/gog")).unwrap();
         let root = std::fs::canonicalize(&root).unwrap();
-        assert!(ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")).is_some());
+        assert!(repo_ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")).is_some());
     }
 
-    /// A link that leads somewhere else belongs to its owner.
+    /// A link is found wherever it leads; only the ones into the repository
+    /// count for `repo_ancestor_link`.
     #[test]
-    fn a_link_outside_the_repository_is_left_alone() {
+    fn a_link_outside_the_repository_is_found_but_is_not_a_repository_link() {
         let d = scratch("ancestor-outside");
         let root = d.join("repo");
         let home = d.join("home");
@@ -405,9 +419,9 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         std::fs::create_dir_all(home.join("skills")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, home.join("skills/gog")).unwrap();
 
-        assert_eq!(
-            ancestor_link(&root, &home, Path::new("skills/gog/SKILL.md")),
-            None
-        );
+        let rel = Path::new("skills/gog/SKILL.md");
+        assert_eq!(ancestor_link(&home, rel), Some(home.join("skills/gog")));
+        assert!(!link_into_repo(&root, &home.join("skills/gog")));
+        assert_eq!(repo_ancestor_link(&root, &home, rel), None);
     }
 }

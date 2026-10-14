@@ -185,7 +185,7 @@ pub fn read_target(dest: &Path) -> Result<Option<Target>> {
 
 pub fn status(p: &Planned, root: &Path, home: &Path) -> Status {
     // Through a link into the repository the target is not a file of its own yet
-    if plan::ancestor_link(root, home, &p.rel).is_some() {
+    if plan::repo_ancestor_link(root, home, &p.rel).is_some() {
         return Status::Missing;
     }
     match read_target(&p.dest) {
@@ -226,7 +226,7 @@ struct Prepared {
 }
 
 fn prepare(p: &Planned, root: &Path, home: &Path, dry_run: bool) -> Result<Prepared> {
-    let blocked = plan::ancestor_link(root, home, &p.rel);
+    let blocked = plan::repo_ancestor_link(root, home, &p.rel);
     if let Some(link) = &blocked {
         // Apply replaces a link into the repository with a real directory
         // before it gets here. Still finding one means it was not under [link],
@@ -324,7 +324,7 @@ pub fn apply_all(
     }
 
     for p in merges {
-        if dry_run && plan::ancestor_link(root, home, &p.rel).is_some() {
+        if dry_run && plan::repo_ancestor_link(root, home, &p.rel).is_some() {
             println!(
                 "  {:>8}  {}  (once the link above it is replaced)",
                 "would merge", p.out
