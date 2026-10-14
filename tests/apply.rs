@@ -2103,3 +2103,46 @@ fn a_merge_output_declared_under_link_is_refused_when_the_manifest_loads() {
     assert!(!out.status.success());
     assert!(both(&out).contains("[link]"), "{}", both(&out));
 }
+
+// ---------------------------------------------------------------------------
+// replacing a parent link that also holds sennit's own state
+// ---------------------------------------------------------------------------
+
+/// The state file lives under `<home>/.local/state/sennit`. When a link on the
+/// way to it is the one being replaced, saving the state used to create the
+/// directory the replacement then tried to create, and the first apply failed.
+#[test]
+fn a_parent_link_that_holds_the_state_file_is_replaced() {
+    let r = Repo::new("ancestor-holds-state");
+    r.manifest("[link]\ncommon = [\".local\"]\n");
+    r.write(".local/state/x.conf", "x\n");
+    let outside = r.home.parent().unwrap().join("other-state");
+    std::fs::create_dir_all(outside.join("sennit")).unwrap();
+    std::fs::write(outside.join("keep-me"), "mine\n").unwrap();
+    std::fs::create_dir_all(r.home_path(".local")).unwrap();
+    std::os::unix::fs::symlink(&outside, r.home_path(".local/state")).unwrap();
+
+    let out = r.run(&["apply"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state = r.home_path(".local/state/sennit/state.json");
+    assert!(
+        read(&state).contains(".local/state/x.conf"),
+        "{}",
+        read(&state)
+    );
+    assert_eq!(read(&r.home_path(".local/state/x.conf")), "x\n");
+    assert_eq!(read(&outside.join("keep-me")), "mine\n");
+
+    let again = ok(&r.run(&["apply"]));
+    assert!(again.contains("already up to date"), "{again}");
+
+    ok(&r.run(&["rollback"]));
+    assert_eq!(
+        std::fs::read_link(r.home_path(".local/state")).unwrap(),
+        outside
+    );
+}
