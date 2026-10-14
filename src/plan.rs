@@ -154,7 +154,7 @@ impl Plan {
         }
         let src = root.join(rel);
         let dest = home.join(rel);
-        let state = match ancestor_link(home, rel) {
+        let state = match ancestor_link(root, home, rel, manifest) {
             Some(link) => State::Ancestor { link },
             None => inspect(&src, &dest),
         };
@@ -173,13 +173,8 @@ impl Plan {
 }
 
 /// `rel` の祖先(home の直下から dest の親まで)にある symlink のうち、
-/// いちばん外側のもの。向き先はリポジトリの中でも外でもよい。
-///
-/// 宣言された dest の途中が symlink だと、dest はその先の実ファイルに
-/// 着いてしまう。向き先がリポジトリなら自分自身を、外(旧い配置が向けていた
-/// 別のリポジトリなど)なら他人の木を書き換えることになる。symlink 自体は
-/// 中身を持たないので、外して実ディレクトリにすれば向き先には触れずに済む。
-pub fn ancestor_link(home: &Path, rel: &Path) -> Option<PathBuf> {
+/// いちばん外側のもの。向き先は問わない。
+fn first_symlink(home: &Path, rel: &Path) -> Option<PathBuf> {
     let mut cur = home.to_path_buf();
     let comps: Vec<_> = rel.components().collect();
     for c in comps.iter().take(comps.len().saturating_sub(1)) {
@@ -193,6 +188,61 @@ pub fn ancestor_link(home: &Path, rel: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 張り替える祖先 symlink。`rel` の祖先のうちいちばん外側の symlink で、
+///
+/// - 向き先がリポジトリの中なら、どこにあっても張り替える。そのまま進むと
+///   リポジトリ自身のファイルを退避し、自分を指すリンクを作る。
+/// - 向き先が外なら、manifest に書かれたトップレベルのパスより**深い**ものだけ
+///   張り替える。旧い配置が別のリポジトリへ向けていたディレクトリが典型で、
+///   symlink は中身を持たないので、外せば向き先には触れずに済む。
+///   トップレベルそのもの(`.config -> ~/Dropbox/config`)や、その上のリンクは
+///   利用者が意図した配置なので触らず、0.19 までと同じく向き先の中に置く。
+pub fn ancestor_link(root: &Path, home: &Path, rel: &Path, manifest: &Manifest) -> Option<PathBuf> {
+    let link = first_symlink(home, rel)?;
+    if link_into_repo(root, &link) {
+        return Some(link);
+    }
+    let at = link.strip_prefix(home).ok()?;
+    manifest
+        .targets()
+        .iter()
+        .any(|t| at.starts_with(t) && at != Path::new(t))
+        .then_some(link)
+}
+
+/// manifest のトップレベルのパスのうち、それ自身が外を指す symlink のもの。
+/// 配置はその向き先の中に行われる。
+pub fn outside_top_levels(
+    root: &Path,
+    home: &Path,
+    manifest: &Manifest,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for t in manifest.targets() {
+        let path = home.join(t);
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link && !link_into_repo(root, &path) {
+            if let Ok(to) = std::fs::read_link(&path) {
+                out.push((PathBuf::from(t), to));
+            }
+        }
+    }
+    out
+}
+
+/// 上の一覧を 1 行ずつ知らせる。
+pub fn note_outside_top_levels(root: &Path, home: &Path, manifest: &Manifest) {
+    for (rel, to) in outside_top_levels(root, home, manifest) {
+        println!(
+            "note: ~/{} points to {}, outside the repository; files are placed inside it",
+            rel.display(),
+            to.display()
+        );
+    }
 }
 
 /// その symlink の向き先がリポジトリの中か。
@@ -214,13 +264,13 @@ pub fn link_into_repo(root: &Path, link: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// `ancestor_link` のうち、リポジトリの中を指すものだけ。
+/// 祖先の symlink のうち、リポジトリの中を指すものだけ。
 ///
 /// [merge] の出力が使う。出力は plan の対象ではなく、利用者が自分で外へ
 /// 向けたリンクの先に書くのは従来どおりでよい。中を指すリンクを通すと
 /// リポジトリを書き換えてしまうので、それだけを見つける。
 pub fn repo_ancestor_link(root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
-    ancestor_link(home, rel).filter(|l| link_into_repo(root, l))
+    first_symlink(home, rel).filter(|l| link_into_repo(root, l))
 }
 
 /// dest の現状を分類する。symlink_metadata なので、リンク先の有無に
@@ -389,9 +439,16 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         std::os::unix::fs::symlink(root.join("skills/gog"), home.join("skills/gog")).unwrap();
 
         let rel = Path::new("skills/gog/SKILL.md");
-        assert_eq!(ancestor_link(&home, rel), Some(home.join("skills/gog")));
+        let m = manifest_from("[link]\ncommon = [\"skills\"]\n");
+        assert_eq!(
+            ancestor_link(&root, &home, rel, &m),
+            Some(home.join("skills/gog"))
+        );
         // a path with no link above it
-        assert_eq!(ancestor_link(&home, Path::new("skills/other/a.md")), None);
+        assert_eq!(
+            ancestor_link(&root, &home, Path::new("skills/other/a.md"), &m),
+            None
+        );
     }
 
     #[test]
@@ -420,8 +477,18 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         std::os::unix::fs::symlink(&elsewhere, home.join("skills/gog")).unwrap();
 
         let rel = Path::new("skills/gog/SKILL.md");
-        assert_eq!(ancestor_link(&home, rel), Some(home.join("skills/gog")));
         assert!(!link_into_repo(&root, &home.join("skills/gog")));
         assert_eq!(repo_ancestor_link(&root, &home, rel), None);
+        // below a declared top-level path, it is replaced ...
+        let m = manifest_from("[link]\ncommon = [\"skills\"]\n");
+        assert_eq!(
+            ancestor_link(&root, &home, rel, &m),
+            Some(home.join("skills/gog"))
+        );
+        // ... but the top-level path itself, or a link above it, is not
+        let m = manifest_from("[link]\ncommon = [\"skills/gog\"]\n");
+        assert_eq!(ancestor_link(&root, &home, rel, &m), None);
+        let m = manifest_from("[link]\ncommon = [\"skills/gog/SKILL.md\"]\n");
+        assert_eq!(ancestor_link(&root, &home, rel, &m), None);
     }
 }

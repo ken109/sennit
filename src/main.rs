@@ -159,6 +159,7 @@ fn run() -> Result<()> {
         Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
             let merges = merge::plan(&root, &home, &manifest)?;
+            plan::note_outside_top_levels(&root, &home, &manifest);
             print_diff(&plan, &merges, &root, &home);
             Ok(())
         }
@@ -640,6 +641,8 @@ fn apply(
 ) -> Result<()> {
     let previous = state::State::load(home)?;
 
+    plan::note_outside_top_levels(root, home, manifest);
+
     // 「張れる状態にあるか」を 1 か所で決める。
     //
     // Path::exists() は使えない。あれは EACCES も「無い」と答えるので、
@@ -769,7 +772,7 @@ fn apply(
             // もう一度書く。そのとき state の保存がディレクトリを先に作っていても
             // 落ちないよう、作るのは create_dir_all で。
             if let State::Ancestor { .. } = &e.state {
-                while let Some(link) = plan::ancestor_link(home, &e.rel) {
+                while let Some(link) = plan::ancestor_link(root, home, &e.rel, manifest) {
                     let aside = if backup && !plan::link_into_repo(root, &link) {
                         let to = backup_path(&link)?;
                         kept.push(state::Backup {

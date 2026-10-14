@@ -138,7 +138,7 @@ touched:
 | `missing` | nothing is there |
 | `wrong` | a symlink pointing somewhere else |
 | `occupied` | a real file or directory is in the way |
-| `relink-parent` | a directory above it is a symlink |
+| `relink-parent` | a directory above it is a symlink (see below) |
 
 ### A symlink above the destination
 
@@ -147,16 +147,25 @@ this repository, or into another one. Every file below such a link is the file i
 not a path of its own. Into this repository, placing a link there would mean moving the
 repository's file aside and pointing it at itself; into another tree, it would move that
 tree's file aside and put a link inside it. So when a directory above a declared
-destination is a symlink, wherever it leads, `apply` removes that one symlink, creates a
-real directory in its place, and links the files inside it one by one. What the old link
-led to is never touched. The state is recorded before anything changes, and `diff`, `list`
-and `--dry-run` show the path as `relink-parent`.
+destination is such a symlink, `apply` removes that one symlink, creates a real directory in
+its place, and links the files inside it one by one. What the old link led to is never
+touched. The state is recorded before anything changes (and again afterwards, since the
+state file itself can live behind the link), and `diff`, `list` and `--dry-run` show the
+path as `relink-parent`.
 
 A link that led outside the repository is moved to `<name>.sennit-backup` and recorded, so
 `sennit rollback` puts the original link back (the directory that replaced it is moved
 aside, as with any other path). A link into the repository is simply removed, since it can
-be recreated; `--no-backup` drops either. A symlink above a path the repository does not
-declare is left alone.
+be recreated; `--no-backup` drops either.
+
+Two kinds of link are left alone:
+
+- the path the manifest declares, when it leads outside the repository. With
+  `common = [".config"]` and `~/.config -> ~/Dropbox/config`, the link is a deliberate
+  layout: files are placed inside it, as before 0.20, and `apply` and `diff` say so in one
+  line (`note: ~/.config points to ..., outside the repository`). A link *below* the
+  declared path (`.config/app`) is still replaced;
+- a symlink above a path the repository does not declare.
 
 ## What apply will not do
 

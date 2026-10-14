@@ -2146,3 +2146,60 @@ fn a_parent_link_that_holds_the_state_file_is_replaced() {
         outside
     );
 }
+
+// ---------------------------------------------------------------------------
+// a declared top-level path that is itself a link leading outside
+// ---------------------------------------------------------------------------
+
+/// `~/.config -> ~/Dropbox/config` is a deliberate layout. The path the manifest
+/// declares is never replaced when it leads outside the repository; files are
+/// placed inside it, as in 0.19, and a note says so.
+#[test]
+fn a_declared_top_level_link_that_leaves_the_repository_is_kept() {
+    let r = Repo::new("top-level-outside");
+    r.manifest("[link]\ncommon = [\".config\"]\n");
+    r.write(".config/app/a.conf", "from repo\n");
+    let outside = r.home.parent().unwrap().join("cloud-config");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("theirs.conf"), "theirs\n").unwrap();
+    std::os::unix::fs::symlink(&outside, r.home_path(".config")).unwrap();
+
+    let diff = ok(&r.run(&["diff"]));
+    assert!(diff.contains("outside the repository"), "{diff}");
+    assert!(!diff.contains("relink-parent"), "{diff}");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("outside the repository"), "{out}");
+    assert!(!out.contains("relink-parent"), "{out}");
+    // the link stays, and the file is placed inside what it leads to
+    assert_eq!(std::fs::read_link(r.home_path(".config")).unwrap(), outside);
+    assert_eq!(read(&outside.join("theirs.conf")), "theirs\n");
+    assert!(std::fs::symlink_metadata(outside.join("app/a.conf"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(backups_under(&r.home).is_empty());
+
+    let again = ok(&r.run(&["apply"]));
+    assert!(again.contains("already up to date"), "{again}");
+}
+
+/// Only the top-level path is protected; a link below it is still replaced.
+#[test]
+fn a_link_below_a_kept_top_level_directory_is_still_replaced() {
+    let r = Repo::new("below-top-level");
+    r.manifest("[link]\ncommon = [\".config\"]\n");
+    r.write(".config/app/a.conf", "from repo\n");
+    let other = r.home.parent().unwrap().join("old-app");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("a.conf"), "old\n").unwrap();
+    std::fs::create_dir_all(r.home_path(".config")).unwrap();
+    std::os::unix::fs::symlink(&other, r.home_path(".config/app")).unwrap();
+
+    ok(&r.run(&["apply"]));
+    assert_eq!(read(&other.join("a.conf")), "old\n");
+    assert_eq!(read(&r.home_path(".config/app/a.conf")), "from repo\n");
+    assert!(std::fs::symlink_metadata(r.home_path(".config/app"))
+        .unwrap()
+        .is_dir());
+}
