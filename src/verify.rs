@@ -189,9 +189,10 @@ fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<(
 
     // [merge] の出力が、重ねた結果とずれていないか。値は出さず、キーのパスだけ
     let merges = crate::merge::plan(root, home, &manifest)?;
+    let env = crate::merge::Env::load(root, home, &manifest)?;
     let mut bad_merges = 0usize;
     for m in &merges {
-        match crate::merge::status(m, root, home) {
+        match crate::merge::status(m, &env) {
             crate::merge::Status::Ok => {}
             crate::merge::Status::Missing => {
                 bad_merges += 1;

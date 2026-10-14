@@ -2233,3 +2233,53 @@ fn prune_leaves_a_link_alone_when_its_target_climbs_out_with_dotdot() {
     assert!(std::fs::symlink_metadata(r.home_path("a.conf")).is_ok());
     assert_eq!(read(&theirs), "theirs\n");
 }
+
+// ---------------------------------------------------------------------------
+// a path moving from [link] to [merge]
+// ---------------------------------------------------------------------------
+
+/// The old declaration linked `.claude/settings.json`; the new one merges into
+/// it. Until apply prunes the old link, previews and checks must treat it as
+/// not being there rather than as a symlink they cannot merge into.
+#[test]
+fn a_path_moving_from_link_to_merge_previews_cleanly() {
+    let r = Repo::new("link-to-merge");
+    r.manifest("[link]\ncommon = [\".claude\"]\nignore = [\"*.shared.json\"]\n");
+    r.write(".claude/settings.json", "{\"old\": true}\n");
+    r.write(".claude/settings.shared.json", SHARED);
+    ok(&r.run(&["apply"]));
+    assert!(
+        std::fs::symlink_metadata(r.home_path(".claude/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // the repository no longer holds the file; the manifest merges instead
+    std::fs::remove_file(r.root_path(".claude/settings.json")).unwrap();
+    r.manifest(MERGE_MANIFEST);
+
+    let diff = r.run(&["diff"]);
+    assert!(diff.status.success(), "{}", both(&diff));
+    assert!(!both(&diff).contains("symlink"), "{}", both(&diff));
+    let dry = r.run(&["apply", "--dry-run"]);
+    assert!(dry.status.success(), "{}", both(&dry));
+    assert!(both(&dry).contains("would merge"), "{}", both(&dry));
+    let verify = r.run(&["verify"]);
+    assert!(!both(&verify).contains("symlink"), "{}", both(&verify));
+    assert!(both(&verify).contains("missing"), "{}", both(&verify));
+    // none of that changed anything
+    assert!(
+        std::fs::symlink_metadata(r.home_path(".claude/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("prune"), "{out}");
+    let target = r.home_path(".claude/settings.json");
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
+    assert_eq!(json(&target)["model"], "opus");
+    assert!(r.run(&["verify"]).status.success());
+}

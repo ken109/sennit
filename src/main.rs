@@ -160,7 +160,8 @@ fn run() -> Result<()> {
         Command::Diff => {
             let merges = merge::plan(&root, &home, &manifest)?;
             plan::note_outside_top_levels(&root, &home, &manifest);
-            print_diff(&plan, &merges, &root, &home);
+            let env = merge::Env::new(&root, &home, &manifest, &plan, &state::State::load(&home)?);
+            print_diff(&plan, &merges, &env);
             Ok(())
         }
         Command::Check => check(&root),
@@ -172,7 +173,8 @@ fn run() -> Result<()> {
         Command::Audit { history } => audit::audit(&root, history),
         Command::List { changed } => {
             let merges = merge::plan(&root, &home, &manifest)?;
-            print_list(&plan, &merges, &root, &home, changed);
+            let env = merge::Env::new(&root, &home, &manifest, &plan, &state::State::load(&home)?);
+            print_list(&plan, &merges, &env, changed);
             Ok(())
         }
     }
@@ -862,10 +864,9 @@ fn apply(
         // 落ちる。README は diff と --dry-run から始めろと書いてある。
         enforce_modes(root, manifest, true)?;
         let mut merged = previous.merged.clone();
+        let env = merge::Env::new(root, home, manifest, plan, &previous);
         let merging = merge::apply_all(
-            root,
-            home,
-            manifest,
+            &env,
             merges,
             &mut merged,
             &mut kept,
@@ -897,10 +898,9 @@ fn apply(
     // 替わっている)で、モードとフックのまえ。フックが取り込む設定は、
     // 重ねたあとのものでなければならない。
     let mut merged = previous.merged.clone();
+    let env = merge::Env::new(root, home, manifest, plan, &previous);
     let merging = merge::apply_all(
-        root,
-        home,
-        manifest,
+        &env,
         merges,
         &mut merged,
         &mut kept,
@@ -1145,11 +1145,11 @@ fn backup_path(dest: &Path) -> Result<PathBuf> {
     bail!("too many backups next to {}", dest.display())
 }
 
-fn print_diff(plan: &Plan, merges: &[merge::Planned], root: &Path, home: &Path) {
+fn print_diff(plan: &Plan, merges: &[merge::Planned], env: &merge::Env) {
     let changes: Vec<_> = plan.changes().collect();
     let merge_status: Vec<_> = merges
         .iter()
-        .map(|m| (m, merge::status(m, root, home)))
+        .map(|m| (m, merge::status(m, env)))
         .filter(|(_, st)| *st != merge::Status::Ok)
         .collect();
     if changes.is_empty() && merge_status.is_empty() {
@@ -1204,13 +1204,7 @@ fn merge_line(out: &str, st: &merge::Status) -> String {
     }
 }
 
-fn print_list(
-    plan: &Plan,
-    merges: &[merge::Planned],
-    root: &Path,
-    home: &Path,
-    changed_only: bool,
-) {
+fn print_list(plan: &Plan, merges: &[merge::Planned], env: &merge::Env, changed_only: bool) {
     let width = plan
         .entries
         .iter()
@@ -1246,7 +1240,7 @@ fn print_list(
 
     let mut merge_changes = 0usize;
     for m in merges {
-        let st = merge::status(m, root, home);
+        let st = merge::status(m, env);
         if st == merge::Status::Ok {
             if !changed_only {
                 println!("{}", merge_line(&m.out, &st));

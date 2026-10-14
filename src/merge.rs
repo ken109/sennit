@@ -183,12 +183,67 @@ pub fn read_target(dest: &Path) -> Result<Option<Target>> {
     }))
 }
 
-pub fn status(p: &Planned, root: &Path, home: &Path) -> Status {
+/// What a merge needs to know about the run it is part of.
+pub struct Env<'a> {
+    pub root: &'a Path,
+    pub home: &'a Path,
+    pub manifest: &'a Manifest,
+    /// Paths (relative to `$HOME`) holding a link that this run is about to
+    /// prune: recorded last time, no longer declared, and ours. A merge target
+    /// that is one of them is treated as absent, since apply removes the link
+    /// before merging and a preview should say what apply will find.
+    pub pending: Vec<PathBuf>,
+}
+
+impl<'a> Env<'a> {
+    pub fn new(
+        root: &'a Path,
+        home: &'a Path,
+        manifest: &'a Manifest,
+        plan: &plan::Plan,
+        previous: &crate::state::State,
+    ) -> Self {
+        let current: Vec<PathBuf> = plan.entries.iter().map(|e| e.rel.clone()).collect();
+        let pending = previous
+            .stale(&current)
+            .into_iter()
+            .filter(|rel| {
+                let dest = home.join(rel);
+                std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink())
+                    && plan::link_into_repo(root, &dest)
+            })
+            .collect();
+        Env {
+            root,
+            home,
+            manifest,
+            pending,
+        }
+    }
+
+    /// Like `new`, reading the plan and the state itself. For commands that
+    /// have neither at hand.
+    pub fn load(root: &'a Path, home: &'a Path, manifest: &'a Manifest) -> Result<Self> {
+        let plan = plan::Plan::build(root, home, manifest)?;
+        let previous = crate::state::State::load(home)?;
+        Ok(Self::new(root, home, manifest, &plan, &previous))
+    }
+}
+
+/// The target as this run will find it.
+fn target_of(p: &Planned, env: &Env) -> Result<Option<Target>> {
+    if env.pending.contains(&p.rel) {
+        return Ok(None);
+    }
+    read_target(&p.dest)
+}
+
+pub fn status(p: &Planned, env: &Env) -> Status {
     // Through a link into the repository the target is not a file of its own yet
-    if plan::repo_ancestor_link(root, home, &p.rel).is_some() {
+    if plan::repo_ancestor_link(env.root, env.home, &p.rel).is_some() {
         return Status::Missing;
     }
-    match read_target(&p.dest) {
+    match target_of(p, env) {
         Err(e) => Status::Broken(format!("{e:#}")),
         Ok(None) => Status::Missing,
         Ok(Some(t)) => {
@@ -225,8 +280,8 @@ struct Prepared {
     mode: u32,
 }
 
-fn prepare(p: &Planned, root: &Path, home: &Path, dry_run: bool) -> Result<Prepared> {
-    let blocked = plan::repo_ancestor_link(root, home, &p.rel);
+fn prepare(p: &Planned, env: &Env, dry_run: bool) -> Result<Prepared> {
+    let blocked = plan::repo_ancestor_link(env.root, env.home, &p.rel);
     if let Some(link) = &blocked {
         // Apply replaces a link into the repository with a real directory
         // before it gets here. Still finding one means it was not under [link],
@@ -243,7 +298,7 @@ fn prepare(p: &Planned, root: &Path, home: &Path, dry_run: bool) -> Result<Prepa
     let current = if blocked.is_some() {
         None
     } else {
-        read_target(&p.dest)?
+        target_of(p, env)?
     };
     let base = current.as_ref().map(|t| &t.value);
     let merged = merge_value(base, &p.shared);
@@ -300,9 +355,7 @@ pub type SaveState<'a> = dyn FnMut(&[Backup], &[String]) -> Result<()> + 'a;
 /// written; the caller saves it.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_all(
-    root: &Path,
-    home: &Path,
-    manifest: &Manifest,
+    env: &Env,
     merges: &[Planned],
     merged: &mut Vec<String>,
     kept: &mut Vec<Backup>,
@@ -310,6 +363,7 @@ pub fn apply_all(
     dry_run: bool,
     save: &mut SaveState,
 ) -> Result<usize> {
+    let manifest = env.manifest;
     let mut changed = 0usize;
 
     // Taking a declaration away does not undo what it did: the keys stay in the file
@@ -324,7 +378,7 @@ pub fn apply_all(
     }
 
     for p in merges {
-        if dry_run && plan::repo_ancestor_link(root, home, &p.rel).is_some() {
+        if dry_run && plan::repo_ancestor_link(env.root, env.home, &p.rel).is_some() {
             println!(
                 "  {:>8}  {}  (once the link above it is replaced)",
                 "would merge", p.out
@@ -332,7 +386,7 @@ pub fn apply_all(
             changed += 1;
             continue;
         }
-        let prep = prepare(p, root, home, dry_run)?;
+        let prep = prepare(p, env, dry_run)?;
         if prep.unchanged {
             if !dry_run && !merged.contains(&p.out) {
                 merged.push(p.out.clone());
