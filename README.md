@@ -797,9 +797,21 @@ are missing with `winget install --id <ID> --exact --source winget`, accepting t
 package agreements and never prompting. A package winget does not list but whose command
 (its `provides`, or its name) is already on `PATH` is left alone and shown with `=`: it was
 installed some other way, with scoop or by hand, and a second copy would only compete with
-it. `upgrade = true` runs `winget upgrade` on an installed package every time; winget's
-"no newer version" answer (0x8A15002B) counts as success. A failed install or upgrade does
-not stop the others; `sync` fails at the end and names each one with its exit code.
+it. `upgrade = true` runs `winget upgrade` on an installed package every time.
+
+winget's exit codes are read by what they mean rather than as "non-zero is a failure":
+
+| Code | Meaning | `sync` |
+| --- | --- | --- |
+| 0x8A15002B, 0x8A15004F, 0x8A150050, 0x8A150068 | upgrade: no newer version, not newer, version unknown, pinned | success |
+| 0x8A150061, 0x8A15010D | install: already installed | success |
+| 0x8A150109 | restart to finish | success, with a note to restart |
+| 0x8A150101, 0x8A150103 | the application or a file is in use | skipped, with a warning |
+
+The in-use case is mostly PowerShell itself: `sync` run from PowerShell 7 cannot upgrade
+`Microsoft.PowerShell` while it is running, so close it, run `sync` from another shell, and
+the upgrade goes through. Any other failure does not stop the remaining packages; `sync`
+fails at the end and names each one with its exit code.
 
 `verify` checks a winget package's command on `PATH` first, and asks winget about the ID only
 when that fails, so an application without a command, or one installed after this shell

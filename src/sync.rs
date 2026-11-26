@@ -255,9 +255,57 @@ pub mod winget {
     /// `winget list` が「入っていない」と答えるときの終了コード
     /// (APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND)
     pub const NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
-    /// `winget upgrade` が「新しい版が無い」と答えるときの終了コード
-    /// (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE)。失敗ではない
+    // 以下は winget の returnCodes.md の値
+    /// upgrade: 新しい版が無い(UPDATE_NOT_APPLICABLE)
     pub const UPDATE_NOT_APPLICABLE: u32 = 0x8A15_002B;
+    /// upgrade: 入っている版より新しくない(UPGRADE_VERSION_NOT_NEWER)
+    pub const UPGRADE_VERSION_NOT_NEWER: u32 = 0x8A15_004F;
+    /// upgrade: 入っている版が分からない(UPGRADE_VERSION_UNKNOWN)
+    pub const UPGRADE_VERSION_UNKNOWN: u32 = 0x8A15_0050;
+    /// upgrade: pin が掛かっている(PACKAGE_IS_PINNED)
+    pub const PACKAGE_IS_PINNED: u32 = 0x8A15_0068;
+    /// install: 既にどれかの版が入っている(PACKAGE_ALREADY_INSTALLED)
+    pub const PACKAGE_ALREADY_INSTALLED: u32 = 0x8A15_0061;
+    /// install: 別の版が既に入っている(INSTALL_ALREADY_INSTALLED)
+    pub const INSTALL_ALREADY_INSTALLED: u32 = 0x8A15_010D;
+    /// 起動中のため入れられない(INSTALL_PACKAGE_IN_USE)
+    pub const INSTALL_PACKAGE_IN_USE: u32 = 0x8A15_0101;
+    /// ファイルが使用中(INSTALL_FILE_IN_USE)
+    pub const INSTALL_FILE_IN_USE: u32 = 0x8A15_0103;
+    /// 再起動で完了する(INSTALL_REBOOT_REQUIRED_TO_FINISH)
+    pub const INSTALL_REBOOT_REQUIRED_TO_FINISH: u32 = 0x8A15_0109;
+
+    /// install / upgrade の終了コードの読み方。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Outcome {
+        Done,
+        /// 済んだが、再起動で完了する
+        Reboot,
+        /// 起動中で入れ替えられなかった。閉じてから入れ直せば済む
+        InUse,
+        Failed,
+    }
+
+    /// `upgrade` が真なら upgrade の、偽なら install の終了コード。
+    pub fn outcome(code: u32, upgrade: bool) -> Outcome {
+        match code {
+            0 => Outcome::Done,
+            INSTALL_REBOOT_REQUIRED_TO_FINISH => Outcome::Reboot,
+            INSTALL_PACKAGE_IN_USE | INSTALL_FILE_IN_USE => Outcome::InUse,
+            // 新しい版が無い・比べられない・pin で止めてある: どれも直すものが無い
+            UPDATE_NOT_APPLICABLE
+            | UPGRADE_VERSION_NOT_NEWER
+            | UPGRADE_VERSION_UNKNOWN
+            | PACKAGE_IS_PINNED
+                if upgrade =>
+            {
+                Outcome::Done
+            }
+            // 入れようとしたら既に入っていた: 望んだ状態にはなっている
+            PACKAGE_ALREADY_INSTALLED | INSTALL_ALREADY_INSTALLED if !upgrade => Outcome::Done,
+            _ => Outcome::Failed,
+        }
+    }
 
     /// どのパッケージにも付ける引数。ID の完全一致で、winget のソースだけを見て、
     /// 端末に何も訊かない。
@@ -269,27 +317,50 @@ pub mod winget {
         "--disable-interactivity",
     ];
 
-    /// 1 件ずつ見て、入っていないものを入れ、upgrade の宣言があるものは上げる。
-    /// 戻り値は入れる(--dry-run なら入れるはずの)件数。
-    pub fn sync(wanted: &[&Installable], dry_run: bool) -> Result<usize> {
-        let mut missing: Vec<&Installable> = Vec::new();
-        let mut upgrades: Vec<&Installable> = Vec::new();
-        let mut elsewhere: Vec<(&Installable, String)> = Vec::new();
+    /// 宣言を、このマシンの様子で振り分けたもの。
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Sorted<'a> {
+        /// 入っていない。入れる
+        pub missing: Vec<&'a Installable>,
+        /// 入っていて、毎回上げる宣言がある
+        pub upgrades: Vec<&'a Installable>,
+        /// winget の一覧に無いが、同じコマンドが PATH にある(見つけた場所)
+        pub elsewhere: Vec<(&'a Installable, String)>,
+    }
+
+    /// 振り分け。`installed` と `on_path` を差し替えられるよう、外から渡す。
+    pub fn sort<'a>(
+        wanted: &[&'a Installable],
+        installed: impl Fn(&str) -> Result<bool>,
+        on_path: impl Fn(&[String]) -> Option<String>,
+    ) -> Result<Sorted<'a>> {
+        let mut out = Sorted::default();
         for i in wanted {
             if installed(&i.name)? {
                 if i.upgrade {
-                    upgrades.push(i);
+                    out.upgrades.push(i);
                 }
                 continue;
             }
             // winget の一覧に無くても、同じコマンドが PATH にあれば別の手段で
             // 入っている。入れると同じ道具が 2 つ並び、どちらが動くか分からなくなる
             if let Some(found) = on_path(&i.commands) {
-                elsewhere.push((i, found));
+                out.elsewhere.push((i, found));
                 continue;
             }
-            missing.push(i);
+            out.missing.push(i);
         }
+        Ok(out)
+    }
+
+    /// 1 件ずつ見て、入っていないものを入れ、upgrade の宣言があるものは上げる。
+    /// 戻り値は入れる(--dry-run なら入れるはずの)件数。
+    pub fn sync(wanted: &[&Installable], dry_run: bool) -> Result<usize> {
+        let Sorted {
+            missing,
+            upgrades,
+            elsewhere,
+        } = sort(wanted, installed, on_path)?;
 
         println!(
             "winget: {} declared, {} missing",
@@ -310,27 +381,36 @@ pub mod winget {
         }
 
         let mut failed: Vec<String> = Vec::new();
-        for i in &missing {
-            let code = run(&["install", "--id", &i.name, "--accept-package-agreements"])?;
-            if code != 0 {
-                failed.push(format!("{} (install exited {})", i.name, describe(code)));
+        let mut reboot = false;
+        let jobs = missing
+            .iter()
+            .map(|i| (i, false))
+            .chain(upgrades.iter().map(|i| (i, true)));
+        for (i, upgrade) in jobs {
+            let verb = if upgrade { "upgrade" } else { "install" };
+            let code = run(&[verb, "--id", &i.name, "--accept-package-agreements"])?;
+            match outcome(code, upgrade) {
+                Outcome::Done => {}
+                Outcome::Reboot => reboot = true,
+                // PowerShell 7 の中から Microsoft.PowerShell を上げると、自分が
+                // 使っているので入れ替えられない。sync の失敗にはしない
+                Outcome::InUse => eprintln!(
+                    "\x1b[33mwarning\x1b[0m: {} is in use, so the {verb} was skipped; \
+                     close it (for PowerShell, run sync from another shell) and run sync again",
+                    i.name
+                ),
+                Outcome::Failed => {
+                    failed.push(format!("{} ({verb} exited {})", i.name, describe(code)))
+                }
             }
         }
-        for i in &upgrades {
-            let code = run(&["upgrade", "--id", &i.name, "--accept-package-agreements"])?;
-            if !upgrade_succeeded(code) {
-                failed.push(format!("{} (upgrade exited {})", i.name, describe(code)));
-            }
+        if reboot {
+            eprintln!("\x1b[33mnote\x1b[0m: restart Windows to finish installing");
         }
         if !failed.is_empty() {
             bail!("winget failed for: {}", failed.join(", "));
         }
         Ok(missing.len())
-    }
-
-    /// 0 と「新しい版が無い」は成功。
-    pub fn upgrade_succeeded(code: u32) -> bool {
-        code == 0 || code == UPDATE_NOT_APPLICABLE
     }
 
     /// 終了コードを 16 進でも見せる。winget の失敗は 0x8A15.... で引く
@@ -418,13 +498,67 @@ mod tests {
     /// マシンで毎回 sync を落とさないように。
     #[test]
     fn winget_reporting_no_newer_version_is_not_a_failure() {
-        assert!(winget::upgrade_succeeded(0));
-        assert!(winget::upgrade_succeeded(0x8A15_002B));
+        use winget::{outcome, Outcome};
+        assert_eq!(outcome(0, true), Outcome::Done);
+        for code in [0x8A15_002B, 0x8A15_004F, 0x8A15_0050, 0x8A15_0068] {
+            assert_eq!(outcome(code, true), Outcome::Done, "{code:X}");
+            // install でこれが出たら、それは失敗
+            assert_eq!(outcome(code, false), Outcome::Failed, "{code:X}");
+        }
         // PowerShell の $LASTEXITCODE で見える値と同じもの
         assert_eq!(0x8A15_002Bu32 as i32, -1978335189);
-        assert!(!winget::upgrade_succeeded(1));
-        assert!(!winget::upgrade_succeeded(winget::NO_APPLICATIONS_FOUND));
+        assert_eq!(outcome(1, true), Outcome::Failed);
+        assert_eq!(
+            outcome(winget::NO_APPLICATIONS_FOUND, true),
+            Outcome::Failed
+        );
         assert_eq!(winget::describe(0x8A15_002B), "-1978335189 / 0x8A15002B");
+    }
+
+    /// 既に入っていた install は成功。再起動待ちは成功、使用中は飛ばす。
+    #[test]
+    fn winget_install_codes_are_read_by_what_they_mean() {
+        use winget::{outcome, Outcome};
+        assert_eq!(outcome(0x8A15_0061, false), Outcome::Done);
+        assert_eq!(outcome(0x8A15_010D, false), Outcome::Done);
+        for upgrade in [true, false] {
+            assert_eq!(outcome(0x8A15_0109, upgrade), Outcome::Reboot);
+            assert_eq!(outcome(0x8A15_0101, upgrade), Outcome::InUse);
+            assert_eq!(outcome(0x8A15_0103, upgrade), Outcome::InUse);
+        }
+    }
+
+    /// 入っている・PATH にある・入っていないの振り分け。
+    #[test]
+    fn winget_declarations_are_sorted_by_what_is_on_the_machine() {
+        let pkg = |name: &str, upgrade: bool, cmd: &str| Installable {
+            name: name.to_string(),
+            manager: Manager::Winget,
+            upgrade,
+            commands: vec![cmd.to_string()],
+        };
+        let a = pkg("A.Installed", false, "a");
+        let b = pkg("B.Upgraded", true, "b");
+        let c = pkg("C.Elsewhere", true, "c");
+        let d = pkg("D.Missing", false, "d");
+        let wanted = vec![&a, &b, &c, &d];
+        let got = winget::sort(
+            &wanted,
+            |id| Ok(id.starts_with('A') || id.starts_with('B')),
+            |cmds| (cmds[0] == "c").then(|| r"C:\scoop\shims\c.exe".to_string()),
+        )
+        .unwrap();
+        assert_eq!(got.missing, vec![&d]);
+        assert_eq!(got.upgrades, vec![&b]);
+        // PATH にあるものは upgrade の宣言があっても winget では触らない
+        assert_eq!(
+            got.elsewhere,
+            vec![(&c, r"C:\scoop\shims\c.exe".to_string())]
+        );
+
+        // winget に訊けなければ落とす。黙って「入っていない」と読まない
+        let e = winget::sort(&wanted, |_| anyhow::bail!("no winget"), |_| None).unwrap_err();
+        assert!(e.to_string().contains("no winget"));
     }
 
     /// cask は formula より後(unzip などの依存が formula 側にもあるため)。
