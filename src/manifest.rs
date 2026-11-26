@@ -502,14 +502,15 @@ impl Manifest {
 
     /// リポジトリ内のパス `rel` をどこへ置くか。
     ///
-    /// `to` のある項目のうち、`rel` を含むいちばん深いものに従う。無ければ
-    /// $HOME の下の同じパス。
+    /// `rel` を含む項目のうち、いちばん深いものに従う。`to` の無い項目が
+    /// いちばん深ければ、$HOME の下の同じパス。同じ深さなら後に書いたもの
+    /// (common より OS の一覧)。
     pub fn placement(&self, dirs: &crate::platform::Dirs, rel: &Path) -> Result<Placement> {
-        let mapped = self
+        let deepest = self
             .targets_here()
-            .filter(|t| t.to.is_some() && rel.starts_with(&t.path))
+            .filter(|t| rel.starts_with(&t.path))
             .max_by_key(|t| Path::new(&t.path).components().count());
-        let Some(t) = mapped else {
+        let Some(t) = deepest.filter(|t| t.to.is_some()) else {
             return Ok(Placement {
                 base: dirs.home.clone(),
                 under: rel.to_path_buf(),
@@ -995,6 +996,18 @@ mod tests {
             PathBuf::from("/h/AppData/Roaming/herdr/config.toml")
         );
         assert_eq!(at("conf/deep/x"), PathBuf::from("/h/elsewhere/x"));
+
+        // 平の項目の方が深ければ、そちらが決める
+        let m2 = load(
+            "[link]\ncommon = [{ path = \"win\", to = \"AppData/Roaming\" }, \"win/plain\"]\n",
+        )
+        .unwrap();
+        let at = |rel: &str| {
+            let p = m2.placement(&dirs, Path::new(rel)).unwrap();
+            p.base.join(p.under)
+        };
+        assert_eq!(at("win/a"), PathBuf::from("/h/AppData/Roaming/a"));
+        assert_eq!(at("win/plain/b"), PathBuf::from("/h/win/plain/b"));
         assert_eq!(m.targets(), vec!["conf", "win/herdr", "conf/deep"]);
     }
 

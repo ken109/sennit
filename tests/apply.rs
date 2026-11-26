@@ -2747,3 +2747,21 @@ fn a_file_is_not_placed_over_a_directory() {
     assert!(!out.status.success());
     assert!(r.home_path("a/keep").exists());
 }
+
+/// The deepest entry decides where a file goes, whether or not it has a `to`.
+#[test]
+fn a_plain_entry_inside_a_placed_one_keeps_its_own_path() {
+    let r = Repo::new("deepest-plain");
+    r.write("win/a.conf", "a\n");
+    r.write("win/plain/b.conf", "b\n");
+    r.manifest(
+        r#"
+[link]
+common = [{ path = "win", to = "elsewhere" }, "win/plain"]
+"#,
+    );
+    ok(&r.run(&["apply"]));
+    assert!(r.home_path("elsewhere/a.conf").exists());
+    assert!(r.home_path("win/plain/b.conf").exists());
+    assert!(std::fs::symlink_metadata(r.home_path("elsewhere/plain/b.conf")).is_err());
+}
