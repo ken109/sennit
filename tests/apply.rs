@@ -2812,3 +2812,39 @@ fn a_place_taken_over_by_another_entry_is_relinked() {
     ok(&r.run(&["apply"]));
     assert!(std::fs::symlink_metadata(r.home_path(".config/tool/c")).is_err());
 }
+
+/// A file that a `to` would place on a [merge] output is refused before anything
+/// is linked: it is compared where it would go, not by its path in the repository.
+/// Other files in the same directory are fine.
+#[test]
+fn a_file_placed_onto_a_merge_output_is_refused() {
+    let r = Repo::new("to-onto-merge");
+    r.write("win/claude/settings.json", "{}\n");
+    r.write("win/claude/other.json", "{}\n");
+    r.write("shared.json", "{\"a\": 1}\n");
+    let manifest = r#"
+[link]
+common = [{ path = "win/claude", to = ".claude" }]
+
+[merge.".claude/settings.json"]
+from = "shared.json"
+"#;
+    r.manifest(manifest);
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("[merge] output"), "{err}");
+    assert!(std::fs::symlink_metadata(r.home_path(".claude/other.json")).is_err());
+
+    std::fs::remove_file(r.root_path("win/claude/settings.json")).unwrap();
+    ok(&r.run(&["apply"]));
+    assert!(r.home_path(".claude/other.json").exists());
+    let merged = std::fs::read_to_string(r.home_path(".claude/settings.json")).unwrap();
+    assert!(merged.contains("\"a\""), "{merged}");
+    assert!(
+        !std::fs::symlink_metadata(r.home_path(".claude/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

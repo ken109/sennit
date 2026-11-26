@@ -160,15 +160,6 @@ impl Plan {
         {
             return Ok(());
         }
-        // [merge] の出力は symlink にしない。リポジトリに同じパスのファイルが
-        // あると、link が張った symlink を merge が JSON として書き直す。
-        if manifest.is_merge_output(rel) {
-            anyhow::bail!(
-                "`{}` is a [merge] output and also a file under [link]; \
-                 remove it from the repository or from [link]",
-                rel.display()
-            );
-        }
         let place = manifest.placement(dirs, rel)?;
         // 読み込みの検査で断っているが、ここでも確かめる。配置先がフォルダそのものだと
         // apply はそのフォルダを退避するか消してから張る
@@ -185,6 +176,19 @@ impl Plan {
         }
         let src = crate::platform::native(&root.join(rel));
         let dest = crate::platform::native(&place.base.join(&place.under));
+        // [merge] の出力は symlink にしない。そこに置かれるファイルがリポジトリに
+        // あると、link が張った symlink を merge が JSON として書き直す。
+        // 比べるのは配置先: `to` で置く項目は、リポジトリ内のパスと配置先が違う
+        if let Some(out) = manifest.merge.keys().find(|o| {
+            crate::platform::same_path(&crate::platform::native(&dirs.home.join(o)), &dest)
+        }) {
+            anyhow::bail!(
+                "`{}` would be placed at {}, which is the [merge] output `{out}`; \
+                 remove it from the repository or from [link]",
+                rel.display(),
+                dest.display()
+            );
+        }
         // 2 つの項目が同じ場所へ置こうとすると、後の方が EEXIST で落ちるか、
         // 先に張ったものを「別の場所を指す」として張り替える
         if let Some(other) = entries
