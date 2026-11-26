@@ -636,13 +636,17 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    /// テストは並んで走る。内容から作った名前では、違う内容の 2 つが同じ
+    /// ファイルを書き合い、片方が相手の manifest を読んでいた。呼ぶたびに別の名前
     fn load(toml: &str) -> Result<Manifest> {
-        let p = std::env::temp_dir().join(format!(
-            "sennit-manifest-{}.toml",
-            toml.len() as u64 * 31 + toml.bytes().map(u64::from).sum::<u64>()
-        ));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("sennit-manifest-{}-{n}.toml", std::process::id()));
         std::fs::write(&p, toml).unwrap();
-        Manifest::load(&p)
+        let m = Manifest::load(&p);
+        let _ = std::fs::remove_file(&p);
+        m
     }
 
     #[test]

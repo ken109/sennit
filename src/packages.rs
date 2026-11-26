@@ -765,13 +765,17 @@ mod load_tests {
         assert!(will_install(&pkg("winget = \"Starship.Starship\"\n")));
     }
 
+    /// 呼ぶたびに別の名前。内容から作った名前では、並んで走るテストが同じ
+    /// ファイルを書き合う
     fn load(toml: &str) -> Result<Packages> {
-        let p = std::env::temp_dir().join(format!(
-            "sennit-packages-{}.toml",
-            toml.bytes().map(u64::from).sum::<u64>()
-        ));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("sennit-packages-{}-{n}.toml", std::process::id()));
         std::fs::write(&p, toml).unwrap();
-        Packages::load(&p)
+        let m = Packages::load(&p);
+        let _ = std::fs::remove_file(&p);
+        m
     }
 
     /// 打ち間違えると sync の対象から静かに外れる。それでいて verify は
