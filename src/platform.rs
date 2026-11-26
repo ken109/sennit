@@ -586,15 +586,21 @@ pub fn find_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
+        // WindowsApps の実行エイリアス(winget.exe など)は 0 バイトの reparse point
+        // (IO_REPARSE_TAG_APPEXECLINK)で、辿れないので is_file() が偽になりうる。
+        // ディレクトリでない項目があれば、実行できるものとして数える
+        let present = |p: &Path| {
+            p.is_file() || std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir())
+        };
         let exact = dir.join(name);
-        if exact.is_file() && Path::new(name).extension().is_some() {
+        if Path::new(name).extension().is_some() && present(&exact) {
             return Some(exact);
         }
         let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
         exts.split(';')
             .filter(|e| !e.is_empty())
             .map(|e| dir.join(format!("{name}{e}")))
-            .find(|p| p.is_file())
+            .find(|p| present(p))
     }
 }
 
@@ -655,6 +661,37 @@ mod tests {
             Path::new(r"C:\Repo2\a"),
             Path::new(r"C:\Repo")
         ));
+    }
+    /// The shell's own answer for a known folder: an absolute directory that exists.
+    #[test]
+    fn known_folders_come_from_the_shell() {
+        for name in ["appdata", "localappdata", "documents"] {
+            let p = known_folder::get(name).unwrap();
+            assert!(p.is_absolute(), "{name}: {}", p.display());
+            assert!(p.is_dir(), "{name}: {}", p.display());
+            let real = Dirs::new(PathBuf::from(r"C:\nowhere"), true);
+            assert_eq!(real.known(name).unwrap(), p);
+        }
+        assert!(known_folder::get("desktop").is_err());
+    }
+
+    /// App execution aliases in WindowsApps (winget.exe) are 0-byte reparse
+    /// points that a plain metadata call may not follow; they still count.
+    #[test]
+    fn an_app_execution_alias_is_found_on_path() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let apps = PathBuf::from(local).join("Microsoft").join("WindowsApps");
+        let Some(alias) = std::fs::read_dir(&apps).ok().and_then(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        }) else {
+            return;
+        };
+        let stem = alias.file_stem().unwrap().to_string_lossy().to_string();
+        assert!(find_in_dir(&apps, &stem).is_some(), "{}", alias.display());
     }
 }
 
