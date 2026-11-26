@@ -459,7 +459,10 @@ runs nor forgets when it last ran. `shell` picks what reads `run`: `sh` (the def
 `powershell` (Windows PowerShell) or `pwsh` (PowerShell 7). PowerShell gets the script as
 `-EncodedCommand`, with `-NoProfile -NonInteractive` (and `-ExecutionPolicy Bypass` on
 Windows), so nothing in it is re-quoted on the way. A PowerShell hook fails the apply when
-its last command fails or it calls `exit` with a non-zero code.
+its last command fails or it calls `exit` with a non-zero code. `-EncodedCommand` carries the
+script on the command line as base64 of UTF-16, and Windows limits a command line to 32,767
+characters, so a script much past 12,000 characters belongs in a `.ps1` file that the hook
+runs.
 
 ```toml
 [hooks.bat-themes]
@@ -585,6 +588,8 @@ GH_CONFIG_DIR     = { value = "{appdata}/GitHub CLI", if-unset = true }
   check. `--dry-run` prints the same.
 - `Path` cannot be declared: as a single `REG_SZ` it would replace the whole user `Path`,
   including what installers appended to it.
+- A value that starts with `{` is read as a folder, so a literal value beginning with a
+  brace — a GUID such as `{6B29FC40-CA47-1067-B31D-00DD010662DA}` — cannot be declared yet.
 - Removing a variable from `[env.windows]` does not unset it.
 
 **On macOS and Linux, `[env]` does nothing.** There is no user environment to write to
