@@ -126,19 +126,45 @@ pub enum Action {
     Kept,
 }
 
+/// What `HKCU\Environment` holds for a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current {
+    /// as stored: `%USERPROFILE%` is not expanded
+    pub value: String,
+    /// `REG_EXPAND_SZ` rather than `REG_SZ`
+    pub expand: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub name: String,
     pub value: String,
     pub now: Option<String>,
+    /// write it as `REG_EXPAND_SZ`
+    pub expand: bool,
     pub action: Action,
 }
 
-/// What each declared variable needs. `read` gives the user's current value.
+/// Whether two values mean the same: both expanded (`%USERPROFILE%`), compared
+/// without case, and a trailing `\` does not count. Windows reads them that way.
+pub fn same_value(a: &str, b: &str, expand: impl Fn(&str) -> String) -> bool {
+    let norm = |s: &str| {
+        let e = expand(s);
+        let t = e.trim_end_matches('\\');
+        // `C:\` を `C:` にしない
+        let t = if t.ends_with(':') { e.as_str() } else { t };
+        t.to_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// What each declared variable needs. `read` gives what the user has now, and
+/// `expand` expands `%NAME%` as Windows does.
 pub fn plan(
     decl: &EnvDecl,
     dirs: &Dirs,
-    read: impl Fn(&str) -> Result<Option<String>>,
+    read: impl Fn(&str) -> Result<Option<Current>>,
+    expand: impl Fn(&str) -> String,
 ) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     for (name, v) in &decl.windows {
@@ -146,13 +172,17 @@ pub fn plan(
         let now = read(name)?;
         let action = match &now {
             Some(_) if v.if_unset() => Action::Kept,
-            Some(n) if *n == value => Action::Same,
+            Some(n) if same_value(&n.value, &value, &expand) => Action::Same,
             _ => Action::Set,
         };
+        // `%` があれば展開される型で書く。既存が REG_EXPAND_SZ なら、それも残す
+        // (ほかの道具が `%` 入りの値に書き戻したときに展開されなくならないように)
+        let expand_sz = value.contains('%') || now.as_ref().is_some_and(|n| n.expand);
         out.push(Change {
             name: name.clone(),
             value,
-            now,
+            now: now.map(|n| n.value),
+            expand: expand_sz,
             action,
         });
     }
@@ -167,7 +197,7 @@ fn shown(now: &Option<String>) -> String {
 }
 
 /// The user's current value, from `HKCU\Environment`.
-fn read_now(name: &str) -> Result<Option<String>> {
+fn read_now(name: &str) -> Result<Option<Current>> {
     #[cfg(windows)]
     {
         registry::get(name)
@@ -179,20 +209,53 @@ fn read_now(name: &str) -> Result<Option<String>> {
     }
 }
 
-/// apply の一部。書いた(--dry-run・--home では書くはずの)件数を返す。
+fn write_now(c: &Change) -> Result<()> {
+    #[cfg(windows)]
+    {
+        registry::set(&c.name, &c.value, c.expand)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = c;
+        Ok(())
+    }
+}
+
+fn expand_now(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        registry::expand(s)
+    }
+    #[cfg(not(windows))]
+    {
+        s.to_string()
+    }
+}
+
+/// apply の結果。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// 書いた件数
+    pub written: usize,
+    /// 書かずに、書くはずと出した件数(--dry-run・--home)
+    pub previewed: usize,
+}
+
+/// apply の一部。
 ///
 /// --home を渡した試しの実行では書かない。環境変数はプロファイルに 1 つしか
 /// なく、試しの home を指す値で本物を上書きしてしまう。
-pub fn apply(decl: &EnvDecl, dirs: &Dirs, dry_run: bool) -> Result<usize> {
+pub fn apply(decl: &EnvDecl, dirs: &Dirs, dry_run: bool) -> Result<Applied> {
+    let mut done = Applied::default();
     if decl.windows.is_empty() || !crate::manifest::on_this_os(&["windows".to_string()]) {
-        return Ok(0);
+        return Ok(done);
     }
-    let changes = plan(decl, dirs, read_now)?;
+    let changes = plan(decl, dirs, read_now, expand_now)?;
     let write = !dry_run && dirs.is_real();
-    let mut count = 0usize;
+    let mut failed: Option<anyhow::Error> = None;
     for c in changes.iter().filter(|c| c.action == Action::Set) {
-        count += 1;
         if !write {
+            done.previewed += 1;
             let why = if dry_run {
                 ""
             } else {
@@ -206,19 +269,26 @@ pub fn apply(decl: &EnvDecl, dirs: &Dirs, dry_run: bool) -> Result<usize> {
             );
             continue;
         }
-        #[cfg(windows)]
-        registry::set(&c.name, &c.value)?;
+        if let Err(e) = write_now(c) {
+            failed = Some(e);
+            break;
+        }
+        done.written += 1;
         // このあと走るフックにも見えるように
-        std::env::set_var(&c.name, &c.value);
+        std::env::set_var(&c.name, expand_now(&c.value));
         println!("  {:>8}  {}={}", "env", c.name, c.value);
     }
-    if write && count > 0 {
+    if done.written > 0 {
         // 開いているエクスプローラーなどに読み直させる。新しく開くターミナルが
-        // 新しい値を受け取るのは、エクスプローラーが読み直したあと
+        // 新しい値を受け取るのは、エクスプローラーが読み直したあと。途中で
+        // 書けなくなっても、それまでに書いた分は知らせる
         #[cfg(windows)]
         registry::broadcast();
     }
-    Ok(count)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(done),
+    }
 }
 
 /// verify の一部。食い違っている件数を返す。
@@ -233,7 +303,7 @@ pub fn verify(decl: &EnvDecl, dirs: &Dirs) -> Result<usize> {
         );
         return Ok(0);
     }
-    let changes = plan(decl, dirs, read_now)?;
+    let changes = plan(decl, dirs, read_now, expand_now)?;
     let mut bad = 0usize;
     for c in changes.iter().filter(|c| c.action == Action::Set) {
         bad += 1;
@@ -258,8 +328,8 @@ pub mod registry {
     // ((HKEY)(ULONG_PTR)((LONG)0x80000001)): sign-extended on 64-bit
     const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as i32 as isize;
     const REG_SZ: u32 = 1;
-    const RRF_RT_REG_SZ: u32 = 0x2;
-    const RRF_RT_REG_EXPAND_SZ: u32 = 0x4;
+    const REG_EXPAND_SZ: u32 = 2;
+    const RRF_RT_ANY: u32 = 0x0000_ffff;
     const RRF_NOEXPAND: u32 = 0x1000_0000;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_MORE_DATA: i32 = 234;
@@ -292,6 +362,10 @@ pub mod registry {
     extern "system" {
         fn RegDeleteKeyValueW(hkey: Hkey, sub_key: *const u16, value: *const u16) -> i32;
     }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ExpandEnvironmentStringsW(src: *const u16, dst: *mut u16, size: u32) -> u32;
+    }
     #[link(name = "user32")]
     extern "system" {
         fn SendMessageTimeoutW(
@@ -309,11 +383,30 @@ pub mod registry {
         OsStr::new(s).encode_wide().chain(Some(0)).collect()
     }
 
-    /// The raw value (`REG_EXPAND_SZ` is not expanded), or None when unset.
-    pub fn get(name: &str) -> Result<Option<String>> {
+    fn type_name(kind: u32) -> String {
+        let name = match kind {
+            0 => "REG_NONE",
+            3 => "REG_BINARY",
+            4 => "REG_DWORD",
+            5 => "REG_DWORD_BIG_ENDIAN",
+            6 => "REG_LINK",
+            7 => "REG_MULTI_SZ",
+            11 => "REG_QWORD",
+            _ => "",
+        };
+        if name.is_empty() {
+            format!("type {kind}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// The raw value (`REG_EXPAND_SZ` is not expanded) and its type, or None when
+    /// unset. A value of another type (`REG_DWORD`) is an error that names it.
+    pub fn get(name: &str) -> Result<Option<super::Current>> {
         let key = wide("Environment");
         let value = wide(name);
-        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        let flags = RRF_RT_ANY | RRF_NOEXPAND;
         let mut len: u32 = 0;
         // SAFETY: the strings are NUL-terminated; a null buffer asks for the size
         let rc = unsafe {
@@ -336,6 +429,7 @@ pub mod registry {
         loop {
             let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
             let mut got = (buf.len() * 2) as u32;
+            let mut kind: u32 = 0;
             // SAFETY: `buf` holds `got` bytes
             let rc = unsafe {
                 RegGetValueW(
@@ -343,20 +437,28 @@ pub mod registry {
                     key.as_ptr(),
                     value.as_ptr(),
                     flags,
-                    std::ptr::null_mut(),
+                    &mut kind,
                     buf.as_mut_ptr().cast(),
                     &mut got,
                 )
             };
             match rc {
                 0 => {
+                    if kind != REG_SZ && kind != REG_EXPAND_SZ {
+                        bail!(
+                            "HKCU\\Environment\\{name} is a {} value, not a string; \
+                             sennit only writes strings, so remove or rename it first",
+                            type_name(kind)
+                        );
+                    }
                     let n = (got as usize / 2).min(buf.len());
                     let end = buf[..n].iter().position(|&c| c == 0).unwrap_or(n);
-                    return Ok(Some(
-                        OsString::from_wide(&buf[..end])
+                    return Ok(Some(super::Current {
+                        value: OsString::from_wide(&buf[..end])
                             .to_string_lossy()
                             .to_string(),
-                    ));
+                        expand: kind == REG_EXPAND_SZ,
+                    }));
                 }
                 ERROR_FILE_NOT_FOUND => return Ok(None),
                 // grew in between
@@ -366,17 +468,19 @@ pub mod registry {
         }
     }
 
-    pub fn set(name: &str, value: &str) -> Result<()> {
+    /// `REG_EXPAND_SZ` when `expand`, else `REG_SZ`.
+    pub fn set(name: &str, value: &str, expand: bool) -> Result<()> {
         let key = wide("Environment");
         let n = wide(name);
         let data = wide(value);
+        let kind = if expand { REG_EXPAND_SZ } else { REG_SZ };
         // SAFETY: `data` is NUL-terminated and its length in bytes includes the NUL
         let rc = unsafe {
             RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),
                 n.as_ptr(),
-                REG_SZ,
+                kind,
                 data.as_ptr().cast(),
                 (data.len() * 2) as u32,
             )
@@ -385,6 +489,32 @@ pub mod registry {
             bail!("failed to write HKCU\\Environment\\{name} (error {rc})");
         }
         Ok(())
+    }
+
+    /// `%NAME%` expanded against this process's environment. Left as it is if
+    /// that fails.
+    pub fn expand(s: &str) -> String {
+        if !s.contains('%') {
+            return s.to_string();
+        }
+        let src = wide(s);
+        let mut cap: u32 = (src.len() as u32).max(64) * 2;
+        for _ in 0..4 {
+            let mut buf = vec![0u16; cap as usize];
+            // SAFETY: `src` is NUL-terminated; `buf` holds `cap` characters
+            let need = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), cap) };
+            if need == 0 {
+                break;
+            }
+            if need <= cap {
+                let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                return OsString::from_wide(&buf[..end])
+                    .to_string_lossy()
+                    .to_string();
+            }
+            cap = need;
+        }
+        s.to_string()
     }
 
     /// For tests. Removing an unset value is not an error.
@@ -452,7 +582,7 @@ GH_CONFIG_DIR = { value = "{appdata}/GitHub CLI", if-unset = true }
 "#,
         )
         .unwrap();
-        let got = plan(&d, &dirs(), |_| Ok(None)).unwrap();
+        let got = plan(&d, &dirs(), |_| Ok(None), str::to_string).unwrap();
         let v: BTreeMap<_, _> = got
             .iter()
             .map(|c| (c.name.as_str(), c.value.as_str()))
@@ -488,14 +618,18 @@ NONE_YET = { value = "x", if-unset = true }
 "#,
         )
         .unwrap();
-        let now = |n: &str| -> Result<Option<String>> {
+        let now = |n: &str| -> Result<Option<Current>> {
             Ok(match n {
                 "SAME" => Some("x".into()),
                 "DIFF" | "MINE" => Some("y".into()),
                 _ => None,
-            })
+            }
+            .map(|value| Current {
+                value,
+                expand: false,
+            }))
         };
-        let got: BTreeMap<_, _> = plan(&d, &dirs(), now)
+        let got: BTreeMap<_, _> = plan(&d, &dirs(), now, str::to_string)
             .unwrap()
             .into_iter()
             .map(|c| (c.name, c.action))
@@ -505,6 +639,51 @@ NONE_YET = { value = "x", if-unset = true }
         assert_eq!(got["UNSET"], Action::Set);
         assert_eq!(got["MINE"], Action::Kept);
         assert_eq!(got["NONE_YET"], Action::Set);
+    }
+
+    /// 展開してから、大小文字と末尾の `\` を無視して比べる。
+    #[test]
+    fn values_are_compared_as_windows_reads_them() {
+        let expand = |s: &str| s.replace("%USERPROFILE%", r"C:\Users\me");
+        assert!(same_value(
+            r"%USERPROFILE%\.config",
+            r"C:\Users\me\.config",
+            expand
+        ));
+        assert!(same_value(
+            r"c:\users\ME\.config\",
+            r"C:\Users\me\.config",
+            expand
+        ));
+        assert!(same_value(r"C:\", r"c:\", expand));
+        assert!(!same_value(r"C:\", r"C:", expand));
+        assert!(!same_value(
+            r"C:\Users\me\.config\bat",
+            r"C:\Users\me\.config",
+            expand
+        ));
+    }
+
+    /// `%` を含む値、または既存が REG_EXPAND_SZ なら、REG_EXPAND_SZ で書く。
+    #[test]
+    fn an_expandable_value_stays_expandable() {
+        let d =
+            decl("[env.windows]\nPCT = \"%USERPROFILE%/x\"\nWAS = \"plain\"\nNEW = \"plain\"\n")
+                .unwrap();
+        let now = |n: &str| -> Result<Option<Current>> {
+            Ok((n == "WAS").then(|| Current {
+                value: "%OLD%".into(),
+                expand: true,
+            }))
+        };
+        let got: BTreeMap<_, _> = plan(&d, &dirs(), now, str::to_string)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.name, c.expand))
+            .collect();
+        assert!(got["PCT"]);
+        assert!(got["WAS"]);
+        assert!(!got["NEW"]);
     }
 
     #[test]
@@ -538,11 +717,31 @@ NONE_YET = { value = "x", if-unset = true }
         registry::delete(name).unwrap();
         assert_eq!(registry::get(name).unwrap(), None);
         let value = r"C:\Users\me\GitHub CLI\日本語";
-        registry::set(name, value).unwrap();
+        registry::set(name, value, false).unwrap();
         let back = registry::get(name);
+        registry::set(name, "%USERPROFILE%\\x", true).unwrap();
+        let expandable = registry::get(name);
         registry::delete(name).unwrap();
-        assert_eq!(back.unwrap().as_deref(), Some(value));
+        assert_eq!(
+            back.unwrap(),
+            Some(Current {
+                value: value.into(),
+                expand: false
+            })
+        );
+        // 展開されずに読める
+        assert_eq!(
+            expandable.unwrap(),
+            Some(Current {
+                value: "%USERPROFILE%\\x".into(),
+                expand: true
+            })
+        );
         assert_eq!(registry::get(name).unwrap(), None);
+        assert_eq!(
+            registry::expand("%USERPROFILE%\\x"),
+            format!("{}\\x", std::env::var("USERPROFILE").unwrap())
+        );
 
         // apply が書き、verify が通り、if-unset は上書きしない
         let real = Dirs::new(PathBuf::from(r"C:\Users\me"), true);
@@ -550,21 +749,33 @@ NONE_YET = { value = "x", if-unset = true }
             "[env.windows]\nSENNIT_TEST_APPLY = \"{home}/x\"\nSENNIT_TEST_KEEP = { value = \"new\", if-unset = true }\n",
         )
         .unwrap();
-        registry::set("SENNIT_TEST_KEEP", "mine").unwrap();
+        registry::set("SENNIT_TEST_KEEP", "mine", false).unwrap();
         let wrote = apply(&d, &real, false);
         let checked = verify(&d, &real);
         let applied = registry::get("SENNIT_TEST_APPLY");
         let kept = registry::get("SENNIT_TEST_KEEP");
         registry::delete("SENNIT_TEST_APPLY").unwrap();
         registry::delete("SENNIT_TEST_KEEP").unwrap();
-        assert_eq!(wrote.unwrap(), 1);
+        assert_eq!(wrote.unwrap().written, 1);
         assert_eq!(checked.unwrap(), 0);
         assert_eq!(
             std::env::var("SENNIT_TEST_APPLY").unwrap(),
             r"C:\Users\me\x"
         );
-        assert_eq!(applied.unwrap().as_deref(), Some(r"C:\Users\me\x"));
-        assert_eq!(kept.unwrap().as_deref(), Some("mine"));
+        assert_eq!(applied.unwrap().unwrap().value, r"C:\Users\me\x");
+        assert_eq!(kept.unwrap().unwrap().value, "mine");
+
+        // 文字列でない値に当たったら、型を書いて落とす
+        let out = std::process::Command::new("reg")
+            .args(["add", r"HKCU\Environment", "/v", "SENNIT_TEST_DWORD"])
+            .args(["/t", "REG_DWORD", "/d", "1", "/f"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let got = registry::get("SENNIT_TEST_DWORD");
+        registry::delete("SENNIT_TEST_DWORD").unwrap();
+        let e = got.unwrap_err();
+        assert!(e.to_string().contains("REG_DWORD"), "{e}");
     }
 
     /// --home では書かない。
@@ -572,7 +783,8 @@ NONE_YET = { value = "x", if-unset = true }
     #[test]
     fn nothing_is_written_with_a_given_home() {
         let d = decl("[env.windows]\nSENNIT_TEST_NEVER = \"{home}/x\"\n").unwrap();
-        assert_eq!(apply(&d, &dirs(), false).unwrap(), 1);
+        let done = apply(&d, &dirs(), false).unwrap();
+        assert_eq!((done.written, done.previewed), (0, 1));
         assert_eq!(registry::get("SENNIT_TEST_NEVER").unwrap(), None);
     }
 
@@ -582,7 +794,7 @@ NONE_YET = { value = "x", if-unset = true }
     fn nothing_happens_elsewhere() {
         let d = decl("[env.windows]\nA = \"x\"\n").unwrap();
         let real = Dirs::new(PathBuf::from("/h"), true);
-        assert_eq!(apply(&d, &real, false).unwrap(), 0);
+        assert_eq!(apply(&d, &real, false).unwrap(), Applied::default());
         assert_eq!(verify(&d, &real).unwrap(), 0);
         assert!(std::env::var_os("A").is_none());
     }

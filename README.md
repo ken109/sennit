@@ -567,13 +567,19 @@ GH_CONFIG_DIR     = { value = "{appdata}/GitHub CLI", if-unset = true }
 - A value that starts with a folder (`{home}`, `{appdata}`, `{localappdata}`,
   `{documents}`, found as for `to`) is a path, and every `/` in it becomes `\`. Any other
   value is written exactly as given.
-- `apply` writes each value that differs to `HKCU\Environment` as `REG_SZ`, then broadcasts
-  `WM_SETTINGCHANGE` so Explorer — and the terminals it starts afterwards — pick them up.
+- `apply` writes each value that differs to `HKCU\Environment` as `REG_SZ` — or as
+  `REG_EXPAND_SZ` when the value has a `%` in it or the one it replaces was expandable —
+  then broadcasts `WM_SETTINGCHANGE` so Explorer — and the terminals it starts afterwards —
+  pick them up. If a write fails partway, the ones already written are still broadcast.
   Terminals already open keep their old environment. Hooks in the same `apply` already see
   the new values.
 - `if-unset = true` sets the variable only when the user has none; a value of their own is
   left alone, and `verify` accepts it.
-- `verify` reports a variable that is unset or holds something else.
+- Values are compared as Windows reads them: both expanded (`%USERPROFILE%\.config` is the
+  same as `C:\Users\me\.config`), without case, and ignoring a trailing `\`. So a value set
+  by hand or by a script in another spelling is not rewritten on every apply.
+- `verify` reports a variable that is unset or holds something else. A variable of another
+  registry type (`REG_DWORD`) is an error that names the type; sennit does not replace it.
 - With `--home`, nothing is written: there is one user environment, and a trial run must not
   point it at a scratch directory. `apply` prints what it would set, and `verify` skips the
   check. `--dry-run` prints the same.

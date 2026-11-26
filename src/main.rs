@@ -884,7 +884,7 @@ fn apply(
 
     if dry_run {
         // 環境変数は書かず、何を書くかだけ出す
-        let env_set = userenv::apply(&manifest.env, dirs, true)?;
+        let env_set = userenv::apply(&manifest.env, dirs, true)?.previewed;
         // フックは実際には走らせず、何が走るかだけ出す
         hooks::run_all(root, &manifest.hooks, &previous.hooks, true)?;
         // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
@@ -981,7 +981,8 @@ fn apply(
         && fixed == 0
         && ran.count == 0
         && merging == 0
-        && env_set == 0
+        // --home で書かなかったものは would set と出してある。何も書いていない
+        && env_set.written == 0
     {
         if not_yet.is_empty() {
             println!("already up to date ({} links)", plan.entries.len());
@@ -1009,12 +1010,14 @@ fn apply(
     if !not_yet.is_empty() {
         println!("{} not generated yet, so not linked", not_yet.len());
     }
-    if env_set > 0 {
-        if dirs.is_real() {
-            println!("{env_set} environment variable(s) set");
-        } else {
-            println!("{env_set} environment variable(s) not set (--home)");
-        }
+    if env_set.written > 0 {
+        println!("{} environment variable(s) set", env_set.written);
+    }
+    if env_set.previewed > 0 {
+        println!(
+            "{} environment variable(s) not set (--home)",
+            env_set.previewed
+        );
     }
     if !kept.is_empty() {
         println!(
