@@ -324,15 +324,30 @@ fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
     }
 }
 
-/// .config/<name> の存在そのものが、そのツールへの依存を表す。
+/// 設定の置き場の直下にある名前が、そのツールへの依存を表す。
 ///
 /// direnv のように「設定ディレクトリはあるが、どの設定ファイルからも
 /// 名前が参照されない」依存はこれでしか捕まらない。実際 direnvrc を配置
 /// しているのに direnv を入れていない期間があった。
 /// 対象外にしたいものは packages.toml の ignore.commands に書く。
+///
+/// 置き場は `.config/` と、Windows の `AppData/Roaming/`・`AppData/Local/`。
+/// [link] の `to` でそこへ置く項目(`{ path = "herdr", to = "{appdata}/herdr" }`)も、
+/// 置き先の名前で数える。OS を問わない。check はマシンに依らない検査なので、
+/// Windows 向けの設定も macOS の CI で見る。
+const CONFIG_BASES: [&str; 3] = [".config", "AppData/Roaming", "AppData/Local"];
+
 fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
-    let Ok(dir) = std::fs::read_dir(root.join(".config")) else {
-        return Ok(());
+    for base in CONFIG_BASES {
+        config_dir(root, base, out);
+    }
+    linked_into_config_dirs(root, out);
+    Ok(())
+}
+
+fn config_dir(root: &Path, base: &str, out: &mut Vec<Requirement>) {
+    let Ok(dir) = std::fs::read_dir(root.join(base)) else {
+        return;
     };
     for entry in dir.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -353,10 +368,7 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         let name = if entry.path().is_dir() {
             name
         } else {
-            Path::new(&name)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or(name)
+            stem(&name)
         };
         if name.starts_with('.') || name.is_empty() {
             continue;
@@ -364,10 +376,58 @@ fn config_dirs(root: &Path, out: &mut Vec<Requirement>) -> Result<()> {
         out.push(Requirement {
             kind: Kind::Command,
             name,
-            source: ".config/ (directory exists)".into(),
+            source: format!("{base}/ (directory exists)"),
         });
     }
-    Ok(())
+}
+
+/// [link] の `to` が設定の置き場の直下へ置くもの。
+fn linked_into_config_dirs(root: &Path, out: &mut Vec<Requirement>) {
+    let Ok(m) = crate::manifest::Manifest::load(&root.join("sennit.toml")) else {
+        return;
+    };
+    let all = m
+        .link
+        .common
+        .iter()
+        .chain(&m.link.darwin)
+        .chain(&m.link.linux)
+        .chain(&m.link.windows);
+    for t in all {
+        let Some(to) = &t.to else { continue };
+        let (folder, rest) = crate::manifest::split_to(to);
+        let rest = Path::new(rest);
+        let below = match folder {
+            Some("appdata" | "localappdata") => Some(rest),
+            None | Some("home") => CONFIG_BASES.iter().find_map(|b| rest.strip_prefix(b).ok()),
+            _ => None,
+        };
+        let Some(below) = below else { continue };
+        let mut comps = below.components();
+        let Some(first) = comps.next() else { continue };
+        let first = first.as_os_str().to_string_lossy().to_string();
+        // 置き先の最後の要素がファイルなら、拡張子を落とす(starship.toml -> starship)
+        let name = if comps.next().is_none() && root.join(&t.path).is_file() {
+            stem(&first)
+        } else {
+            first
+        };
+        if name.starts_with('.') || name.is_empty() {
+            continue;
+        }
+        out.push(Requirement {
+            kind: Kind::Command,
+            name,
+            source: format!("sennit.toml ([link] {} -> {to})", t.path),
+        });
+    }
+}
+
+fn stem(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// 行コメントを落とす。引用符の中のものは残す。
@@ -593,6 +653,35 @@ mod tests {
             "[core]\n\tpager = delta\n[interactive]\n\tdiffFilter = delta --color-only\n",
         );
         assert!(f.names().contains(&"delta".to_string()));
+    }
+
+    /// Windows の設定の置き場(AppData)も同じに見る。
+    #[test]
+    fn a_windows_config_directory_is_evidence_too() {
+        let f = Fixture::new("appdata");
+        f.dir("AppData/Roaming/herdr");
+        f.file("AppData/Local/nvim-data.toml", "");
+        let names = f.names();
+        assert!(names.contains(&"herdr".to_string()), "{names:?}");
+        assert!(names.contains(&"nvim-data".to_string()), "{names:?}");
+    }
+
+    /// [link] の `to` で設定の置き場へ置くものは、置き先の名前で数える。
+    /// どの OS の一覧に書いてあっても見る。
+    #[test]
+    fn a_link_placed_into_a_config_directory_is_evidence() {
+        let f = Fixture::new("link-to");
+        f.manifest(
+            "[link]\nwindows = [{ path = \"win/herdr\", to = \"{appdata}/herdr\" }, { path = \"win/ps\", to = \"{documents}/PowerShell\" }]\ncommon = [{ path = \"star.toml\", to = \".config/starship.toml\" }]\n",
+        );
+        f.dir("win/herdr");
+        f.dir("win/ps");
+        f.file("star.toml", "");
+        let names = f.names();
+        assert!(names.contains(&"herdr".to_string()), "{names:?}");
+        assert!(names.contains(&"starship".to_string()), "{names:?}");
+        // Documents は設定の置き場ではない
+        assert!(!names.contains(&"PowerShell".to_string()), "{names:?}");
     }
 
     /// 隠しファイルは拾わない。
