@@ -46,7 +46,6 @@ pub struct Dirs {
     pub home: PathBuf,
     /// `home` is the real home directory (no `--home`). Only Windows asks the
     /// shell for its folders.
-    #[cfg_attr(not(windows), allow(dead_code))]
     real: bool,
 }
 
@@ -61,6 +60,11 @@ pub fn windows_only_folder(name: &str) -> bool {
 impl Dirs {
     pub fn new(home: PathBuf, real: bool) -> Self {
         Dirs { home, real }
+    }
+
+    /// Whether this is the real home directory, rather than one given with `--home`.
+    pub fn is_real(&self) -> bool {
+        self.real
     }
 
     /// The folder `{name}` stands for.

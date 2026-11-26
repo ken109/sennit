@@ -44,6 +44,9 @@ pub struct Manifest {
     /// 書き換えるファイル（Claude Code の settings.json など）のためのもの。
     #[serde(default)]
     pub merge: std::collections::BTreeMap<String, Merge>,
+    /// ユーザー環境変数。`windows` の表だけ(HKCU\Environment)
+    #[serde(default)]
+    pub env: crate::userenv::EnvDecl,
 }
 
 /// `[merge."<output>"]` の中身。
@@ -384,6 +387,7 @@ impl Manifest {
         for (name, h) in &self.hooks {
             h.validate(name)?;
         }
+        self.env.validate()?;
 
         for (name, probe) in &self.probes {
             probe.validate(name)?;
@@ -661,6 +665,7 @@ mod tests {
             data: Default::default(),
             modes: Default::default(),
             merge: Default::default(),
+            env: Default::default(),
         }
     }
 
