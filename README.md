@@ -446,6 +446,28 @@ links are already placed and recorded by then, so `sennit rollback` still works.
 Hooks run under `sh -c`. Windows has no `sh`; see [Windows](#windows) for which shell is
 used there.
 
+`os` limits a hook to some platforms, spelled as in `packages.toml`; elsewhere it neither
+runs nor forgets when it last ran. `shell` picks what reads `run`: `sh` (the default),
+`powershell` (Windows PowerShell) or `pwsh` (PowerShell 7). PowerShell gets the script as
+`-EncodedCommand`, with `-NoProfile -NonInteractive` (and `-ExecutionPolicy Bypass` on
+Windows), so nothing in it is re-quoted on the way. A PowerShell hook fails the apply when
+its last command fails or it calls `exit` with a non-zero code.
+
+```toml
+[hooks.bat-themes]
+os = ["darwin", "linux"]
+when-changed = [".config/bat/themes"]
+run = "command -v bat >/dev/null && bat cache --build >/dev/null || true"
+
+[hooks.bat-themes-windows]
+os = ["windows"]
+shell = "powershell"
+when-changed = [".config/bat/themes"]
+run = "if (Get-Command bat -ErrorAction Ignore) { bat cache --build | Out-Null }"
+```
+
+sennit 0.21 and earlier refuse `os` and `shell`.
+
 ## File modes
 
 
@@ -534,8 +556,10 @@ read-only, as the read-only attribute, when their effective mode has no owner wr
 the default for generated output, 0444 or 0400. A `[merge]` output keeps the read-only
 attribute of the file it replaces.
 
-**Hooks run under Git for Windows' bash.** Hook scripts are written for a POSIX shell, so
-sennit runs `bash.exe -c "<run>"` from the first of these it finds:
+**Hooks run under Git for Windows' bash**, unless the hook says `shell = "powershell"` or
+`"pwsh"` (see [Running things after placing them](#running-things-after-placing-them)).
+Hook scripts are written for a POSIX shell by default, so sennit runs `bash.exe -c "<run>"`
+from the first of these it finds:
 
 1. the file named by the `SENNIT_SHELL` environment variable (any `bash.exe` or `sh.exe`);
 2. Git for Windows' `bin\bash.exe`, found from `git.exe` on `PATH`, then from

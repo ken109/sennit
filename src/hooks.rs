@@ -21,6 +21,31 @@ pub struct Hook {
     /// 実行するディレクトリ(リポジトリルートからの相対)。既定はルート。
     #[serde(default)]
     pub cwd: Option<String>,
+    /// この OS でだけ走らせる。空なら全 OS。packages.toml の `os` と同じ綴り
+    #[serde(default)]
+    pub os: Vec<String>,
+    /// `run` を解釈するシェル。既定は `sh`(Windows では Git for Windows の bash)
+    #[serde(default)]
+    pub shell: Option<String>,
+}
+
+/// `shell` に書けるもの。
+pub const SHELLS: [&str; 3] = ["sh", "powershell", "pwsh"];
+
+impl Hook {
+    /// 宣言の検査。読み込みで落とす。
+    pub fn validate(&self, name: &str) -> Result<()> {
+        crate::manifest::validate_os(&format!("hook `{name}`"), &self.os)?;
+        if let Some(sh) = &self.shell {
+            if !SHELLS.contains(&sh.as_str()) {
+                bail!(
+                    "hook `{name}` has an unknown shell `{sh}`; expected one of: {}",
+                    SHELLS.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 監視対象の現在の指紋。内容とパスの両方を見る。
@@ -93,6 +118,10 @@ pub fn run_all(
     let mut count = 0usize;
 
     for (name, hook) in hooks {
+        // ほかの OS 向けのフックは走らせず、指紋も前回のまま残す
+        if !crate::manifest::on_this_os(&hook.os) {
+            continue;
+        }
         let fp = fingerprint(root, &hook.when_changed);
         // when-changed が空なら毎回走らせる
         let changed = hook.when_changed.is_empty() || previous.get(name) != Some(&fp);
@@ -110,7 +139,7 @@ pub fn run_all(
             Some(c) => root.join(c),
             None => root.to_path_buf(),
         };
-        let status = crate::platform::shell(&hook.run)
+        let status = crate::platform::shell(hook.shell.as_deref().unwrap_or("sh"), &hook.run)
             .with_context(|| format!("hook `{name}`"))?
             .current_dir(&dir)
             .status()
@@ -145,6 +174,8 @@ mod tests {
                 when_changed: vec![],
                 run: "echo ran >> ran.txt".to_string(),
                 cwd: None,
+                os: vec![],
+                shell: None,
             },
         );
 
@@ -173,6 +204,8 @@ mod tests {
                 when_changed: vec!["watched".to_string()],
                 run: "echo ran >> ran.txt".to_string(),
                 cwd: None,
+                os: vec![],
+                shell: None,
             },
         );
 
@@ -203,10 +236,53 @@ mod tests {
                 when_changed: vec![],
                 run: "exit 3".to_string(),
                 cwd: None,
+                os: vec![],
+                shell: None,
             },
         );
         let e = run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap_err();
         assert!(format!("{e:#}").contains("boom"), "{e:#}");
+    }
+
+    /// ほかの OS 向けのフックは走らず、前回の指紋も消えない。
+    #[test]
+    fn a_hook_for_another_os_does_not_run() {
+        let dir = std::env::temp_dir().join("sennit-hook-os");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = if cfg!(windows) { "linux" } else { "windows" };
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "elsewhere".to_string(),
+            Hook {
+                when_changed: vec![],
+                run: "exit 3".to_string(),
+                cwd: None,
+                os: vec![other.to_string()],
+                shell: None,
+            },
+        );
+        let mut seen = BTreeMap::new();
+        seen.insert("elsewhere".to_string(), "kept".to_string());
+        let ran = run_all(&dir, &hooks, &seen, false).unwrap();
+        assert_eq!(ran.count, 0);
+        assert_eq!(ran.fingerprints["elsewhere"], "kept");
+    }
+
+    #[test]
+    fn an_unknown_shell_or_os_is_rejected() {
+        let h = |os: &[&str], shell: Option<&str>| Hook {
+            when_changed: vec![],
+            run: "true".into(),
+            cwd: None,
+            os: os.iter().map(|s| s.to_string()).collect(),
+            shell: shell.map(str::to_string),
+        };
+        assert!(h(&["windows"], Some("pwsh")).validate("x").is_ok());
+        let e = h(&[], Some("cmd")).validate("x").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown shell"), "{e:#}");
+        let e = h(&["win"], None).validate("x").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown os"), "{e:#}");
     }
 
     /// 同じ内容なら指紋も同じ。ここが揺れるとフックが毎回走ってしまう。
