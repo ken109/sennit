@@ -762,7 +762,6 @@ mod tests {
         m.render.insert("a.conf".into(), "a.conf.tmpl".into());
         assert!(m.is_template(Path::new("a.conf.tmpl")));
         assert!(!m.is_foreign_output(Path::new("a.conf")));
-        assert!(m.is_template(Path::new("a.conf.tmpl")));
         assert!(!m.is_template(Path::new("a.conf")));
     }
 

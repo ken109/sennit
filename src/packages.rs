@@ -201,7 +201,7 @@ impl Packages {
     /// Windows では winget の宣言が manager と名前(ID)を決める。宣言が無ければ
     /// mise だけが残り、brew / apt / yay は入れようがないので対象から外れる。
     pub fn installable(&self) -> Vec<Installable> {
-        let linux_pm = current_native_pm();
+        let native_pm = current_native_pm();
 
         let mut out: Vec<Installable> = self
             .packages
@@ -209,7 +209,7 @@ impl Packages {
             .filter(|(_, p)| !p.optional)
             .filter(|(_, p)| p.os.is_empty() || p.os.iter().any(|o| o == current_os()))
             .filter(|(_, p)| matches_profile(&p.profiles))
-            .filter_map(|(name, p)| resolve(name, p, linux_pm))
+            .filter_map(|(name, p)| resolve(name, p, native_pm))
             .filter(|i| {
                 !matches!(
                     i.manager,
