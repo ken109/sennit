@@ -2441,3 +2441,99 @@ fn a_forgotten_merge_claim_does_not_produce_a_second_backup() {
         .home_path(".claude/settings.json.sennit-backup.1")
         .exists());
 }
+
+/// The OS sennit runs on, spelled the way `os = [...]` spells it.
+fn this_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
+/// Some OS other than this one.
+fn other_os() -> &'static str {
+    if cfg!(windows) {
+        "linux"
+    } else {
+        "windows"
+    }
+}
+
+/// A `[render]` limited to another OS is neither generated nor placed here, even
+/// when an old output is sitting in the repository; its template is never placed.
+#[test]
+fn a_render_for_another_os_is_not_generated_or_placed() {
+    let r = Repo::new("render-os");
+    r.manifest(&format!(
+        r#"
+[link]
+common = ["conf"]
+
+[render]
+"conf/here.conf" = {{ from = "conf/here.conf.tmpl", os = ["{}"] }}
+"conf/there.conf" = {{ from = "conf/there.conf.tmpl", os = ["{}"] }}
+"#,
+        this_os(),
+        other_os()
+    ));
+    r.write("theme.toml", "bg = \"zzz\"\n");
+    r.write("conf/here.conf.tmpl", "x = {{ bg }}\n");
+    r.write("conf/there.conf.tmpl", "y = {{ bg }}\n");
+    // left over from another machine sharing the working tree
+    r.write("conf/there.conf", "stale\n");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(
+        out.contains("conf/here.conf") || out.contains("conf\\here.conf"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.home_path("conf/here.conf")).unwrap(),
+        "x = zzz\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.root_path("conf/there.conf")).unwrap(),
+        "stale\n",
+        "rendered an output declared for another OS"
+    );
+    for absent in [
+        "conf/there.conf",
+        "conf/there.conf.tmpl",
+        "conf/here.conf.tmpl",
+    ] {
+        assert!(
+            std::fs::symlink_metadata(r.home_path(absent)).is_err(),
+            "{absent} was placed"
+        );
+    }
+}
+
+/// `[link.ignore]` applies its `common` list everywhere and an OS list only on that OS.
+#[test]
+fn link_ignore_can_differ_per_os() {
+    let r = Repo::new("ignore-os");
+    r.manifest(&format!(
+        r#"
+[link]
+common = ["conf"]
+
+[link.ignore]
+common = ["*.bak"]
+{} = ["conf/mine"]
+{} = ["conf/theirs"]
+"#,
+        this_os(),
+        other_os()
+    ));
+    for f in ["conf/a.conf", "conf/a.bak", "conf/mine/x", "conf/theirs/y"] {
+        r.write(f, "x\n");
+    }
+    ok(&r.run(&["apply"]));
+    assert!(r.home_path("conf/a.conf").exists());
+    assert!(r.home_path("conf/theirs/y").exists());
+    assert!(std::fs::symlink_metadata(r.home_path("conf/a.bak")).is_err());
+    assert!(std::fs::symlink_metadata(r.home_path("conf/mine/x")).is_err());
+}

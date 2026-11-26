@@ -91,6 +91,18 @@ Directories are linked file by file rather than as a whole, so that a tool writi
 | `.claude/worktrees` | that path from the root, and everything under it |
 | `README.md`, `conf/nvim` | a plain name matches from the root only, as whole components |
 
+`ignore` can also differ per platform. Written as a table, it takes the same keys as the
+lists that say what to place: `common` applies everywhere, and `darwin`, `linux` and
+`windows` only there.
+
+```toml
+[link.ignore]
+common  = ["*.tmpl", "**/node_modules"]
+windows = [".config/zsh"]
+```
+
+The array form is the same as `common` alone. sennit 0.21 and earlier refuse the table.
+
 `*` and `?` stay within one path component; `**` as a whole component spans any number of
 them. A pattern with a slash is rooted at the repository. A pattern with a wildcard and no
 slash applies at any depth, as in gitignore. A plain name with neither is a rooted prefix
@@ -238,6 +250,21 @@ option_as_alt = "None"
 {{ end }}
 ```
 
+When a whole output belongs to some platforms only, say so instead of wrapping the file in a
+condition. The long form takes the template as `from` and the platforms as `os`, spelled as
+in `packages.toml`:
+
+```toml
+[render]
+".config/alacritty/alacritty.toml" = ".config/alacritty/alacritty.toml.tmpl"   # every OS
+".config/zsh/rc/theme.zsh" = { from = ".config/zsh/rc/theme.zsh.tmpl", os = ["darwin", "linux"] }
+```
+
+On any other platform the output is not generated, not linked even if an old copy is in the
+repository, and a template that reads secrets is not reported as deferred. The template
+itself is never placed, on any platform. sennit 0.21 and earlier refuse a manifest that uses
+the long form.
+
 `==`, `!=`, and a bare variable meaning "not empty". No loops, no functions, no pipelines
 — those are what turn a template into something you can no longer read as the file it
 produces. A block that disappears leaves the rest intact.
@@ -292,7 +319,7 @@ Templates see the same context, alongside whatever is in your data files:
 
 | | |
 |---|---|
-| `{{ sennit.os }}` | `darwin` or `linux` |
+| `{{ sennit.os }}` | `darwin`, `linux` or `windows` |
 | `{{ sennit.hostname }}` | short hostname |
 | `{{ sennit.profile }}` | the current profile list |
 | `{{ env.ANYTHING }}` | environment variables |

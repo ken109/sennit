@@ -100,7 +100,15 @@ impl Plan {
         // 生成物はまだディスクに無いことがある。クローン直後の diff / list が
         // 「これから作られて張られるもの」を数えないと、apply の結果と食い違う。
         // 宣言されている出力は、実体の有無に関わらず対象として数える。
-        for out in manifest.render.keys().chain(manifest.encrypted.keys()) {
+        let renders: Vec<&str> = manifest
+            .renders_here()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
+        for out in renders
+            .into_iter()
+            .chain(manifest.encrypted.keys().map(String::as_str))
+        {
             let rel = Path::new(out);
             if entries.iter().any(|e| e.rel == rel) {
                 continue;
@@ -137,6 +145,7 @@ impl Plan {
         //
         // [merge] の入力も同じ。共有設定そのものを $HOME に出す理由が無い。
         if manifest.is_template(rel)
+            || manifest.is_foreign_output(rel)
             || manifest.is_ciphertext(rel)
             || manifest.is_merge_source(rel)
             || manifest.is_ignored(rel)
