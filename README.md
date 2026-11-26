@@ -142,8 +142,9 @@ in each platform's list. Everything else — `ignore`, `[render]`, `[modes]` —
 the path in the repository. When several entries contain a file, the deepest one decides
 where it goes, and two entries that would put files at the same place are refused before
 anything is linked. Moving or removing a `to` prunes the links at the old place, which is
-recorded in the state for that purpose. sennit 0.21 and earlier refuse a manifest that uses
-the table form.
+recorded in the state for that purpose. `to` must name something under its folder: `{home}`, `.` or `{appdata}` alone,
+and `{appdata}herdr` without the `/`, are refused. sennit 0.21 and earlier refuse a
+manifest that uses the table form.
 
 `packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
 and `sync`; `apply` does not read it. What was linked is recorded in
@@ -216,7 +217,7 @@ Two kinds of link are left alone:
 
 `apply` never destroys a file you wrote. When something that is not a symlink is sitting
 where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
-`sennit rollback` puts it back. Directories are moved whole. The record is written the
+`sennit rollback` puts it back. The record is written the
 moment a file is moved, and accumulates across applies, so neither a later apply nor a
 failure partway through can strand a file you can no longer find.
 
@@ -226,8 +227,14 @@ idempotent: running it twice does not put an older file back over the one it jus
 restored. And if you wrote something new at that path after the apply, it is moved aside
 too rather than overwritten — restoring a backup should not cost you a different file.
 
-`--no-backup` opts out, and is the only way sennit itself discards a file; on a directory
-it removes the whole tree, and says how many files that is.
+`--no-backup` opts out, and is the only way sennit itself discards a file.
+
+A real directory where a file is to be linked is neither moved aside nor removed:
+`apply` (and `--dry-run`, `diff`) refuses before linking anything, and names both. Moving
+the directory would take everything else in it along — `{ path = "starship.toml", to =
+".config" }` would have moved all of `~/.config`. Up to 0.21 the directory was moved whole,
+or with `--no-backup` deleted. For the same reason a `to` that names the folder itself —
+`{home}`, `.`, `{documents}` — is refused when the manifest loads.
 
 It also remembers what it linked. A path that was linked last time and is no longer
 declared gets its symlink removed, so dropping a config from the repository does not leave

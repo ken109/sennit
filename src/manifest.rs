@@ -189,6 +189,20 @@ impl From<&str> for Target {
 
 /// `to` を「既知のフォルダ」と「その下のパス」に分ける。
 /// `{documents}/PowerShell` -> (Some("documents"), "PowerShell")、`a/b` -> (None, "a/b")
+/// [`split_to`] の検査つき。フォルダの直後は `/` か終わりでなければならない
+/// (`{appdata}herdr` は書き損じ)。
+pub fn checked_folder(what: &str, s: &str) -> Result<()> {
+    if let Some(rest) = s.strip_prefix('{') {
+        if let Some(end) = rest.find('}') {
+            let after = &rest[end + 1..];
+            if !after.is_empty() && !after.starts_with('/') {
+                bail!("{what}: `{s}` needs a `/` after `{}`", &s[..end + 2]);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn split_to(to: &str) -> (Option<&str>, &str) {
     if let Some(rest) = to.strip_prefix('{') {
         if let Some(end) = rest.find('}') {
@@ -297,7 +311,22 @@ impl Manifest {
             for t in items {
                 paths.push(("link", &t.path));
                 let Some(to) = &t.to else { continue };
+                checked_folder(&format!("link `{}`", t.path), to)?;
                 let (folder, rest) = split_to(to);
+                // 配置先が $HOME やフォルダそのものだと、ファイル 1 つを置くために
+                // その中身ごと退避・削除してしまう(`to = "{home}"`)。空は下の
+                // パスの検査が断る
+                if !to.is_empty()
+                    && !Path::new(rest)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    bail!(
+                        "link `{}` is placed at `{to}`, which is the folder itself; \
+                         sennit would replace everything in it. Name a path under it",
+                        t.path
+                    );
+                }
                 if let Some(f) = folder {
                     if !crate::platform::KNOWN_FOLDERS.contains(&f) {
                         bail!(
@@ -1020,7 +1049,34 @@ mod tests {
             assert!(format!("{e:#}").contains(want), "{toml}: {e:#}");
         }
         assert!(load("[link]\nwindows = [{ path = \"a\", to = \"{appdata}/a\" }]\n").is_ok());
-        assert!(load("[link]\nwindows = [{ path = \"a\", to = \"{documents}\" }]\n").is_ok());
+        assert!(load("[link]\nwindows = [{ path = \"a\", to = \"{documents}/a\" }]\n").is_ok());
+        // 配置先がフォルダそのもの(=$HOME やその根)
+        for (list, to) in [
+            ("common", "{home}"),
+            ("common", "{home}/"),
+            ("common", "."),
+            ("common", "./"),
+            ("common", "a/.."),
+            ("windows", "{documents}"),
+            ("windows", "{appdata}/"),
+            ("windows", "{localappdata}"),
+        ] {
+            let e = load(&format!(
+                "[link]\n{list} = [{{ path = \"a\", to = \"{to}\" }}]\n"
+            ))
+            .unwrap_err();
+            let e = format!("{e:#}");
+            assert!(
+                e.contains("the folder itself") || e.contains(".."),
+                "{to}: {e}"
+            );
+        }
+        let e =
+            load("[link]\nwindows = [{ path = \"a\", to = \"{appdata}herdr\" }]\n").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("needs a `/` after `{appdata}`"),
+            "{e:#}"
+        );
     }
 
     #[test]

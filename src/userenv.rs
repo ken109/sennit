@@ -82,6 +82,7 @@ impl EnvDecl {
             if value.contains('\0') {
                 bail!("[env.windows] `{name}` contains a NUL");
             }
+            crate::manifest::checked_folder(&format!("[env.windows] `{name}`"), value)?;
             if let (Some(folder), _) = crate::manifest::split_to(value) {
                 if !crate::platform::KNOWN_FOLDERS.contains(&folder) {
                     bail!(

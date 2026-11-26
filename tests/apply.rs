@@ -2690,3 +2690,60 @@ SENNIT_TEST_INTEGRATION = "{home}/.config"
         "{text}"
     );
 }
+
+/// A `to` that is the home directory (or a folder) itself is refused when the
+/// manifest is read. Placing a file there would replace the whole directory:
+/// with `--no-backup`, everything in it was deleted.
+#[test]
+fn a_destination_that_is_the_home_directory_itself_is_refused() {
+    for to in ["{home}", "{home}/", ".", "./"] {
+        let r = Repo::new("to-home-itself");
+        r.write("profile.ps1", "x\n");
+        r.write_home("keep.txt", "mine\n");
+        r.manifest(&format!(
+            "[link]\ncommon = [{{ path = \"profile.ps1\", to = \"{to}\" }}]\n"
+        ));
+        let out = r.run(&["apply", "--no-backup"]);
+        assert!(!out.status.success(), "{to}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("the folder itself"), "{to}: {err}");
+        assert_eq!(
+            std::fs::read_to_string(r.home_path("keep.txt")).unwrap(),
+            "mine\n",
+            "{to}"
+        );
+    }
+}
+
+/// A file is never placed over a real directory, by `to` or by its own path:
+/// the directory (here all of `~/.config`) is neither moved aside nor deleted.
+#[test]
+fn a_file_is_not_placed_over_a_directory() {
+    let r = Repo::new("file-over-dir");
+    r.write("starship.toml", "x\n");
+    r.write_home(".config/other/config", "mine\n");
+    r.manifest("[link]\ncommon = [{ path = \"starship.toml\", to = \".config\" }]\n");
+    for args in [
+        &["apply", "--no-backup"][..],
+        &["apply"][..],
+        &["apply", "--dry-run"][..],
+    ] {
+        let out = r.run(args);
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("is a directory"), "{args:?}: {err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(r.home_path(".config/other/config")).unwrap(),
+        "mine\n"
+    );
+
+    // the same through the file's own path
+    let r = Repo::new("file-over-dir-plain");
+    r.write("a", "x\n");
+    r.write_home("a/keep", "mine\n");
+    r.manifest("[link]\ncommon = [\"a\"]\n");
+    let out = r.run(&["apply", "--no-backup"]);
+    assert!(!out.status.success());
+    assert!(r.home_path("a/keep").exists());
+}

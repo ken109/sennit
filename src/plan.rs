@@ -170,6 +170,19 @@ impl Plan {
             );
         }
         let place = manifest.placement(dirs, rel)?;
+        // 読み込みの検査で断っているが、ここでも確かめる。配置先がフォルダそのものだと
+        // apply はそのフォルダを退避するか消してから張る
+        if !place
+            .under
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            anyhow::bail!(
+                "`{}` would be placed at {} itself",
+                rel.display(),
+                place.base.display()
+            );
+        }
         let src = crate::platform::native(&root.join(rel));
         let dest = crate::platform::native(&place.base.join(&place.under));
         // 2 つの項目が同じ場所へ置こうとすると、後の方が EEXIST で落ちるか、
@@ -189,6 +202,19 @@ impl Plan {
             Some(link) => State::Ancestor { link },
             None => inspect(&src, &dest),
         };
+        // 置くのはファイル。そこに実ディレクトリがあるなら、退避も削除もしない。
+        // ディレクトリごと退避すると、中のほかの設定(~/.config 全体など)まで
+        // 巻き込む。`to` の書き損じ(`{ path = "starship.toml", to = ".config" }`)で起きる
+        if state == State::Occupied
+            && std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_dir())
+        {
+            anyhow::bail!(
+                "`{}` is a file, but {} is a directory; sennit does not move a directory \
+                 aside to put a file there. Check the declaration, or move the directory yourself",
+                rel.display(),
+                dest.display()
+            );
+        }
         entries.push(Entry {
             rel: rel.to_path_buf(),
             src,
