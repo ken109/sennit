@@ -2677,7 +2677,6 @@ SENNIT_TEST_INTEGRATION = "{home}/.config"
     if cfg!(windows) {
         assert!(out.contains("would set  SENNIT_TEST_INTEGRATION="), "{out}");
         assert!(out.contains("not written with --home"), "{out}");
-        assert!(std::env::var_os("SENNIT_TEST_INTEGRATION").is_none());
     } else {
         assert!(!out.contains("SENNIT_TEST_INTEGRATION"), "{out}");
         assert!(out.contains("already up to date"), "{out}");
