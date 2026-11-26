@@ -695,7 +695,10 @@ mod tests {
         let p = parse("[packages]\nbat = {}\nfd = { winget = \"sharkdp.fd\" }\n");
         let i = p.installable();
         assert_eq!(i.len(), 1);
-        assert_eq!((i[0].manager, i[0].name.as_str()), (Manager::Winget, "sharkdp.fd"));
+        assert_eq!(
+            (i[0].manager, i[0].name.as_str()),
+            (Manager::Winget, "sharkdp.fd")
+        );
     }
 }
 

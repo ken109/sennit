@@ -2618,3 +2618,43 @@ windows = [{ path = "win/PowerShell", to = "{documents}/PowerShell" }]
     let placed = r.home_path("Documents/PowerShell/profile.ps1");
     assert_eq!(std::fs::symlink_metadata(&placed).is_ok(), cfg!(windows));
 }
+
+/// A hook can be limited to one platform, and can be written for PowerShell.
+#[test]
+fn a_hook_runs_only_on_its_os_and_under_its_shell() {
+    let r = Repo::new("hook-os-shell");
+    let ps = if cfg!(windows) {
+        // Windows PowerShell is always there
+        r#"
+[hooks.ps]
+os = ["windows"]
+shell = "powershell"
+run = '''Set-Content -Path ps.txt -Value "it's $($PSVersionTable.PSEdition)"'''
+"#
+    } else {
+        ""
+    };
+    r.manifest(&format!(
+        r#"
+[link]
+common = []
+
+[hooks.elsewhere]
+os = ["{}"]
+run = "echo ran > elsewhere.txt"
+
+[hooks.here]
+os = ["{}"]
+run = "echo ran > here.txt"
+{ps}"#,
+        other_os(),
+        this_os()
+    ));
+    ok(&r.run(&["apply"]));
+    assert!(r.root_path("here.txt").exists());
+    assert!(!r.root_path("elsewhere.txt").exists());
+    if cfg!(windows) {
+        let got = std::fs::read_to_string(r.root_path("ps.txt")).unwrap();
+        assert_eq!(got.trim(), "it's Desktop");
+    }
+}

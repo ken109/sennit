@@ -381,6 +381,9 @@ impl Manifest {
         for (out, r) in &self.render {
             validate_os(&format!("render output `{out}`"), r.os())?;
         }
+        for (name, h) in &self.hooks {
+            h.validate(name)?;
+        }
 
         for (name, probe) in &self.probes {
             probe.validate(name)?;

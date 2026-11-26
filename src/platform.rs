@@ -432,26 +432,67 @@ pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// A command that runs `script` with a POSIX shell: `sh -c` on Unix.
+/// A command that runs `script` with the hook's `shell`.
 ///
-/// Windows has none of its own. Hooks are written for a POSIX shell, so Git
-/// for Windows' bash is used. `bash` on `PATH` is not trusted: on a machine
-/// with WSL it is the launcher in `System32`, which runs the script inside a
-/// Linux VM where the repository's Windows paths mean nothing.
-pub fn shell(script: &str) -> Result<Command> {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(script);
-        Ok(c)
+/// `sh` (the default) is `sh -c` on Unix. Windows has none of its own; hooks
+/// written for a POSIX shell run under Git for Windows' bash. `bash` on `PATH`
+/// is not trusted: on a machine with WSL it is the launcher in `System32`, which
+/// runs the script inside a Linux VM where the repository's Windows paths mean
+/// nothing.
+///
+/// `powershell` (Windows PowerShell) and `pwsh` (PowerShell 7) get the script
+/// as `-EncodedCommand`, so no quoting in it is reinterpreted on the way.
+pub fn shell(kind: &str, script: &str) -> Result<Command> {
+    match kind {
+        "powershell" | "pwsh" => {
+            let mut c = Command::new(kind);
+            c.args(["-NoProfile", "-NonInteractive"]);
+            if cfg!(windows) {
+                c.args(["-ExecutionPolicy", "Bypass"]);
+            }
+            c.arg("-EncodedCommand").arg(encode_command(script));
+            Ok(c)
+        }
+        "sh" => {
+            #[cfg(unix)]
+            {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(script);
+                Ok(c)
+            }
+            #[cfg(windows)]
+            {
+                let sh = windows_shell()?;
+                let mut c = Command::new(sh);
+                c.arg("-c").arg(script);
+                Ok(c)
+            }
+        }
+        other => bail!("unknown shell `{other}`"),
     }
-    #[cfg(windows)]
-    {
-        let sh = windows_shell()?;
-        let mut c = Command::new(sh);
-        c.arg("-c").arg(script);
-        Ok(c)
+}
+
+/// What `-EncodedCommand` takes: the script as UTF-16LE, in base64.
+pub fn encode_command(script: &str) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
     }
+    out
 }
 
 #[cfg(windows)]
@@ -610,5 +651,17 @@ mod tests {
             Path::new(r"C:\Repo2\a"),
             Path::new(r"C:\Repo")
         ));
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    #[test]
+    fn a_script_is_encoded_as_utf16_base64() {
+        // [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('echo hi'))
+        assert_eq!(super::encode_command("echo hi"), "ZQBjAGgAbwAgAGgAaQA=");
+        assert_eq!(super::encode_command(""), "");
+        assert_eq!(super::encode_command("a"), "YQA=");
+        assert_eq!(super::encode_command("日本"), "5WUsZw==");
     }
 }
