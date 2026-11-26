@@ -189,6 +189,19 @@ impl From<&str> for Target {
 
 /// `to` を「既知のフォルダ」と「その下のパス」に分ける。
 /// `{documents}/PowerShell` -> (Some("documents"), "PowerShell")、`a/b` -> (None, "a/b")
+/// `to` が $HOME の下のどこを指すか。フォルダは既定の場所で読む
+/// (`{appdata}/x` は `AppData/Roaming/x`)。宣言どうしを比べるためのもの。
+fn default_place(to: &str) -> PathBuf {
+    let (folder, rest) = split_to(to);
+    let base = match folder {
+        Some("appdata") => PathBuf::from("AppData/Roaming"),
+        Some("localappdata") => PathBuf::from("AppData/Local"),
+        Some("documents") => PathBuf::from("Documents"),
+        _ => PathBuf::new(),
+    };
+    base.join(rest)
+}
+
 /// [`split_to`] の検査つき。フォルダの直後は `/` か終わりでなければならない
 /// (`{appdata}herdr` は書き損じ)。
 pub fn checked_folder(what: &str, s: &str) -> Result<()> {
@@ -467,9 +480,7 @@ impl Manifest {
                 .chain(&self.link.windows)
                 .any(|t| {
                     Path::new(&t.path) == rel
-                        || t.to.as_deref().is_some_and(|to| {
-                            matches!(split_to(to), (None | Some("home"), r) if Path::new(r) == rel)
-                        })
+                        || t.to.as_deref().is_some_and(|to| default_place(to) == rel)
                 })
             {
                 bail!("merge output `{out}` is also declared under [link]; sennit would both link and rewrite it");
@@ -1096,6 +1107,12 @@ mod tests {
     fn a_merge_output_that_a_link_is_placed_at_is_rejected() {
         let e = load(
             "[link]\ncommon = [{ path = \"s\", to = \".claude/settings.json\" }]\n\n[merge.\".claude/settings.json\"]\nfrom = \"s.json\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[link]"), "{e:#}");
+        // フォルダを通しても同じ場所
+        let e = load(
+            "[link]\nwindows = [{ path = \"s\", to = \"{appdata}/x/s.json\" }]\n\n[merge.\"AppData/Roaming/x/s.json\"]\nfrom = \"m.json\"\n",
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("[link]"), "{e:#}");
