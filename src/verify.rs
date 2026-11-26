@@ -248,7 +248,10 @@ fn verify_machine(
         }
     }
 
-    if missing.is_empty() && wrong_modes.is_empty() && bad_merges == 0 {
+    // [env.windows] がユーザー環境変数と食い違っていないか
+    let bad_env = crate::userenv::verify(&manifest.env, dirs)?;
+
+    if missing.is_empty() && wrong_modes.is_empty() && bad_merges == 0 && bad_env == 0 {
         println!("\x1b[32mok\x1b[0m  everything verifiable is present");
         return Ok(());
     }
@@ -264,6 +267,9 @@ fn verify_machine(
     }
     if bad_merges > 0 {
         problems.push(format!("{bad_merges} merged file(s) out of date"));
+    }
+    if bad_env > 0 {
+        problems.push(format!("{bad_env} environment variable(s) not as declared"));
     }
     bail!("{}", problems.join("; "))
 }

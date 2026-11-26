@@ -2658,3 +2658,35 @@ run = "echo ran > here.txt"
         assert_eq!(got.trim(), "it's Desktop");
     }
 }
+
+/// `[env.windows]` is never written with `--home`: on Windows apply only says
+/// what it would set, and elsewhere the table does nothing at all.
+#[test]
+fn env_is_only_previewed_with_a_given_home() {
+    let r = Repo::new("env-windows");
+    r.manifest(
+        r#"
+[link]
+common = []
+
+[env.windows]
+SENNIT_TEST_INTEGRATION = "{home}/.config"
+"#,
+    );
+    let out = ok(&r.run(&["apply"]));
+    if cfg!(windows) {
+        assert!(out.contains("would set  SENNIT_TEST_INTEGRATION="), "{out}");
+        assert!(out.contains("not written with --home"), "{out}");
+        assert!(std::env::var_os("SENNIT_TEST_INTEGRATION").is_none());
+    } else {
+        assert!(!out.contains("SENNIT_TEST_INTEGRATION"), "{out}");
+        assert!(out.contains("already up to date"), "{out}");
+    }
+    let out = r.run(&["verify"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.contains("not checked with --home"),
+        cfg!(windows),
+        "{text}"
+    );
+}

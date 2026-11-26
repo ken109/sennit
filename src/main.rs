@@ -13,6 +13,7 @@ mod probe;
 mod render;
 mod state;
 mod sync;
+mod userenv;
 mod verify;
 
 use anyhow::{bail, Context, Result};
@@ -882,6 +883,8 @@ fn apply(
     }
 
     if dry_run {
+        // 環境変数は書かず、何を書くかだけ出す
+        let env_set = userenv::apply(&manifest.env, dirs, true)?;
         // フックは実際には走らせず、何が走るかだけ出す
         hooks::run_all(root, &manifest.hooks, &previous.hooks, true)?;
         // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
@@ -901,7 +904,7 @@ fn apply(
         )?;
         println!(
             "\n{} change(s), {} prune(s), nothing written (--dry-run)",
-            changes.len() + not_yet.len() + merging,
+            changes.len() + not_yet.len() + merging + env_set,
             pruned
         );
         return Ok(());
@@ -949,6 +952,10 @@ fn apply(
     // ファイルはここでしか直せない。
     let fixed = enforce_modes(root, home, manifest, false)?;
 
+    // ユーザー環境変数(Windows)。フックのまえ: 取り込む道具が設定の場所を
+    // 環境変数で知ることがある(BAT_CONFIG_DIR で bat cache --build)
+    let env_set = userenv::apply(&manifest.env, dirs, false)?;
+
     // 配置のあとにフックを走らせる。設定を置いてから取り込む処理なので、
     // 順序が逆だと参照先がまだ無い。
     //
@@ -969,7 +976,13 @@ fn apply(
     }
     .save(home)?;
 
-    if changes.is_empty() && pruned == 0 && fixed == 0 && ran.count == 0 && merging == 0 {
+    if changes.is_empty()
+        && pruned == 0
+        && fixed == 0
+        && ran.count == 0
+        && merging == 0
+        && env_set == 0
+    {
         if not_yet.is_empty() {
             println!("already up to date ({} links)", plan.entries.len());
         } else {
@@ -995,6 +1008,13 @@ fn apply(
     }
     if !not_yet.is_empty() {
         println!("{} not generated yet, so not linked", not_yet.len());
+    }
+    if env_set > 0 {
+        if dirs.is_real() {
+            println!("{env_set} environment variable(s) set");
+        } else {
+            println!("{env_set} environment variable(s) not set (--home)");
+        }
     }
     if !kept.is_empty() {
         println!(

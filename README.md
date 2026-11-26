@@ -543,6 +543,42 @@ With `--home`, they are the folders' default places under that directory
 (`AppData\Roaming`, `AppData\Local`, `Documents`), so a trial run against a scratch
 directory never reaches your real profile.
 
+**User environment variables.** Some tools only find their config through a variable —
+on Windows, bat reads `%APPDATA%\bat` unless `BAT_CONFIG_DIR` says otherwise, and git,
+lazygit and nvim look under `~/.config` only when `XDG_CONFIG_HOME` is set. `[env.windows]`
+declares them:
+
+```toml
+[env.windows]
+XDG_CONFIG_HOME   = "{home}/.config"
+BAT_CONFIG_DIR    = "{home}/.config/bat"
+HERDR_CONFIG_PATH = "{appdata}/herdr/config.toml"
+GH_CONFIG_DIR     = { value = "{appdata}/GitHub CLI", if-unset = true }
+```
+
+- A value that starts with a folder (`{home}`, `{appdata}`, `{localappdata}`,
+  `{documents}`, found as for `to`) is a path, and every `/` in it becomes `\`. Any other
+  value is written exactly as given.
+- `apply` writes each value that differs to `HKCU\Environment` as `REG_SZ`, then broadcasts
+  `WM_SETTINGCHANGE` so Explorer — and the terminals it starts afterwards — pick them up.
+  Terminals already open keep their old environment. Hooks in the same `apply` already see
+  the new values.
+- `if-unset = true` sets the variable only when the user has none; a value of their own is
+  left alone, and `verify` accepts it.
+- `verify` reports a variable that is unset or holds something else.
+- With `--home`, nothing is written: there is one user environment, and a trial run must not
+  point it at a scratch directory. `apply` prints what it would set, and `verify` skips the
+  check. `--dry-run` prints the same.
+- `Path` cannot be declared: as a single `REG_SZ` it would replace the whole user `Path`,
+  including what installers appended to it.
+- Removing a variable from `[env.windows]` does not unset it.
+
+**On macOS and Linux, `[env]` does nothing.** There is no user environment to write to
+there — a shell's environment comes from its startup files, which sennit already places —
+so the only table is `windows` (`[env.darwin]` is refused as an unknown key), and `apply`
+and `verify` ignore it on other platforms. sennit 0.21 and earlier refuse a manifest with
+`[env]`.
+
 **Paths.** Link targets are written with backslashes and without the `\\?\` prefix that
 Windows' path resolution adds. A link that already points at the right file is recognised
 whatever its case or separators, so `C:/Repo/a` and `c:\repo\a` are the same place.
