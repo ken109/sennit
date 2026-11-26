@@ -33,6 +33,134 @@ pub fn home_dir() -> Result<PathBuf> {
     }
 }
 
+/// Where things are placed: the home directory, and the folders a `to = "{name}/..."`
+/// in `[link]` can name.
+///
+/// On Windows the known folders (`{appdata}`, `{localappdata}`, `{documents}`) are
+/// asked of the shell, since they can be moved: Documents often lives in OneDrive.
+/// That is only right for the real home directory. With `--home` (a scratch
+/// directory, a test) they are the folders' default places under it, so a trial run
+/// never reaches the real profile.
+#[derive(Debug, Clone)]
+pub struct Dirs {
+    pub home: PathBuf,
+    /// `home` is the real home directory (no `--home`). Only Windows asks the
+    /// shell for its folders.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    real: bool,
+}
+
+/// The folder names `to` and `[env]` values can start with.
+pub const KNOWN_FOLDERS: [&str; 4] = ["home", "appdata", "localappdata", "documents"];
+
+/// The folders that exist only on Windows.
+pub fn windows_only_folder(name: &str) -> bool {
+    matches!(name, "appdata" | "localappdata" | "documents")
+}
+
+impl Dirs {
+    pub fn new(home: PathBuf, real: bool) -> Self {
+        Dirs { home, real }
+    }
+
+    /// The folder `{name}` stands for.
+    pub fn known(&self, name: &str) -> Result<PathBuf> {
+        let default = match name {
+            "home" => return Ok(self.home.clone()),
+            "appdata" => self.home.join("AppData").join("Roaming"),
+            "localappdata" => self.home.join("AppData").join("Local"),
+            "documents" => self.home.join("Documents"),
+            _ => bail!(
+                "unknown folder `{{{name}}}`; expected one of {}",
+                KNOWN_FOLDERS
+                    .iter()
+                    .map(|f| format!("{{{f}}}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        #[cfg(windows)]
+        if self.real {
+            return known_folder::get(name).map_err(|e| {
+                e.context(format!("failed to resolve the Windows folder {{{name}}}"))
+            });
+        }
+        Ok(default)
+    }
+}
+
+/// SHGetKnownFolderPath, without pulling in a crate for one call.
+#[cfg(windows)]
+mod known_folder {
+    use anyhow::{bail, Result};
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const Guid,
+            flags: u32,
+            token: *mut core::ffi::c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(p: *mut core::ffi::c_void);
+    }
+
+    // KnownFolders.h
+    const ROAMING_APP_DATA: Guid = Guid(
+        0x3EB685DB,
+        0x65F9,
+        0x4CF6,
+        [0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D],
+    );
+    const LOCAL_APP_DATA: Guid = Guid(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        [0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91],
+    );
+    const DOCUMENTS: Guid = Guid(
+        0xFDD39AD0,
+        0x238F,
+        0x46AF,
+        [0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7],
+    );
+
+    pub fn get(name: &str) -> Result<PathBuf> {
+        let id = match name {
+            "appdata" => &ROAMING_APP_DATA,
+            "localappdata" => &LOCAL_APP_DATA,
+            "documents" => &DOCUMENTS,
+            _ => bail!("not a known folder: {name}"),
+        };
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `id` is a valid GUID; `raw` receives a buffer that is freed below
+        // whatever the result, as the documentation requires.
+        let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
+        let path = if hr == 0 && !raw.is_null() {
+            // SAFETY: on success `raw` is a NUL-terminated wide string
+            let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+            let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+            Some(PathBuf::from(OsString::from_wide(wide)))
+        } else {
+            None
+        };
+        unsafe { CoTaskMemFree(raw.cast()) };
+        match path {
+            Some(p) => Ok(p),
+            None => bail!("SHGetKnownFolderPath failed with 0x{:08X}", hr as u32),
+        }
+    }
+}
+
 /// Like `std::fs::canonicalize`, but never returns a `\\?\` path on Windows.
 /// Those are valid but unreadable in messages, and they do not compare equal to
 /// the same path spelled normally.

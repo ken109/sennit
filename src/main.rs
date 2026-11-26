@@ -140,8 +140,12 @@ fn run() -> Result<()> {
     let root = absolute(&root).with_context(|| format!("bad --root: {}", root.display()))?;
     let home = absolute(&home).with_context(|| format!("bad --home: {}", home.display()))?;
 
+    // 既知のフォルダ({documents} など)は、本物の $HOME のときだけ OS に訊く。
+    // --home を渡した試しの実行が、本物のプロファイルに張りに行かないように
+    let dirs = platform::Dirs::new(home.clone(), cli.home.is_none());
+
     let manifest = Manifest::load(&root.join("sennit.toml"))?;
-    let plan = Plan::build(&root, &home, &manifest)?;
+    let plan = Plan::build(&root, &dirs, &manifest)?;
 
     match cli.command {
         Command::Apply {
@@ -153,15 +157,15 @@ fn run() -> Result<()> {
             let merges = merge::plan(&root, &home, &manifest)?;
             // 生成物はコミットしないので、配置の前に必ず作る
             let produced = render_all(&root, &manifest, secrets, dry_run)?;
-            let plan = Plan::build(&root, &home, &manifest)?;
+            let plan = Plan::build(&root, &dirs, &manifest)?;
             apply(
-                &plan, &merges, &root, &home, &manifest, dry_run, !no_backup, &produced,
+                &plan, &merges, &root, &dirs, &manifest, dry_run, !no_backup, &produced,
             )
         }
         Command::Rollback { dry_run } => rollback(&home, dry_run),
         Command::Diff => {
             let merges = merge::plan(&root, &home, &manifest)?;
-            plan::note_outside_top_levels(&root, &home, &manifest);
+            plan::note_outside_top_levels(&root, &dirs, &manifest);
             let env = merge::Env::new(&root, &home, &manifest, &plan, &state::State::load(&home)?);
             print_diff(&plan, &merges, &env);
             Ok(())
@@ -169,7 +173,7 @@ fn run() -> Result<()> {
         Command::Check => check(&root),
         Command::Render { secrets } => render_all(&root, &manifest, secrets, false).map(|_| ()),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
-        Command::Verify { export, secrets } => verify::verify(&root, &home, export, secrets),
+        Command::Verify { export, secrets } => verify::verify(&root, &dirs, export, secrets),
         // 先に捌いてある
         Command::Compare { .. } => unreachable!(),
         Command::Audit { history } => audit::audit(&root, history),
@@ -643,7 +647,7 @@ fn apply(
     plan: &Plan,
     merges: &[merge::Planned],
     root: &Path,
-    home: &Path,
+    dirs: &platform::Dirs,
     manifest: &Manifest,
     dry_run: bool,
     backup: bool,
@@ -651,9 +655,12 @@ fn apply(
     // 「まだ無い」と「これから作られる」を取り違えないために要る。
     produced: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<()> {
+    let home = dirs.home.as_path();
     let previous = state::State::load(home)?;
+    // `to` で置いたものの配置先。state に毎回書き、次の prune が場所を知るのに使う
+    let placed_elsewhere = plan.placed_elsewhere(home);
 
-    plan::note_outside_top_levels(root, home, manifest);
+    plan::note_outside_top_levels(root, dirs, manifest);
 
     // 「張れる状態にあるか」を 1 か所で決める。
     //
@@ -682,7 +689,13 @@ fn apply(
             current.push(e.rel.clone());
         }
     }
-    let stale = previous.stale(&current);
+    let current_dests: Vec<(PathBuf, PathBuf)> = plan
+        .entries
+        .iter()
+        .filter(|e| current.contains(&e.rel))
+        .map(|e| (e.rel.clone(), e.dest.clone()))
+        .collect();
+    let stale = previous.stale_dests(home, &current_dests);
 
     // 宣言されている生成物は、まだ作られていないことがある。秘密を読む
     // テンプレートは --secrets を渡すまで飛ばされるので、その状態で張ると
@@ -721,15 +734,14 @@ fn apply(
     // 消してよいのは自分が張ったリンクだけ。管理をやめた後に利用者が
     // 別の場所を指すリンクを自分で張り直していることがあり、それを
     // 「前回の記録に載っている」というだけで消すのは越権になる。
-    for rel in &stale {
-        let dest = home.join(rel);
-        let Ok(meta) = std::fs::symlink_metadata(&dest) else {
+    for (rel, dest) in &stale {
+        let Ok(meta) = std::fs::symlink_metadata(dest) else {
             continue;
         };
         if !meta.file_type().is_symlink() {
             continue;
         }
-        if !plan::link_into_repo(root, &dest) {
+        if !plan::link_into_repo(root, dest) {
             println!(
                 "  {:>8}  {}  (points outside the repository; left alone)",
                 "keep",
@@ -740,7 +752,7 @@ fn apply(
         println!("  {:>8}  {}", "prune", rel.display());
         pruned += 1;
         if !dry_run {
-            platform::remove_link(&dest)
+            platform::remove_link(dest)
                 .with_context(|| format!("failed to remove {}", dest.display()))?;
         }
     }
@@ -781,7 +793,7 @@ fn apply(
             // もう一度書く。そのとき state の保存がディレクトリを先に作っていても
             // 落ちないよう、作るのは create_dir_all で。
             if let State::Ancestor { .. } = &e.state {
-                while let Some(link) = plan::ancestor_link(root, home, &e.rel, manifest) {
+                while let Some(link) = plan.ancestor_link(root, e) {
                     let aside = if backup && !plan::link_into_repo(root, &link) {
                         let to = backup_path(&link)?;
                         kept.push(state::Backup {
@@ -798,6 +810,7 @@ fn apply(
                             backups: kept.to_vec(),
                             hooks: previous.hooks.clone(),
                             merged: previous.merged.clone(),
+                            placed: placed_elsewhere.clone(),
                         }
                         .save(home)
                     };
@@ -840,6 +853,7 @@ fn apply(
                     backups: kept.clone(),
                     hooks: previous.hooks.clone(),
                     merged: previous.merged.clone(),
+                    placed: placed_elsewhere.clone(),
                 }
                 .save(home)?;
             }
@@ -859,6 +873,7 @@ fn apply(
                     backups: kept.clone(),
                     hooks: previous.hooks.clone(),
                     merged: previous.merged.clone(),
+                    placed: placed_elsewhere.clone(),
                 }
                 .save(home)?;
                 return Err(err);
@@ -901,6 +916,7 @@ fn apply(
         backups: kept.clone(),
         hooks: previous.hooks.clone(),
         merged: previous.merged.clone(),
+        placed: placed_elsewhere.clone(),
     }
     .save(home)?;
 
@@ -922,6 +938,7 @@ fn apply(
                 backups: kept.to_vec(),
                 hooks: previous.hooks.clone(),
                 merged: merged.to_vec(),
+                placed: placed_elsewhere.clone(),
             }
             .save(home)
         },
@@ -948,6 +965,7 @@ fn apply(
         backups: kept.clone(),
         hooks: hooks.clone(),
         merged,
+        placed: placed_elsewhere,
     }
     .save(home)?;
 
