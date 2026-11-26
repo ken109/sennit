@@ -40,6 +40,8 @@ pub enum Manager {
     Mise,
     Apt,
     Yay,
+    /// Windows のパッケージマネージャ
+    Winget,
     ZedExtension,
     /// sennit は導入に関与しない
     None,
@@ -55,6 +57,7 @@ impl Manager {
             Some("mise") => Manager::Mise,
             Some("apt") => Manager::Apt,
             Some("yay") => Manager::Yay,
+            Some("winget") => Manager::Winget,
             // Zed 拡張は settings.json の auto_install_extensions が入れる
             Some("zed-extension") => Manager::ZedExtension,
             Some("none") => Manager::None,
@@ -90,13 +93,53 @@ pub struct Package {
     /// Arch 系での パッケージ名。指定があると Linux では yay を使う
     #[serde(default)]
     pub yay: Option<String>,
+    /// winget のパッケージ ID。指定があると Windows では winget を使う。
+    /// `"Starship.Starship"` か `{ id = "Microsoft.PowerShell", upgrade = true }`
+    #[serde(default)]
+    pub winget: Option<Winget>,
+}
+
+/// `winget = ...` の中身。ID だけの文字列か、upgrade を添えた表。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Winget {
+    Id(String),
+    Table(WingetTable),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WingetTable {
+    pub id: String,
+    /// 入っていても sync のたびに `winget upgrade` する
+    #[serde(default)]
+    pub upgrade: bool,
+}
+
+impl Winget {
+    pub fn id(&self) -> &str {
+        match self {
+            Winget::Id(id) => id,
+            Winget::Table(t) => &t.id,
+        }
+    }
+
+    pub fn upgrade(&self) -> bool {
+        matches!(self, Winget::Table(t) if t.upgrade)
+    }
 }
 
 /// sync が実際に導入するパッケージ 1 件。
 #[derive(Debug, Clone)]
 pub struct Installable {
+    /// マネージャに渡す名前(winget なら ID)
     pub name: String,
     pub manager: Manager,
+    /// 入っていても毎回 upgrade する(winget のみ)
+    pub upgrade: bool,
+    /// 「入っている」とみなすコマンド名。winget の一覧に無くても、PATH に
+    /// あれば別の手段(scoop、手で入れたもの)で入っているとして入れない
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -142,8 +185,11 @@ impl Packages {
     /// ディストリで違う(libyaml -> libyaml-dev)場合があるため、名前も
     /// そこで差し替える。どちらの宣言も無ければ既定の manager を使う
     /// (linuxbrew は Linux でも動くため)。
+    ///
+    /// Windows では winget の宣言が manager と名前(ID)を決める。宣言が無ければ
+    /// mise だけが残り、brew / apt / yay は入れようがないので対象から外れる。
     pub fn installable(&self) -> Vec<Installable> {
-        let linux_pm = current_linux_pm();
+        let linux_pm = current_native_pm();
 
         let mut out: Vec<Installable> = self
             .packages
@@ -184,7 +230,7 @@ impl Packages {
                 if Manager::parse(Some(m)) == Manager::Unknown {
                     bail!(
                         "package `{name}` has an unknown manager `{m}`; \
-                         expected one of: brew, brew-cask, mise, apt, yay, zed-extension, none"
+                         expected one of: brew, brew-cask, mise, apt, yay, winget, zed-extension, none"
                     );
                 }
             }
@@ -194,6 +240,11 @@ impl Packages {
                         "package `{name}` has an unknown kind `{k}`; \
                          expected one of: command, font, extension, library"
                     );
+                }
+            }
+            if let Some(w) = &pkg.winget {
+                if w.id().trim().is_empty() {
+                    bail!("package `{name}` has an empty winget id");
                 }
             }
             for os in &pkg.os {
@@ -295,21 +346,30 @@ fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 1 パッケージについて、この環境で使うマネージャと名前を決める。
 /// この OS で sync が導入経路を持つか。verify はこれを見て、入れようが
 /// ないものを「見つからない」と報告しないようにする。
 pub fn will_install(pkg: &Package) -> bool {
-    // sync does not run on Windows, so nothing is installable there
-    if cfg!(windows) {
-        return false;
-    }
-    will_install_with(pkg, current_linux_pm())
+    will_install_with(pkg, current_native_pm())
 }
 
-/// このマシンの Linux パッケージマネージャ。macOS では無い。
-fn current_linux_pm() -> Option<Manager> {
+/// このマシンで sync がこのパッケージを winget で入れるなら、その ID。
+pub fn winget_id_here(name: &str, pkg: &Package) -> Option<String> {
+    resolve(name, pkg, current_native_pm())
+        .filter(|i| i.manager == Manager::Winget)
+        .map(|i| i.name)
+}
+
+/// このマシンの「OS のパッケージマネージャ」。Linux では apt / yay のうち
+/// 在るもの、Windows では winget、macOS では無い。
+///
+/// Windows で winget の有無を見ないのは、verify が「winget が無いので検証
+/// しない」と黙るより、宣言どおり入っていないと言う方が役に立つから。
+/// sync は winget が無ければその旨を言って落ちる。
+fn current_native_pm() -> Option<Manager> {
     if cfg!(target_os = "macos") {
         None
+    } else if cfg!(windows) {
+        Some(Manager::Winget)
     } else {
         detect_linux_pm()
     }
@@ -321,42 +381,79 @@ fn current_linux_pm() -> Option<Manager> {
 /// sync が使うのと同じ resolve に訊く。ここで条件を書き写すと必ずずれる。
 /// 実際、macOS を先に真で返していたせいで、`manager = "apt"` を os 無しで
 /// 書いた宣言が sync からは消え、verify だけが missing と言い続けていた。
-pub fn will_install_with(pkg: &Package, linux_pm: Option<Manager>) -> bool {
-    resolve("", pkg, linux_pm).is_some()
+pub fn will_install_with(pkg: &Package, native_pm: Option<Manager>) -> bool {
+    resolve("", pkg, native_pm).is_some()
 }
 
-fn resolve(name: &str, pkg: &Package, linux_pm: Option<Manager>) -> Option<Installable> {
-    if let Some(pm) = linux_pm {
+/// 1 パッケージについて、この環境で使うマネージャと名前を決める。
+///
+/// `native_pm` は OS のパッケージマネージャ(apt / yay / winget)。macOS では None。
+fn resolve(name: &str, pkg: &Package, native_pm: Option<Manager>) -> Option<Installable> {
+    let commands = if pkg.provides.is_empty() {
+        vec![name.to_string()]
+    } else {
+        pkg.provides.clone()
+    };
+    let plain = |name: &str, manager| Installable {
+        name: name.to_string(),
+        manager,
+        upgrade: false,
+        commands: commands.clone(),
+    };
+    let manager = Manager::parse(pkg.manager.as_deref());
+
+    if native_pm == Some(Manager::Winget) {
+        // winget の宣言が manager と ID を決める。apt / yay と同じ規則
+        if let Some(w) = &pkg.winget {
+            return Some(Installable {
+                name: w.id().to_string(),
+                manager: Manager::Winget,
+                upgrade: w.upgrade(),
+                commands,
+            });
+        }
+        return match manager {
+            // ID の宣言が無ければパッケージ名を ID として使う
+            Manager::Winget => Some(plain(name, Manager::Winget)),
+            // mise は Windows でも動く。関与しない宣言はそのまま
+            Manager::Mise | Manager::None | Manager::ZedExtension | Manager::Unknown => {
+                Some(plain(name, manager))
+            }
+            // brew / cask / apt / yay は Windows に無い
+            _ => None,
+        };
+    }
+
+    if let Some(pm) = native_pm {
         let distro_name = match pm {
             Manager::Apt => pkg.apt.as_deref(),
             Manager::Yay => pkg.yay.as_deref(),
             _ => None,
         };
         if let Some(n) = distro_name {
-            return Some(Installable {
-                name: n.to_string(),
-                manager: pm,
-            });
+            return Some(plain(n, pm));
         }
         // apt / yay の宣言が無く、既定が cask なら Linux では入れられない
-        if Manager::parse(pkg.manager.as_deref()) == Manager::BrewCask && !is_font(pkg) {
+        if manager == Manager::BrewCask && !is_font(pkg) {
             return None;
         }
     }
-    let manager = Manager::parse(pkg.manager.as_deref());
     // Linux のマネージャが無い環境(macOS)で dpkg-query / pacman を呼びに
     // 行かない。os を書き忘れた `manager = "apt"` 1 件で、sync 全体が
     // 最初のマネージャで落ちていた。
     //
-    // cfg! ではなく linux_pm で判断する。関数の中で OS を見ると、片方の
+    // cfg! ではなく native_pm で判断する。関数の中で OS を見ると、片方の
     // OS では常に同じ答えになってテストが何も押さえられない。
-    if linux_pm.is_none() && matches!(manager, Manager::Apt | Manager::Yay) {
+    if !matches!(native_pm, Some(Manager::Apt | Manager::Yay))
+        && matches!(manager, Manager::Apt | Manager::Yay)
+    {
         return None;
     }
-    Some(Installable {
-        name: name.to_string(),
-        manager,
-    })
+    // winget は Windows にしか無い
+    if manager == Manager::Winget {
+        return None;
+    }
+    Some(plain(name, manager))
 }
 
 /// フォントの cask は Linux でも動く(supports_linux? な cask)。
@@ -494,12 +591,83 @@ mod tests {
         assert_eq!(r.name, "libyaml");
     }
 
+    /// Windows では winget の宣言がマネージャと ID を決める。
+    #[test]
+    fn a_winget_id_decides_the_manager_on_windows() {
+        let p = pkg("winget = \"Starship.Starship\"\n");
+        let r = resolve("starship", &p, Some(Manager::Winget)).unwrap();
+        assert_eq!(r.manager, Manager::Winget);
+        assert_eq!(r.name, "Starship.Starship");
+        assert!(!r.upgrade);
+        // PATH で探すのはパッケージ名(provides が無いとき)
+        assert_eq!(r.commands, vec!["starship".to_string()]);
+        // ほかの OS では読まない
+        assert_eq!(resolve("starship", &p, None).unwrap().manager, Manager::Brew);
+        assert_eq!(
+            resolve("starship", &p, Some(Manager::Apt)).unwrap().manager,
+            Manager::Brew
+        );
+    }
+
+    /// 毎回 upgrade する宣言は表で書く。
+    #[test]
+    fn a_winget_table_can_ask_for_an_upgrade_every_time() {
+        let p = pkg("provides = [\"pwsh\"]\nmanager = \"none\"\nwinget = { id = \"Microsoft.PowerShell\", upgrade = true }\n");
+        let r = resolve("powershell", &p, Some(Manager::Winget)).unwrap();
+        assert_eq!(r.manager, Manager::Winget);
+        assert_eq!(r.name, "Microsoft.PowerShell");
+        assert!(r.upgrade);
+        assert_eq!(r.commands, vec!["pwsh".to_string()]);
+    }
+
+    /// brew / cask / apt / yay は Windows に無い。mise と none は意味を保つ。
+    #[test]
+    fn without_a_winget_id_only_mise_and_none_remain_on_windows() {
+        for m in ["brew", "brew-cask", "apt", "yay"] {
+            let p = pkg(&format!("manager = \"{m}\"\n"));
+            assert!(resolve("x", &p, Some(Manager::Winget)).is_none(), "{m}");
+        }
+        assert!(resolve("x", &pkg(""), Some(Manager::Winget)).is_none());
+        let mise = resolve("go", &pkg("manager = \"mise\"\n"), Some(Manager::Winget)).unwrap();
+        assert_eq!(mise.manager, Manager::Mise);
+        // `manager = "winget"` はパッケージ名を ID として使う
+        let w = resolve("Git.Git", &pkg("manager = \"winget\"\n"), Some(Manager::Winget)).unwrap();
+        assert_eq!((w.manager, w.name.as_str()), (Manager::Winget, "Git.Git"));
+        // ほかの OS では winget を呼ばない
+        assert!(resolve("Git.Git", &pkg("manager = \"winget\"\n"), None).is_none());
+        assert!(resolve("Git.Git", &pkg("manager = \"winget\"\n"), Some(Manager::Apt)).is_none());
+    }
+
+    /// dotfiles の packages.toml の書き方がそのまま読める。
+    #[test]
+    fn the_inline_winget_key_parses_alongside_the_others() {
+        let p = parse(
+            "[packages]\nripgrep = { provides = [\"rg\"], winget = \"BurntSushi.ripgrep.MSVC\" }\n\n[packages.git]\napt = \"git\"\nwinget = \"Git.Git\"\n",
+        );
+        assert_eq!(
+            p.packages["ripgrep"].winget.as_ref().map(Winget::id),
+            Some("BurntSushi.ripgrep.MSVC")
+        );
+        assert_eq!(p.packages["git"].winget.as_ref().map(Winget::id), Some("Git.Git"));
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn manager_defaults_to_brew() {
         let p = parse("[packages]\nbat = {}\n");
         let i = p.installable();
         assert_eq!(i.len(), 1);
         assert_eq!(i[0].manager, Manager::Brew);
+    }
+
+    /// Windows に brew は無い。winget の宣言があるものだけが入る。
+    #[cfg(windows)]
+    #[test]
+    fn only_winget_packages_are_installed_on_windows() {
+        let p = parse("[packages]\nbat = {}\nfd = { winget = \"sharkdp.fd\" }\n");
+        let i = p.installable();
+        assert_eq!(i.len(), 1);
+        assert_eq!((i[0].manager, i[0].name.as_str()), (Manager::Winget, "sharkdp.fd"));
     }
 }
 
@@ -558,12 +726,12 @@ mod load_tests {
         assert!(will_install(&font));
     }
 
-    /// sync does not run on Windows, so verify has nothing to hold a package to.
+    /// Windows has no brew; a package is held to what winget (or mise) installs.
     #[cfg(windows)]
     #[test]
-    fn nothing_is_installable_on_windows() {
-        let plain = pkg("manager = \"brew\"\n");
-        assert!(!will_install(&plain));
+    fn only_what_winget_or_mise_installs_is_installable_on_windows() {
+        assert!(!will_install(&pkg("manager = \"brew\"\n")));
+        assert!(will_install(&pkg("winget = \"Starship.Starship\"\n")));
     }
 
     fn load(toml: &str) -> Result<Packages> {
@@ -593,6 +761,22 @@ mod load_tests {
     fn an_unknown_os_is_rejected() {
         let e = load("[packages]\ntrash = { os = [\"macos\"] }\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown os"), "{e:#}");
+    }
+
+    #[test]
+    fn an_unknown_winget_key_is_rejected() {
+        // upgrades と書いて毎回の upgrade が黙って消えるのを防ぐ
+        let e = load("[packages]\npwsh = { winget = { id = \"Microsoft.PowerShell\", upgrades = true } }\n")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("winget"), "{e:#}");
+        let e = load("[packages]\npwsh = { winget = \" \" }\n").unwrap_err();
+        assert!(format!("{e:#}").contains("empty winget id"), "{e:#}");
+    }
+
+    #[test]
+    fn winget_is_a_known_manager() {
+        let p = load("[packages]\n\"Git.Git\" = { manager = \"winget\" }\n").unwrap();
+        assert_eq!(p.packages["Git.Git"].manager_of(), Manager::Winget);
     }
 
     /// 「関与しない」の宣言は綴りの誤りではない

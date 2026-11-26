@@ -483,11 +483,12 @@ Windows paths mean nothing. If none is found, a hook fails with an error that sa
 manifest without hooks needs no shell at all. A hook's `cwd` and the environment are
 passed through as they are.
 
+**Packages are installed with winget.** `sennit sync` drives winget from the `winget`
+entries in `packages.toml`; see [Installing packages](#installing-packages). Up to 0.21 it
+refused to run on Windows, and `verify` treated every package as not verifiable.
+
 **Not supported on Windows.**
 
-- `sennit sync` exits with an error saying so. There is no package manager it knows how to
-  drive; `verify` therefore treats packages as not verifiable instead of reporting every
-  one of them missing, and still checks fonts, `[merge]` outputs and secrets.
 - sennit never schedules anything: there is no `autosync`-style timer to port. If you want
   `apply` on a schedule, create a Task Scheduler task that runs `sennit apply` yourself.
 - Directory junctions. Windows reports a junction as a mount point, not a symbolic link,
@@ -620,6 +621,7 @@ idempotency does not depend on the manager's own behaviour.
 | `brew-cask` | macOS only, except font casks which install on Linux as well |
 | `mise` | runtimes |
 | `apt` / `yay` | Linux; selected automatically from what the machine has |
+| `winget` | Windows; see below |
 | `zed-extension` | declared so `check` knows about it; the editor installs it |
 | `none` | declared, but sennit does not install it |
 
@@ -643,8 +645,40 @@ the default `manager` is used. Entries marked `optional`, or restricted to anoth
 them, but are installed by the editor itself.
 
 Managers run in dependency order — `apt`/`yay` first, since distribution packages are what
-Homebrew sits on, then `brew`, `brew-cask`, and `mise` last because `brew` is what installs
-it.
+Homebrew sits on (and `winget` on Windows), then `brew`, `brew-cask`, and `mise` last because
+`brew` or `winget` is what installs it.
+
+On Windows, a `winget` entry decides both the manager and the name, the way `apt` and `yay`
+do on Linux. The value is the winget package ID, as `winget search` shows it:
+
+```toml
+[packages]
+starship = { winget = "Starship.Starship" }
+ripgrep  = { provides = ["rg"], winget = "BurntSushi.ripgrep.MSVC" }
+
+[packages.powershell]
+provides = ["pwsh"]
+os       = ["windows"]
+winget   = { id = "Microsoft.PowerShell", upgrade = true }   # upgraded on every sync
+```
+
+Without a `winget` entry, a package is installed on Windows only if its `manager` is `mise`
+(or `winget`, with the package name as the ID); `brew`, `brew-cask`, `apt` and `yay` do not
+exist there, so those packages are left out of `sync` and `verify` treats them as not
+verifiable. Other platforms ignore `winget` entirely.
+
+`sync` asks `winget list --id <ID> --exact` about each package, and installs the ones that
+are missing with `winget install --id <ID> --exact --source winget`, accepting the source and
+package agreements and never prompting. A package winget does not list but whose command
+(its `provides`, or its name) is already on `PATH` is left alone and shown with `=`: it was
+installed some other way, with scoop or by hand, and a second copy would only compete with
+it. `upgrade = true` runs `winget upgrade` on an installed package every time; winget's
+"no newer version" answer (0x8A15002B) counts as success. A failed install or upgrade does
+not stop the others; `sync` fails at the end and names each one with its exit code.
+
+`verify` checks a winget package's command on `PATH` first, and asks winget about the ID only
+when that fails, so an application without a command, or one installed after this shell
+started, is not reported missing.
 
 `apt` needs root. sennit works out how to get it before running anything: as root it calls
 `apt-get` directly, otherwise it uses `sudo` when that is passwordless or when there is a
