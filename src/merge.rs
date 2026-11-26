@@ -187,7 +187,7 @@ pub struct Env<'a> {
     pub root: &'a Path,
     pub home: &'a Path,
     pub manifest: &'a Manifest,
-    /// Paths (relative to `$HOME`) holding a link that this run is about to
+    /// Places holding a link that this run is about to
     /// prune: recorded last time, no longer declared, and ours. A merge target
     /// that is one of them is treated as absent, since apply removes the link
     /// before merging and a preview should say what apply will find.
@@ -202,15 +202,15 @@ impl<'a> Env<'a> {
         plan: &plan::Plan,
         previous: &crate::state::State,
     ) -> Self {
-        let current: Vec<PathBuf> = plan.entries.iter().map(|e| e.rel.clone()).collect();
         let pending = previous
-            .stale(&current)
+            .stale_dests(home, &plan.dests())
             .into_iter()
-            .filter(|rel| {
-                let dest = home.join(rel);
-                std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink())
-                    && plan::link_into_repo(root, &dest)
+            .map(|(_, dest)| dest)
+            .filter(|dest| {
+                std::fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink())
+                    && plan::link_into_repo(root, dest)
             })
+            .map(|dest| crate::platform::native(&dest))
             .collect();
         Env {
             root,
@@ -222,8 +222,13 @@ impl<'a> Env<'a> {
 
     /// Like `new`, reading the plan and the state itself. For commands that
     /// have neither at hand.
-    pub fn load(root: &'a Path, home: &'a Path, manifest: &'a Manifest) -> Result<Self> {
-        let plan = plan::Plan::build(root, home, manifest)?;
+    pub fn load(
+        root: &'a Path,
+        dirs: &'a crate::platform::Dirs,
+        manifest: &'a Manifest,
+    ) -> Result<Self> {
+        let home = dirs.home.as_path();
+        let plan = plan::Plan::build(root, dirs, manifest)?;
         let previous = crate::state::State::load(home)?;
         Ok(Self::new(root, home, manifest, &plan, &previous))
     }
@@ -231,7 +236,11 @@ impl<'a> Env<'a> {
 
 /// The target as this run will find it.
 fn target_of(p: &Planned, env: &Env) -> Result<Option<Target>> {
-    if env.pending.contains(&p.rel) {
+    if env
+        .pending
+        .iter()
+        .any(|d| crate::platform::same_path(d, &p.dest))
+    {
         return Ok(None);
     }
     read_target(&p.dest)

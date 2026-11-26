@@ -122,6 +122,29 @@ nothing because it was not one of the two old shapes, such as `.*`: it was a lit
 with a star in it, and is now a wildcard that ignores every dotfile and dot-directory at any
 depth, `.claude` included.
 
+A path in the repository is placed at the same path under `$HOME`, unless the entry says
+otherwise. Written as a table, an entry takes the repository path as `path` and where it goes
+as `to`, relative to `$HOME`:
+
+```toml
+[link]
+common  = [".config", { path = "herdr-windows", to = "AppData/Roaming/herdr" }]
+windows = [
+    { path = "powershell", to = "{documents}/PowerShell" },
+    { path = ".config/alacritty", to = "{appdata}/alacritty" },
+]
+```
+
+`to` may start with a folder in braces: `{home}` anywhere, and, in the `windows` list only,
+`{appdata}` (Roaming), `{localappdata}` and `{documents}`; see [Windows](#windows) for how
+they are found. The same repository path can be placed differently per platform by listing it
+in each platform's list. Everything else — `ignore`, `[render]`, `[modes]` — still names
+the path in the repository. When several entries contain a file, the deepest one decides
+where it goes, and two entries that would put files at the same place are refused before
+anything is linked. Moving or removing a `to` prunes the links at the old place, which is
+recorded in the state for that purpose. sennit 0.21 and earlier refuse a manifest that uses
+the table form.
+
 `packages.toml` sits beside `sennit.toml` and is required by `check`, `verify`, `audit`
 and `sync`; `apply` does not read it. What was linked is recorded in
 `<home>/.local/state/sennit/state.json`, which follows `--home`.
@@ -482,6 +505,21 @@ every machine before you push a manifest that uses it. (`packages.toml` accepts
 
 **Where `$HOME` is.** `%USERPROFILE%`, then `HOME` if that is unset. `--home` overrides
 either, which is also how to try sennit on a scratch directory.
+
+**Known folders.** A `to` in the `windows` list can start with `{appdata}`,
+`{localappdata}` or `{documents}`. sennit asks Windows for them (`SHGetKnownFolderPath`)
+rather than assuming `%USERPROFILE%\Documents`, because Documents is often moved — OneDrive's
+backup of the Documents folder is the usual reason — and PowerShell reads its profile from
+wherever Documents really is:
+
+```toml
+[link]
+windows = [{ path = "Documents/PowerShell", to = "{documents}/PowerShell" }]
+```
+
+With `--home`, they are the folders' default places under that directory
+(`AppData\Roaming`, `AppData\Local`, `Documents`), so a trial run against a scratch
+directory never reaches your real profile.
 
 **Paths.** Link targets are written with backslashes and without the `\\?\` prefix that
 Windows' path resolution adds. A link that already points at the right file is recognised

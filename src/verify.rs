@@ -118,8 +118,13 @@ pub const UNREADABLE: u32 = u32::MAX;
 /// パッケージとモードの検査は常に走らせ、秘密の検査は後から足す。
 /// どちらかが落ちても、もう一方の結果は出す。片方の失敗がもう片方を
 /// 隠すと、直して再実行するたびに次の失敗が出てくることになる。
-pub fn verify(root: &Path, home: &Path, export: Option<PathBuf>, secrets: bool) -> Result<()> {
-    let machine = verify_machine(root, home, export);
+pub fn verify(
+    root: &Path,
+    dirs: &crate::platform::Dirs,
+    export: Option<PathBuf>,
+    secrets: bool,
+) -> Result<()> {
+    let machine = verify_machine(root, dirs, export);
     if !secrets {
         return machine;
     }
@@ -135,7 +140,12 @@ pub fn verify(root: &Path, home: &Path, export: Option<PathBuf>, secrets: bool) 
     }
 }
 
-fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<()> {
+fn verify_machine(
+    root: &Path,
+    dirs: &crate::platform::Dirs,
+    export: Option<PathBuf>,
+) -> Result<()> {
+    let home = dirs.home.as_path();
     let packages = Packages::load(&root.join("packages.toml"))?;
 
     let mut missing = Vec::new();
@@ -210,7 +220,7 @@ fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<(
 
     // [merge] の出力が、重ねた結果とずれていないか。値は出さず、キーのパスだけ
     let merges = crate::merge::plan(root, home, &manifest)?;
-    let env = crate::merge::Env::load(root, home, &manifest)?;
+    let env = crate::merge::Env::load(root, dirs, &manifest)?;
     let mut bad_merges = 0usize;
     for m in &merges {
         match crate::merge::status(m, &env) {

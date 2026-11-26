@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// sennit.toml の表現。
 ///
@@ -130,15 +130,78 @@ pub fn validate_os(what: &str, os: &[String]) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct Link {
     #[serde(default)]
-    pub common: Vec<String>,
+    pub common: Vec<Target>,
     #[serde(default)]
-    pub darwin: Vec<String>,
+    pub darwin: Vec<Target>,
     #[serde(default)]
-    pub linux: Vec<String>,
+    pub linux: Vec<Target>,
     #[serde(default)]
-    pub windows: Vec<String>,
+    pub windows: Vec<Target>,
     #[serde(default)]
     pub ignore: Ignore,
+}
+
+/// `[link]` の一覧の 1 項目。リポジトリ内のパスだけか、配置先を添えた表。
+///
+/// 配置先を書かなければ、リポジトリ内のパスがそのまま $HOME からの相対パスになる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// リポジトリ内のパス
+    pub path: String,
+    /// 配置先。$HOME からの相対か、`{appdata}/herdr` のように既知のフォルダから。
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetTable {
+    pub path: String,
+    pub to: String,
+}
+
+impl crate::de::ShortOrTable for Target {
+    type Short = String;
+    type Table = TargetTable;
+    const EXPECTING: &'static str = "a path, or a table with `path` and `to`";
+    fn short(s: String) -> Self {
+        Target { path: s, to: None }
+    }
+    fn table(t: TargetTable) -> Self {
+        Target {
+            path: t.path,
+            to: Some(t.to),
+        }
+    }
+}
+crate::short_or_table!(Target);
+
+impl From<&str> for Target {
+    fn from(s: &str) -> Self {
+        Target {
+            path: s.to_string(),
+            to: None,
+        }
+    }
+}
+
+/// `to` を「既知のフォルダ」と「その下のパス」に分ける。
+/// `{documents}/PowerShell` -> (Some("documents"), "PowerShell")、`a/b` -> (None, "a/b")
+pub fn split_to(to: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = to.strip_prefix('{') {
+        if let Some(end) = rest.find('}') {
+            let name = &rest[..end];
+            let after = &rest[end + 1..];
+            return (Some(name), after.trim_start_matches('/'));
+        }
+    }
+    (None, to)
+}
+
+/// 配置先。dest = base.join(under)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub base: PathBuf,
+    pub under: PathBuf,
 }
 
 /// `[link] ignore`。全 OS 共通の配列か、`[link.ignore]` の OS ごとの表。
@@ -222,15 +285,43 @@ impl Manifest {
     /// 宣言そのものの検査。配置を始める前に落とす。
     fn validate(&self) -> Result<()> {
         let mut paths: Vec<(&str, &str)> = Vec::new();
-        for p in self
-            .link
-            .common
-            .iter()
-            .chain(&self.link.darwin)
-            .chain(&self.link.linux)
-            .chain(&self.link.windows)
-        {
-            paths.push(("link", p));
+        for (list, items) in [
+            ("common", &self.link.common),
+            ("darwin", &self.link.darwin),
+            ("linux", &self.link.linux),
+            ("windows", &self.link.windows),
+        ] {
+            for t in items {
+                paths.push(("link", &t.path));
+                let Some(to) = &t.to else { continue };
+                let (folder, rest) = split_to(to);
+                if let Some(f) = folder {
+                    if !crate::platform::KNOWN_FOLDERS.contains(&f) {
+                        bail!(
+                            "link `{}` is placed under an unknown folder `{{{f}}}`; expected one of {}",
+                            t.path,
+                            crate::platform::KNOWN_FOLDERS
+                                .iter()
+                                .map(|f| format!("{{{f}}}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // %APPDATA% や Documents は Windows のもの。macOS で ~/AppData を作らない
+                    if crate::platform::windows_only_folder(f) && list != "windows" {
+                        bail!(
+                            "link `{}` is placed under `{{{f}}}`, a Windows folder; \
+                             declare it in the `windows` list",
+                            t.path
+                        );
+                    }
+                    if !rest.is_empty() {
+                        paths.push(("link destination", rest));
+                    }
+                } else {
+                    paths.push(("link destination", rest));
+                }
+            }
         }
         for (out, r) in &self.render {
             paths.push(("render output", out));
@@ -338,7 +429,12 @@ impl Manifest {
                 .chain(&self.link.darwin)
                 .chain(&self.link.linux)
                 .chain(&self.link.windows)
-                .any(|t| Path::new(t) == rel)
+                .any(|t| {
+                    Path::new(&t.path) == rel
+                        || t.to.as_deref().is_some_and(|to| {
+                            matches!(split_to(to), (None | Some("home"), r) if Path::new(r) == rel)
+                        })
+                })
             {
                 bail!("merge output `{out}` is also declared under [link]; sennit would both link and rewrite it");
             }
@@ -356,10 +452,66 @@ impl Manifest {
 
     /// 現在の OS で配置対象になるトップレベルのパス。
     pub fn targets(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = self.link.common.iter().map(String::as_str).collect();
-        let os_specific = for_this_os(&self.link.darwin, &self.link.linux, &self.link.windows);
-        out.extend(os_specific.iter().map(String::as_str));
-        out
+        self.targets_here().map(|t| t.path.as_str()).collect()
+    }
+
+    /// 現在の OS で配置対象になる項目。common が先。
+    pub fn targets_here(&self) -> impl Iterator<Item = &Target> {
+        self.link.common.iter().chain(for_this_os(
+            &self.link.darwin,
+            &self.link.linux,
+            &self.link.windows,
+        ))
+    }
+
+    /// リポジトリ内のパス `rel` をどこへ置くか。
+    ///
+    /// `to` のある項目のうち、`rel` を含むいちばん深いものに従う。無ければ
+    /// $HOME の下の同じパス。
+    pub fn placement(&self, dirs: &crate::platform::Dirs, rel: &Path) -> Result<Placement> {
+        let mapped = self
+            .targets_here()
+            .filter(|t| t.to.is_some() && rel.starts_with(&t.path))
+            .max_by_key(|t| Path::new(&t.path).components().count());
+        let Some(t) = mapped else {
+            return Ok(Placement {
+                base: dirs.home.clone(),
+                under: rel.to_path_buf(),
+            });
+        };
+        let (base, top) = Self::base_of(dirs, t)?;
+        let below = rel.strip_prefix(&t.path).unwrap_or(Path::new(""));
+        Ok(Placement {
+            base,
+            under: if below.as_os_str().is_empty() {
+                top
+            } else {
+                top.join(below)
+            },
+        })
+    }
+
+    /// 項目の配置先の根と、そこからの相対パス(項目そのもの)。
+    fn base_of(dirs: &crate::platform::Dirs, t: &Target) -> Result<(PathBuf, PathBuf)> {
+        match t.to.as_deref() {
+            None => Ok((dirs.home.clone(), PathBuf::from(&t.path))),
+            Some(to) => {
+                let (folder, rest) = split_to(to);
+                let base = match folder {
+                    Some(f) => dirs.known(f)?,
+                    None => dirs.home.clone(),
+                };
+                Ok((base, PathBuf::from(rest)))
+            }
+        }
+    }
+
+    /// 現在の OS の各項目の (配置先の根, 根からの相対パス)。
+    /// 祖先の symlink をどこまで張り替えるかの判断に使う。
+    pub fn tops(&self, dirs: &crate::platform::Dirs) -> Result<Vec<(PathBuf, PathBuf)>> {
+        self.targets_here()
+            .map(|t| Self::base_of(dirs, t))
+            .collect()
     }
 
     /// この OS で生成する [render] の 出力 -> テンプレート。
@@ -776,6 +928,100 @@ mod tests {
         let e = load("[link]\ncommon = []\n\n[render]\n\"a\" = { from = \"../a.tmpl\" }\n")
             .unwrap_err();
         assert!(format!("{e:#}").contains(".."), "{e:#}");
+    }
+
+    #[test]
+    fn to_is_split_into_a_folder_and_a_path() {
+        assert_eq!(
+            split_to("{documents}/PowerShell"),
+            (Some("documents"), "PowerShell")
+        );
+        assert_eq!(split_to("{appdata}"), (Some("appdata"), ""));
+        assert_eq!(split_to("AppData/Roaming/x"), (None, "AppData/Roaming/x"));
+    }
+
+    /// `to` で、リポジトリ内のパスと別の場所へ置ける。いちばん深い項目に従う。
+    #[test]
+    fn a_target_can_be_placed_elsewhere() {
+        let m = load(
+            "[link]\ncommon = [\"conf\", { path = \"win/herdr\", to = \"AppData/Roaming/herdr\" }, { path = \"conf/deep\", to = \"{home}/elsewhere\" }]\n",
+        )
+        .unwrap();
+        let dirs = crate::platform::Dirs::new(PathBuf::from("/h"), false);
+        let at = |rel: &str| {
+            let p = m.placement(&dirs, Path::new(rel)).unwrap();
+            p.base.join(p.under)
+        };
+        assert_eq!(at("conf/a"), PathBuf::from("/h/conf/a"));
+        assert_eq!(
+            at("win/herdr/config.toml"),
+            PathBuf::from("/h/AppData/Roaming/herdr/config.toml")
+        );
+        assert_eq!(at("conf/deep/x"), PathBuf::from("/h/elsewhere/x"));
+        assert_eq!(m.targets(), vec!["conf", "win/herdr", "conf/deep"]);
+    }
+
+    /// 試しの --home では、既知のフォルダはその下の既定の場所。
+    #[test]
+    fn known_folders_default_to_their_place_under_a_given_home() {
+        let dirs = crate::platform::Dirs::new(PathBuf::from("/h"), false);
+        assert_eq!(dirs.known("home").unwrap(), PathBuf::from("/h"));
+        assert_eq!(
+            dirs.known("appdata").unwrap(),
+            PathBuf::from("/h").join("AppData").join("Roaming")
+        );
+        assert_eq!(
+            dirs.known("localappdata").unwrap(),
+            PathBuf::from("/h").join("AppData").join("Local")
+        );
+        assert_eq!(
+            dirs.known("documents").unwrap(),
+            PathBuf::from("/h").join("Documents")
+        );
+        assert!(dirs.known("desktop").is_err());
+    }
+
+    #[test]
+    fn a_bad_destination_is_rejected() {
+        for (toml, want) in [
+            (
+                "common = [{ path = \"a\", to = \"{appdata}/a\" }]",
+                "a Windows folder",
+            ),
+            (
+                "darwin = [{ path = \"a\", to = \"{documents}/a\" }]",
+                "a Windows folder",
+            ),
+            (
+                "windows = [{ path = \"a\", to = \"{desktop}/a\" }]",
+                "unknown folder",
+            ),
+            (
+                "windows = [{ path = \"a\", to = \"{appdata}/../a\" }]",
+                "..",
+            ),
+            ("common = [{ path = \"a\", to = \"/etc/a\" }]", "absolute"),
+            ("common = [{ path = \"a\", to = \"\" }]", "empty"),
+            (
+                "common = [{ path = \"a\", dest = \"b\" }]",
+                "unknown field `dest`",
+            ),
+            ("common = [{ path = \"a\" }]", "missing field `to`"),
+        ] {
+            let e = load(&format!("[link]\n{toml}\n")).unwrap_err();
+            assert!(format!("{e:#}").contains(want), "{toml}: {e:#}");
+        }
+        assert!(load("[link]\nwindows = [{ path = \"a\", to = \"{appdata}/a\" }]\n").is_ok());
+        assert!(load("[link]\nwindows = [{ path = \"a\", to = \"{documents}\" }]\n").is_ok());
+    }
+
+    #[test]
+    fn a_merge_output_that_a_link_is_placed_at_is_rejected() {
+        let e = load(
+            "[link]\ncommon = [{ path = \"s\", to = \".claude/settings.json\" }]\n\n[merge.\".claude/settings.json\"]\nfrom = \"s.json\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[link]"), "{e:#}");
     }
 
     #[test]

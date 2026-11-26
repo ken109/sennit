@@ -1,4 +1,5 @@
 use crate::manifest::Manifest;
+use crate::platform::Dirs;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -6,10 +7,13 @@ use walkdir::WalkDir;
 /// 1 つのリンクについて、あるべき姿と現状の差。
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// リポジトリルートからの相対パス。$HOME からの相対パスでもある。
+    /// リポジトリルートからの相対パス。`to` の無い項目では $HOME からの相対パスでもある。
     pub rel: PathBuf,
     pub src: PathBuf,
     pub dest: PathBuf,
+    /// dest = base.join(under)。base は $HOME か、`to` が名指した既知のフォルダ
+    pub base: PathBuf,
+    pub under: PathBuf,
     pub state: State,
 }
 
@@ -40,6 +44,8 @@ impl State {
 
 pub struct Plan {
     pub entries: Vec<Entry>,
+    /// 各項目の (配置先の根, 根からの相対パス)
+    tops: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Plan {
@@ -48,8 +54,9 @@ impl Plan {
     /// ディレクトリはその下のファイル単位で symlink する。ディレクトリごと
     /// symlink すると、他のツールがそこへ書き込んだファイルまでリポジトリに
     /// 現れてしまうため。
-    pub fn build(root: &Path, home: &Path, manifest: &Manifest) -> Result<Self> {
+    pub fn build(root: &Path, dirs: &Dirs, manifest: &Manifest) -> Result<Self> {
         let mut entries = Vec::new();
+        let tops = manifest.tops(dirs)?;
 
         for target in manifest.targets() {
             let abs = root.join(target);
@@ -67,7 +74,7 @@ impl Plan {
             }
 
             if abs.is_file() {
-                Self::push(&mut entries, root, home, manifest, Path::new(target))?;
+                Self::push(&mut entries, root, dirs, &tops, manifest, Path::new(target))?;
                 continue;
             }
 
@@ -93,7 +100,7 @@ impl Plan {
                     .path()
                     .strip_prefix(root)
                     .context("path escaped repository root")?;
-                Self::push(&mut entries, root, home, manifest, rel)?;
+                Self::push(&mut entries, root, dirs, &tops, manifest, rel)?;
             }
         }
 
@@ -119,17 +126,18 @@ impl Plan {
             }) {
                 continue;
             }
-            Self::push(&mut entries, root, home, manifest, rel)?;
+            Self::push(&mut entries, root, dirs, &tops, manifest, rel)?;
         }
 
         entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-        Ok(Plan { entries })
+        Ok(Plan { entries, tops })
     }
 
     fn push(
         entries: &mut Vec<Entry>,
         root: &Path,
-        home: &Path,
+        dirs: &Dirs,
+        tops: &[(PathBuf, PathBuf)],
         manifest: &Manifest,
         rel: &Path,
     ) -> Result<()> {
@@ -161,9 +169,23 @@ impl Plan {
                 rel.display()
             );
         }
+        let place = manifest.placement(dirs, rel)?;
         let src = crate::platform::native(&root.join(rel));
-        let dest = crate::platform::native(&home.join(rel));
-        let state = match ancestor_link(root, home, rel, manifest) {
+        let dest = crate::platform::native(&place.base.join(&place.under));
+        // 2 つの項目が同じ場所へ置こうとすると、後の方が EEXIST で落ちるか、
+        // 先に張ったものを「別の場所を指す」として張り替える
+        if let Some(other) = entries
+            .iter()
+            .find(|e| crate::platform::same_path(&e.dest, &dest))
+        {
+            anyhow::bail!(
+                "`{}` and `{}` are both placed at {}",
+                other.rel.display(),
+                rel.display(),
+                dest.display()
+            );
+        }
+        let state = match ancestor_link(root, &place.base, &place.under, tops) {
             Some(link) => State::Ancestor { link },
             None => inspect(&src, &dest),
         };
@@ -171,6 +193,8 @@ impl Plan {
             rel: rel.to_path_buf(),
             src,
             dest,
+            base: place.base,
+            under: place.under,
             state,
         });
         Ok(())
@@ -178,6 +202,29 @@ impl Plan {
 
     pub fn changes(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.state.needs_change())
+    }
+
+    /// その項目の祖先で、張り替える symlink。apply が 1 つずつ外していく。
+    pub fn ancestor_link(&self, root: &Path, e: &Entry) -> Option<PathBuf> {
+        ancestor_link(root, &e.base, &e.under, &self.tops)
+    }
+
+    /// `to` で $HOME の同じパス以外へ置く項目の、リポジトリ内のパス -> 配置先。
+    /// state に残し、宣言から外れたときに prune する場所を知るのに使う。
+    pub fn placed_elsewhere(&self, home: &Path) -> std::collections::BTreeMap<PathBuf, PathBuf> {
+        self.entries
+            .iter()
+            .filter(|e| !crate::platform::same_path(&e.dest, &home.join(&e.rel)))
+            .map(|e| (e.rel.clone(), e.dest.clone()))
+            .collect()
+    }
+
+    /// 今回の項目の (リポジトリ内のパス, 配置先)。
+    pub fn dests(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.entries
+            .iter()
+            .map(|e| (e.rel.clone(), e.dest.clone()))
+            .collect()
     }
 }
 
@@ -208,35 +255,47 @@ fn first_symlink(home: &Path, rel: &Path) -> Option<PathBuf> {
 ///   symlink は中身を持たないので、外せば向き先には触れずに済む。
 ///   トップレベルそのもの(`.config -> ~/Dropbox/config`)や、その上のリンクは
 ///   利用者が意図した配置なので触らず、0.19 までと同じく向き先の中に置く。
-pub fn ancestor_link(root: &Path, home: &Path, rel: &Path, manifest: &Manifest) -> Option<PathBuf> {
-    let link = first_symlink(home, rel)?;
+///
+/// `base` と `rel` は配置先の根とそこからの相対パス(`to` の無い項目なら $HOME と
+/// リポジトリ内のパス)。`tops` は各項目の同じ組で、同じ根の項目どうしで比べる。
+pub fn ancestor_link(
+    root: &Path,
+    base: &Path,
+    rel: &Path,
+    tops: &[(PathBuf, PathBuf)],
+) -> Option<PathBuf> {
+    let link = first_symlink(base, rel)?;
     if link_into_repo(root, &link) {
         return Some(link);
     }
-    let at = link.strip_prefix(home).ok()?;
-    manifest
-        .targets()
-        .iter()
-        .any(|t| at.starts_with(t) && at != Path::new(t))
+    let at = link.strip_prefix(base).ok()?;
+    tops.iter()
+        .filter(|(b, _)| crate::platform::same_path(b, base))
+        .any(|(_, t)| at.starts_with(t) && at != t.as_path())
         .then_some(link)
 }
 
 /// manifest のトップレベルのパスのうち、それ自身が外を指す symlink のもの。
 /// 配置はその向き先の中に行われる。
-pub fn outside_top_levels(
-    root: &Path,
-    home: &Path,
-    manifest: &Manifest,
-) -> Vec<(PathBuf, PathBuf)> {
+/// 1 つ目は表示用の名前(`to` の無い項目は `~/` からの相対、ある項目は配置先そのもの)。
+pub fn outside_top_levels(root: &Path, dirs: &Dirs, manifest: &Manifest) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    for t in manifest.targets() {
-        let path = home.join(t);
+    let Ok(tops) = manifest.tops(dirs) else {
+        return out;
+    };
+    for (base, top) in tops {
+        let path = base.join(&top);
         let is_link = std::fs::symlink_metadata(&path)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
         if is_link && !link_into_repo(root, &path) {
             if let Ok(to) = std::fs::read_link(&path) {
-                out.push((PathBuf::from(t), to));
+                let shown = if crate::platform::same_path(&base, &dirs.home) {
+                    format!("~/{}", top.display())
+                } else {
+                    path.display().to_string()
+                };
+                out.push((shown, to));
             }
         }
     }
@@ -244,11 +303,10 @@ pub fn outside_top_levels(
 }
 
 /// 上の一覧を 1 行ずつ知らせる。
-pub fn note_outside_top_levels(root: &Path, home: &Path, manifest: &Manifest) {
-    for (rel, to) in outside_top_levels(root, home, manifest) {
+pub fn note_outside_top_levels(root: &Path, dirs: &Dirs, manifest: &Manifest) {
+    for (shown, to) in outside_top_levels(root, dirs, manifest) {
         println!(
-            "note: ~/{} points to {}, outside the repository; files are placed inside it",
-            rel.display(),
+            "note: {shown} points to {}, outside the repository; files are placed inside it",
             to.display()
         );
     }
@@ -403,7 +461,7 @@ ignore = ["*.tmpl"]
 "conf/app.conf" = "conf/app.conf.tmpl"
 "#,
         );
-        let plan = Plan::build(&root, &home, &m).unwrap();
+        let plan = Plan::build(&root, &Dirs::new(home.clone(), false), &m).unwrap();
         let rels: Vec<_> = plan.entries.iter().map(|e| e.rel.clone()).collect();
         assert_eq!(rels, vec![PathBuf::from("conf/app.conf")]);
         assert_eq!(plan.entries[0].state, State::Missing);
@@ -427,7 +485,7 @@ common = ["conf"]
 "elsewhere/app.conf" = "elsewhere/app.conf.tmpl"
 "#,
         );
-        let plan = Plan::build(&root, &home, &m).unwrap();
+        let plan = Plan::build(&root, &Dirs::new(home.clone(), false), &m).unwrap();
         assert!(plan.entries.is_empty());
     }
 
@@ -454,7 +512,7 @@ common = ["conf"]
 ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
 "#,
         );
-        let plan = Plan::build(&root, &home, &m);
+        let plan = Plan::build(&root, &Dirs::new(home.clone(), false), &m);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         // root can read anything, which is fine: the point is that nothing fails
         let plan = plan.unwrap();
@@ -474,12 +532,22 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         let rel = Path::new("skills/gog/SKILL.md");
         let m = manifest_from("[link]\ncommon = [\"skills\"]\n");
         assert_eq!(
-            ancestor_link(&root, &home, rel, &m),
+            ancestor_link(
+                &root,
+                &home,
+                rel,
+                &m.tops(&Dirs::new(home.clone(), false)).unwrap()
+            ),
             Some(home.join("skills/gog"))
         );
         // a path with no link above it
         assert_eq!(
-            ancestor_link(&root, &home, Path::new("skills/other/a.md"), &m),
+            ancestor_link(
+                &root,
+                &home,
+                Path::new("skills/other/a.md"),
+                &m.tops(&Dirs::new(home.clone(), false)).unwrap()
+            ),
             None
         );
     }
@@ -515,14 +583,35 @@ ignore = ["conf/worktrees", "**/node_modules", "*.test.ts"]
         // below a declared top-level path, it is replaced ...
         let m = manifest_from("[link]\ncommon = [\"skills\"]\n");
         assert_eq!(
-            ancestor_link(&root, &home, rel, &m),
+            ancestor_link(
+                &root,
+                &home,
+                rel,
+                &m.tops(&Dirs::new(home.clone(), false)).unwrap()
+            ),
             Some(home.join("skills/gog"))
         );
         // ... but the top-level path itself, or a link above it, is not
         let m = manifest_from("[link]\ncommon = [\"skills/gog\"]\n");
-        assert_eq!(ancestor_link(&root, &home, rel, &m), None);
+        assert_eq!(
+            ancestor_link(
+                &root,
+                &home,
+                rel,
+                &m.tops(&Dirs::new(home.clone(), false)).unwrap()
+            ),
+            None
+        );
         let m = manifest_from("[link]\ncommon = [\"skills/gog/SKILL.md\"]\n");
-        assert_eq!(ancestor_link(&root, &home, rel, &m), None);
+        assert_eq!(
+            ancestor_link(
+                &root,
+                &home,
+                rel,
+                &m.tops(&Dirs::new(home.clone(), false)).unwrap()
+            ),
+            None
+        );
     }
 
     /// `repo/../other` starts with `repo` as text but is not inside it.

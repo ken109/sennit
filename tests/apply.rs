@@ -2537,3 +2537,84 @@ common = ["*.bak"]
     assert!(std::fs::symlink_metadata(r.home_path("conf/a.bak")).is_err());
     assert!(std::fs::symlink_metadata(r.home_path("conf/mine/x")).is_err());
 }
+
+/// `to` places a directory somewhere other than the same path under the home
+/// directory. Removing the declaration, or moving it, prunes the old place.
+#[test]
+fn a_target_can_be_placed_elsewhere_and_moved() {
+    let r = Repo::new("placed-elsewhere");
+    r.write("win/herdr/config.toml", "x\n");
+    r.manifest(
+        r#"
+[link]
+common = [{ path = "win/herdr", to = "AppData/Roaming/herdr" }]
+"#,
+    );
+    let out = ok(&r.run(&["apply"]));
+    let first = r.home_path("AppData/Roaming/herdr/config.toml");
+    assert_eq!(
+        std::fs::read_link(&first).unwrap(),
+        canon(&r.root_path("win/herdr/config.toml")),
+        "{out}"
+    );
+    // nothing at the repository's own path
+    assert!(std::fs::symlink_metadata(r.home_path("win")).is_err());
+    let list = ok(&r.run(&["list"]));
+    assert!(list.contains("1 link(s), 0 need change"), "{list}");
+
+    // move it
+    r.manifest(
+        r#"
+[link]
+common = [{ path = "win/herdr", to = ".herdr" }]
+"#,
+    );
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("prune"), "{out}");
+    assert!(
+        std::fs::symlink_metadata(&first).is_err(),
+        "the old place was left"
+    );
+    assert!(r.home_path(".herdr/config.toml").exists());
+
+    // drop it
+    r.manifest("[link]\ncommon = []\n");
+    ok(&r.run(&["apply"]));
+    assert!(std::fs::symlink_metadata(r.home_path(".herdr/config.toml")).is_err());
+}
+
+/// Two declarations that land on the same place are refused before anything is linked.
+#[test]
+fn two_targets_placed_at_the_same_path_are_refused() {
+    let r = Repo::new("placed-twice");
+    r.write("a/x.conf", "a\n");
+    r.write("b/x.conf", "b\n");
+    r.manifest(
+        r#"
+[link]
+common = ["a", { path = "b", to = "a" }]
+"#,
+    );
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("both placed at"), "{err}");
+    assert!(std::fs::symlink_metadata(r.home_path("a")).is_err());
+}
+
+/// A known folder in the `windows` list resolves under `--home` there (never the
+/// real profile), and the entry does nothing on other platforms.
+#[test]
+fn a_known_folder_resolves_under_the_given_home() {
+    let r = Repo::new("known-folder");
+    r.write("win/PowerShell/profile.ps1", "x\n");
+    r.manifest(
+        r#"
+[link]
+windows = [{ path = "win/PowerShell", to = "{documents}/PowerShell" }]
+"#,
+    );
+    ok(&r.run(&["apply"]));
+    let placed = r.home_path("Documents/PowerShell/profile.ps1");
+    assert_eq!(std::fs::symlink_metadata(&placed).is_ok(), cfg!(windows));
+}
