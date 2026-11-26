@@ -838,6 +838,10 @@ commands = ["brew", "git", "curl"]   # provided by the system or the bootstrap
 - editor extensions declared for auto-install
 - commands used in shell startup files
 - the mere existence of `.config/<tool>/`, which is sometimes the *only* evidence of a dependency
+  — and likewise `AppData/Roaming/<tool>/` and `AppData/Local/<tool>/` for Windows, and a
+  `[link]` entry whose `to` places something there (`to = "{appdata}/herdr"` counts as
+  `herdr`). These are read whatever platform `check` runs on, so CI on macOS also catches a
+  Windows config whose tool `packages.toml` forgot
 
 Detectors are written per format, so a format nobody wrote one for is invisible. Rather
 than wait for that, a config can say so itself, in whatever passes for a comment there:
