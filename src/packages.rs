@@ -100,8 +100,7 @@ pub struct Package {
 }
 
 /// `winget = ...` の中身。ID だけの文字列か、upgrade を添えた表。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Winget {
     Id(String),
     Table(WingetTable),
@@ -115,6 +114,19 @@ pub struct WingetTable {
     #[serde(default)]
     pub upgrade: bool,
 }
+
+impl crate::de::ShortOrTable for Winget {
+    type Short = String;
+    type Table = WingetTable;
+    const EXPECTING: &'static str = "a winget package ID, or a table with `id` and `upgrade`";
+    fn short(s: String) -> Self {
+        Winget::Id(s)
+    }
+    fn table(t: WingetTable) -> Self {
+        Winget::Table(t)
+    }
+}
+crate::short_or_table!(Winget);
 
 impl Winget {
     pub fn id(&self) -> &str {
@@ -602,7 +614,10 @@ mod tests {
         // PATH で探すのはパッケージ名(provides が無いとき)
         assert_eq!(r.commands, vec!["starship".to_string()]);
         // ほかの OS では読まない
-        assert_eq!(resolve("starship", &p, None).unwrap().manager, Manager::Brew);
+        assert_eq!(
+            resolve("starship", &p, None).unwrap().manager,
+            Manager::Brew
+        );
         assert_eq!(
             resolve("starship", &p, Some(Manager::Apt)).unwrap().manager,
             Manager::Brew
@@ -631,11 +646,21 @@ mod tests {
         let mise = resolve("go", &pkg("manager = \"mise\"\n"), Some(Manager::Winget)).unwrap();
         assert_eq!(mise.manager, Manager::Mise);
         // `manager = "winget"` はパッケージ名を ID として使う
-        let w = resolve("Git.Git", &pkg("manager = \"winget\"\n"), Some(Manager::Winget)).unwrap();
+        let w = resolve(
+            "Git.Git",
+            &pkg("manager = \"winget\"\n"),
+            Some(Manager::Winget),
+        )
+        .unwrap();
         assert_eq!((w.manager, w.name.as_str()), (Manager::Winget, "Git.Git"));
         // ほかの OS では winget を呼ばない
         assert!(resolve("Git.Git", &pkg("manager = \"winget\"\n"), None).is_none());
-        assert!(resolve("Git.Git", &pkg("manager = \"winget\"\n"), Some(Manager::Apt)).is_none());
+        assert!(resolve(
+            "Git.Git",
+            &pkg("manager = \"winget\"\n"),
+            Some(Manager::Apt)
+        )
+        .is_none());
     }
 
     /// dotfiles の packages.toml の書き方がそのまま読める。
@@ -648,7 +673,10 @@ mod tests {
             p.packages["ripgrep"].winget.as_ref().map(Winget::id),
             Some("BurntSushi.ripgrep.MSVC")
         );
-        assert_eq!(p.packages["git"].winget.as_ref().map(Winget::id), Some("Git.Git"));
+        assert_eq!(
+            p.packages["git"].winget.as_ref().map(Winget::id),
+            Some("Git.Git")
+        );
     }
 
     #[cfg(not(windows))]
@@ -766,9 +794,14 @@ mod load_tests {
     #[test]
     fn an_unknown_winget_key_is_rejected() {
         // upgrades と書いて毎回の upgrade が黙って消えるのを防ぐ
-        let e = load("[packages]\npwsh = { winget = { id = \"Microsoft.PowerShell\", upgrades = true } }\n")
-            .unwrap_err();
-        assert!(format!("{e:#}").contains("winget"), "{e:#}");
+        let e = load(
+            "[packages]\npwsh = { winget = { id = \"Microsoft.PowerShell\", upgrades = true } }\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("unknown field `upgrades`"),
+            "{e:#}"
+        );
         let e = load("[packages]\npwsh = { winget = \" \" }\n").unwrap_err();
         assert!(format!("{e:#}").contains("empty winget id"), "{e:#}");
     }

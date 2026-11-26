@@ -159,9 +159,8 @@ fn verify_machine(root: &Path, home: &Path, export: Option<PathBuf>) -> Result<(
                 // 持たないアプリや、入れた直後でこのシェルの PATH がまだ古い場合に
                 // 「無い」と言わないため。速い方(PATH)を先に見る。
                 if candidates.iter().any(|(kind, n)| resolves(*kind, n))
-                    || crate::packages::winget_id_here(&name, pkg).is_some_and(|id| {
-                        crate::sync::winget::installed(&id).unwrap_or(false)
-                    })
+                    || crate::packages::winget_id_here(&name, pkg)
+                        .is_some_and(|id| crate::sync::winget::installed(&id).unwrap_or(false))
                 {
                     present.push(name.clone());
                 } else {

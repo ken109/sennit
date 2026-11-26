@@ -1,4 +1,5 @@
 mod audit;
+mod de;
 mod detect;
 mod encrypted;
 mod glob;
@@ -294,7 +295,10 @@ fn render_all(
     dry_run: bool,
 ) -> Result<std::collections::BTreeSet<PathBuf>> {
     let mut produced = decrypt_all(root, manifest, dry_run)?;
-    if manifest.render.is_empty() {
+    // 別の OS 向けの [render] は生成しない。秘密を読むものなら、使わない秘密の
+    // ために「deferred」と言い続けることになる
+    let renders = manifest.renders_here();
+    if renders.is_empty() {
         return Ok(produced);
     }
     let data: Vec<PathBuf> = if manifest.data.is_empty() {
@@ -307,7 +311,7 @@ fn render_all(
     let mut cache = render::SecretCache::with(render::effective_providers(&manifest.providers));
     let mut deferred = Vec::new();
 
-    for (out_rel, tmpl_rel) in &manifest.render {
+    for (out_rel, tmpl_rel) in renders {
         let tmpl_path = root.join(tmpl_rel);
         let out_path = root.join(out_rel);
         let raw = std::fs::read_to_string(&tmpl_path)
@@ -320,7 +324,7 @@ fn render_all(
         // ロック解除を人手に要求するので、初回セットアップや CI、
         // コンテナでは原理的に成立しない。そこを異常扱いにしない。
         if !secrets && render::needs_secrets(&template) {
-            deferred.push((out_rel.clone(), render::schemes_used(&template)));
+            deferred.push((out_rel, render::schemes_used(&template)));
             continue;
         }
         // --dry-run で秘密を取りに行かない。プロバイダの呼び出しは

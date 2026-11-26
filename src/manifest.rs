@@ -11,9 +11,9 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub link: Link,
-    /// 出力パス -> テンプレートパス
+    /// 出力パス -> テンプレートパス(か、`{ from = "...", os = [...] }`)
     #[serde(default)]
-    pub render: std::collections::BTreeMap<String, String>,
+    pub render: std::collections::BTreeMap<String, Render>,
     /// 配置後に走らせる処理
     #[serde(default)]
     pub hooks: std::collections::BTreeMap<String, crate::hooks::Hook>,
@@ -54,6 +54,78 @@ pub struct Merge {
     pub from: String,
 }
 
+/// `[render]` の値。テンプレートのパスだけか、生成する OS を絞った表。
+#[derive(Debug)]
+pub enum Render {
+    Template(String),
+    Table(RenderTable),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderTable {
+    /// テンプレートのパス
+    pub from: String,
+    /// 空なら全 OS。packages.toml の `os` と同じ綴り
+    #[serde(default)]
+    pub os: Vec<String>,
+}
+
+impl crate::de::ShortOrTable for Render {
+    type Short = String;
+    type Table = RenderTable;
+    const EXPECTING: &'static str = "a template path, or a table with `from` and `os`";
+    fn short(s: String) -> Self {
+        Render::Template(s)
+    }
+    fn table(t: RenderTable) -> Self {
+        Render::Table(t)
+    }
+}
+crate::short_or_table!(Render);
+
+impl Render {
+    pub fn template(&self) -> &str {
+        match self {
+            Render::Template(t) => t,
+            Render::Table(t) => &t.from,
+        }
+    }
+
+    pub fn os(&self) -> &[String] {
+        match self {
+            Render::Template(_) => &[],
+            Render::Table(t) => &t.os,
+        }
+    }
+
+    /// この OS で生成するか。
+    pub fn here(&self) -> bool {
+        on_this_os(self.os())
+    }
+}
+
+impl From<&str> for Render {
+    fn from(t: &str) -> Self {
+        Render::Template(t.to_string())
+    }
+}
+
+/// `os` が空か、今の OS を含むか。
+pub fn on_this_os(os: &[String]) -> bool {
+    os.is_empty() || os.iter().any(|o| o == crate::packages::current_os())
+}
+
+/// `os` に書ける綴りか。
+pub fn validate_os(what: &str, os: &[String]) -> Result<()> {
+    for o in os {
+        if !matches!(o.as_str(), "darwin" | "linux" | "windows") {
+            bail!("{what} has an unknown os `{o}`; expected darwin, linux or windows");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Link {
@@ -66,7 +138,74 @@ pub struct Link {
     #[serde(default)]
     pub windows: Vec<String>,
     #[serde(default)]
-    pub ignore: Vec<String>,
+    pub ignore: Ignore,
+}
+
+/// `[link] ignore`。全 OS 共通の配列か、`[link.ignore]` の OS ごとの表。
+#[derive(Debug)]
+pub enum Ignore {
+    List(Vec<String>),
+    ByOs(IgnoreByOs),
+}
+
+impl Default for Ignore {
+    fn default() -> Self {
+        Ignore::List(Vec::new())
+    }
+}
+
+/// `[link.ignore]`。キーは `[link]` の配置の一覧と同じ。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoreByOs {
+    #[serde(default)]
+    pub common: Vec<String>,
+    #[serde(default)]
+    pub darwin: Vec<String>,
+    #[serde(default)]
+    pub linux: Vec<String>,
+    #[serde(default)]
+    pub windows: Vec<String>,
+}
+
+impl crate::de::ShortOrTable for Ignore {
+    type Short = Vec<String>;
+    type Table = IgnoreByOs;
+    const EXPECTING: &'static str =
+        "an array of patterns, or a table of them keyed by common, darwin, linux and windows";
+    fn short(s: Vec<String>) -> Self {
+        Ignore::List(s)
+    }
+    fn table(t: IgnoreByOs) -> Self {
+        Ignore::ByOs(t)
+    }
+}
+crate::short_or_table!(Ignore);
+
+impl Ignore {
+    /// この OS で効くパターン。
+    pub fn here(&self) -> Vec<&str> {
+        match self {
+            Ignore::List(v) => v.iter().map(String::as_str).collect(),
+            Ignore::ByOs(b) => b
+                .common
+                .iter()
+                .chain(for_this_os(&b.darwin, &b.linux, &b.windows))
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+}
+
+/// OS ごとの 3 つの一覧から、今の OS のものを選ぶ。
+fn for_this_os<'a, T>(darwin: &'a [T], linux: &'a [T], windows: &'a [T]) -> &'a [T] {
+    if cfg!(target_os = "macos") {
+        darwin
+    } else if cfg!(windows) {
+        windows
+    } else {
+        linux
+    }
 }
 
 impl Manifest {
@@ -93,9 +232,9 @@ impl Manifest {
         {
             paths.push(("link", p));
         }
-        for (out, src) in &self.render {
+        for (out, r) in &self.render {
             paths.push(("render output", out));
-            paths.push(("render template", src));
+            paths.push(("render template", r.template()));
         }
         for (out, src) in &self.encrypted {
             paths.push(("encrypted output", out));
@@ -147,6 +286,10 @@ impl Manifest {
         }
 
         self.validate_merge()?;
+
+        for (out, r) in &self.render {
+            validate_os(&format!("render output `{out}`"), r.os())?;
+        }
 
         for (name, probe) in &self.probes {
             probe.validate(name)?;
@@ -214,20 +357,34 @@ impl Manifest {
     /// 現在の OS で配置対象になるトップレベルのパス。
     pub fn targets(&self) -> Vec<&str> {
         let mut out: Vec<&str> = self.link.common.iter().map(String::as_str).collect();
-        let os_specific = if cfg!(target_os = "macos") {
-            &self.link.darwin
-        } else if cfg!(windows) {
-            &self.link.windows
-        } else {
-            &self.link.linux
-        };
+        let os_specific = for_this_os(&self.link.darwin, &self.link.linux, &self.link.windows);
         out.extend(os_specific.iter().map(String::as_str));
         out
     }
 
-    /// [render] の入力として宣言されているか。
+    /// この OS で生成する [render] の 出力 -> テンプレート。
+    pub fn renders_here(&self) -> Vec<(&str, &str)> {
+        self.render
+            .iter()
+            .filter(|(_, r)| r.here())
+            .map(|(out, r)| (out.as_str(), r.template()))
+            .collect()
+    }
+
+    /// [render] の入力として宣言されているか。OS を問わない。
+    /// 別の OS 向けのテンプレートも、ここで配置してよいものではない。
     pub fn is_template(&self, rel: &Path) -> bool {
-        self.render.values().any(|t| Path::new(t) == rel)
+        self.render.values().any(|r| Path::new(r.template()) == rel)
+    }
+
+    /// 別の OS でだけ生成する [render] の出力か。
+    ///
+    /// この OS では作らないので、リポジトリに残っていても(共有した作業ツリー、
+    /// 以前の生成物)配置しない。古いままのファイルを張ることになる。
+    pub fn is_foreign_output(&self, rel: &Path) -> bool {
+        self.render
+            .iter()
+            .any(|(out, r)| !r.here() && Path::new(out) == rel)
     }
 
     /// [encrypted] の入力として宣言されているか。暗号文も配置しない。
@@ -269,6 +426,7 @@ impl Manifest {
     pub fn is_ignored(&self, rel: &Path) -> bool {
         self.link
             .ignore
+            .here()
             .iter()
             .any(|pat| crate::glob::Pattern::new(pat).matches(rel))
     }
@@ -337,7 +495,7 @@ mod tests {
                 darwin: vec![],
                 linux: vec![],
                 windows: vec![],
-                ignore: ignore.iter().map(|s| s.to_string()).collect(),
+                ignore: Ignore::List(ignore.iter().map(|s| s.to_string()).collect()),
             },
             render: Default::default(),
             hooks: Default::default(),
@@ -401,6 +559,8 @@ mod tests {
     fn declared_templates_are_never_placed() {
         let mut m = manifest(&[]);
         m.render.insert("a.conf".into(), "a.conf.tmpl".into());
+        assert!(m.is_template(Path::new("a.conf.tmpl")));
+        assert!(!m.is_foreign_output(Path::new("a.conf")));
         assert!(m.is_template(Path::new("a.conf.tmpl")));
         assert!(!m.is_template(Path::new("a.conf")));
     }
@@ -545,6 +705,77 @@ mod tests {
         let e = load("[link]\ncommon = []\n\n[merge.\"x.json\"]\nfrom = \"/etc/s.json\"\n")
             .unwrap_err();
         assert!(format!("{e:#}").contains("absolute"), "{e:#}");
+    }
+
+    /// `[link.ignore]` は OS ごとに書ける。common は全 OS に効く。
+    #[test]
+    fn ignore_can_be_written_per_os() {
+        let m = load(
+            "[link]\ncommon = [\".config\"]\n\n[link.ignore]\ncommon = [\"*.tmpl\"]\ndarwin = [\".config/d\"]\nlinux = [\".config/l\"]\nwindows = [\".config/w\"]\n",
+        )
+        .unwrap();
+        assert!(m.is_ignored(Path::new(".config/a.tmpl")));
+        let here = if cfg!(target_os = "macos") {
+            "d"
+        } else if cfg!(windows) {
+            "w"
+        } else {
+            "l"
+        };
+        for os in ["d", "l", "w"] {
+            let p = format!(".config/{os}/x");
+            assert_eq!(m.is_ignored(Path::new(&p)), os == here, "{p}");
+        }
+    }
+
+    /// 配列の書き方はそのまま通る。
+    #[test]
+    fn the_ignore_array_still_applies_everywhere() {
+        let m = load("[link]\ncommon = []\nignore = [\"*.tmpl\"]\n").unwrap();
+        assert!(m.is_ignored(Path::new("a.tmpl")));
+    }
+
+    #[test]
+    fn an_unknown_os_under_link_ignore_is_rejected() {
+        let e = load("[link]\ncommon = []\n\n[link.ignore]\nmacos = [\"x\"]\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown field `macos`"), "{e:#}");
+    }
+
+    /// `os` を付けた [render] は、その OS でだけ生成し配置する。テンプレートは
+    /// どの OS でも配置しない。
+    #[test]
+    fn a_render_can_be_limited_to_some_os() {
+        let m = load(
+            "[link]\ncommon = [\"c\"]\n\n[render]\n\"c/all.conf\" = \"c/all.conf.tmpl\"\n\"c/d.conf\" = { from = \"c/d.conf.tmpl\", os = [\"darwin\"] }\n\"c/w.conf\" = { from = \"c/w.conf.tmpl\", os = [\"windows\"] }\n",
+        )
+        .unwrap();
+        let here: Vec<&str> = m.renders_here().into_iter().map(|(o, _)| o).collect();
+        assert!(here.contains(&"c/all.conf"));
+        assert_eq!(here.contains(&"c/d.conf"), cfg!(target_os = "macos"));
+        assert_eq!(here.contains(&"c/w.conf"), cfg!(windows));
+        assert_eq!(m.is_foreign_output(Path::new("c/w.conf")), !cfg!(windows));
+        assert!(!m.is_foreign_output(Path::new("c/all.conf")));
+        for t in ["c/all.conf.tmpl", "c/d.conf.tmpl", "c/w.conf.tmpl"] {
+            assert!(m.is_template(Path::new(t)), "{t}");
+        }
+    }
+
+    #[test]
+    fn a_render_with_an_unknown_os_or_key_is_rejected() {
+        let e = load(
+            "[link]\ncommon = []\n\n[render]\n\"a\" = { from = \"a.tmpl\", os = [\"macos\"] }\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("unknown os"), "{e:#}");
+        let e = load("[link]\ncommon = []\n\n[render]\n\"a\" = { template = \"a.tmpl\" }\n")
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("unknown field `template`"),
+            "{e:#}"
+        );
+        let e = load("[link]\ncommon = []\n\n[render]\n\"a\" = { from = \"../a.tmpl\" }\n")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains(".."), "{e:#}");
     }
 
     #[test]
