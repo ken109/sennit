@@ -2765,3 +2765,50 @@ common = [{ path = "win", to = "elsewhere" }, "win/plain"]
     assert!(r.home_path("win/plain/b.conf").exists());
     assert!(std::fs::symlink_metadata(r.home_path("elsewhere/plain/b.conf")).is_err());
 }
+
+/// A place that another entry takes over is relinked, not pruned first: a
+/// renamed source, two entries that swap places, and a plain entry replaced by a
+/// `to` that lands on the same path.
+#[test]
+fn a_place_taken_over_by_another_entry_is_relinked() {
+    let link_of = |r: &Repo, rel: &str| canon(&std::fs::read_link(r.home_path(rel)).unwrap());
+
+    // rename: old/x.conf -> new/x.conf, both placed at cfg/x.conf
+    let r = Repo::new("takeover-rename");
+    r.write("old/x.conf", "x\n");
+    r.write("new/x.conf", "x\n");
+    r.manifest("[link]\ncommon = [{ path = \"old\", to = \"cfg\" }]\n");
+    ok(&r.run(&["apply"]));
+    r.manifest("[link]\ncommon = [{ path = \"new\", to = \"cfg\" }]\n");
+    ok(&r.run(&["apply"]));
+    assert_eq!(link_of(&r, "cfg/x.conf"), canon(&r.root_path("new/x.conf")));
+
+    // swap: a -> pa, b -> pb becomes a -> pb, b -> pa
+    let r = Repo::new("takeover-swap");
+    r.write("a/f", "a\n");
+    r.write("b/f", "b\n");
+    r.manifest("[link]\ncommon = [{ path = \"a\", to = \"pa\" }, { path = \"b\", to = \"pb\" }]\n");
+    ok(&r.run(&["apply"]));
+    r.manifest("[link]\ncommon = [{ path = \"a\", to = \"pb\" }, { path = \"b\", to = \"pa\" }]\n");
+    ok(&r.run(&["apply"]));
+    assert_eq!(link_of(&r, "pa/f"), canon(&r.root_path("b/f")));
+    assert_eq!(link_of(&r, "pb/f"), canon(&r.root_path("a/f")));
+
+    // a plain entry replaced by a `to` onto the same path
+    let r = Repo::new("takeover-plain");
+    r.write(".config/tool/c", "old\n");
+    r.write("win/tool/c", "new\n");
+    r.manifest("[link]\ncommon = [\".config/tool\"]\n");
+    ok(&r.run(&["apply"]));
+    r.manifest("[link]\ncommon = [{ path = \"win/tool\", to = \".config/tool\" }]\n");
+    ok(&r.run(&["apply"]));
+    assert_eq!(
+        link_of(&r, ".config/tool/c"),
+        canon(&r.root_path("win/tool/c"))
+    );
+
+    // and dropping it afterwards still prunes it
+    r.manifest("[link]\ncommon = []\n");
+    ok(&r.run(&["apply"]));
+    assert!(std::fs::symlink_metadata(r.home_path(".config/tool/c")).is_err());
+}
