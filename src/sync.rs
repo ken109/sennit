@@ -9,21 +9,17 @@ use std::process::Command;
 /// 冪等性は「入っているかを先に問い合わせ、差分だけ install する」ことで
 /// 得る。マネージャの install が冪等かどうかに依存しない。
 /// マネージャを実行する順序。土台になるものから先に入れる。
-const ORDER: [Manager; 5] = [
+const ORDER: [Manager; 6] = [
     Manager::Apt,
     Manager::Yay,
+    // Windows の土台。mise も winget で入る
+    Manager::Winget,
     Manager::Brew,
     Manager::BrewCask,
     Manager::Mise,
 ];
 
 pub fn sync(root: &Path, dry_run: bool) -> Result<()> {
-    if cfg!(windows) {
-        bail!(
-            "sync is not supported on Windows: there is no package manager it knows how to drive. \
-             Install the declared packages with winget or scoop yourself"
-        );
-    }
     let packages = Packages::load(&root.join("packages.toml"))?;
     let wanted = packages.installable();
 
@@ -31,6 +27,12 @@ pub fn sync(root: &Path, dry_run: bool) -> Result<()> {
     for manager in ORDER {
         let names: Vec<&Installable> = wanted.iter().filter(|i| i.manager == manager).collect();
         if names.is_empty() {
+            continue;
+        }
+        // winget には「一覧を 1 回で取る」安定した手段が無い(表は列が切り詰められる)。
+        // 1 件ずつ訊き、upgrade の宣言も扱うので別に回す
+        if manager == Manager::Winget {
+            planned += winget::sync(&names, dry_run)?;
             continue;
         }
 
@@ -75,6 +77,7 @@ fn label(m: Manager) -> &'static str {
         Manager::Mise => "mise",
         Manager::Apt => "apt",
         Manager::Yay => "yay",
+        Manager::Winget => "winget",
         Manager::ZedExtension => "zed",
         Manager::None | Manager::Unknown => "-",
     }
@@ -243,6 +246,149 @@ fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// winget を回す部分。Windows 以外でも型検査とテストが通るよう cfg で分けない。
+pub mod winget {
+    use super::Installable;
+    use anyhow::{bail, Context, Result};
+    use std::process::Command;
+
+    /// `winget list` が「入っていない」と答えるときの終了コード
+    /// (APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND)
+    pub const NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
+    /// `winget upgrade` が「新しい版が無い」と答えるときの終了コード
+    /// (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE)。失敗ではない
+    pub const UPDATE_NOT_APPLICABLE: u32 = 0x8A15_002B;
+
+    /// どのパッケージにも付ける引数。ID の完全一致で、winget のソースだけを見て、
+    /// 端末に何も訊かない。
+    const COMMON: [&str; 5] = [
+        "--exact",
+        "--source",
+        "winget",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+    ];
+
+    /// 1 件ずつ見て、入っていないものを入れ、upgrade の宣言があるものは上げる。
+    /// 戻り値は入れる(--dry-run なら入れるはずの)件数。
+    pub fn sync(wanted: &[&Installable], dry_run: bool) -> Result<usize> {
+        let mut missing: Vec<&Installable> = Vec::new();
+        let mut upgrades: Vec<&Installable> = Vec::new();
+        let mut elsewhere: Vec<(&Installable, String)> = Vec::new();
+        for i in wanted {
+            if installed(&i.name)? {
+                if i.upgrade {
+                    upgrades.push(i);
+                }
+                continue;
+            }
+            // winget の一覧に無くても、同じコマンドが PATH にあれば別の手段で
+            // 入っている。入れると同じ道具が 2 つ並び、どちらが動くか分からなくなる
+            if let Some(found) = on_path(&i.commands) {
+                elsewhere.push((i, found));
+                continue;
+            }
+            missing.push(i);
+        }
+
+        println!(
+            "winget: {} declared, {} missing",
+            wanted.len(),
+            missing.len()
+        );
+        for (i, found) in &elsewhere {
+            println!("  \x1b[36m=\x1b[0m {}  (already on PATH: {found})", i.name);
+        }
+        for i in &missing {
+            println!("  \x1b[33m+\x1b[0m {}", i.name);
+        }
+        for i in &upgrades {
+            println!("  \x1b[33m^\x1b[0m {}  (upgrade)", i.name);
+        }
+        if dry_run {
+            return Ok(missing.len());
+        }
+
+        let mut failed: Vec<String> = Vec::new();
+        for i in &missing {
+            let code = run(&["install", "--id", &i.name, "--accept-package-agreements"])?;
+            if code != 0 {
+                failed.push(format!("{} (install exited {})", i.name, describe(code)));
+            }
+        }
+        for i in &upgrades {
+            let code = run(&["upgrade", "--id", &i.name, "--accept-package-agreements"])?;
+            if !upgrade_succeeded(code) {
+                failed.push(format!("{} (upgrade exited {})", i.name, describe(code)));
+            }
+        }
+        if !failed.is_empty() {
+            bail!("winget failed for: {}", failed.join(", "));
+        }
+        Ok(missing.len())
+    }
+
+    /// 0 と「新しい版が無い」は成功。
+    pub fn upgrade_succeeded(code: u32) -> bool {
+        code == 0 || code == UPDATE_NOT_APPLICABLE
+    }
+
+    /// 終了コードを 16 進でも見せる。winget の失敗は 0x8A15.... で引く
+    pub fn describe(code: u32) -> String {
+        format!("{} / 0x{code:08X}", code as i32)
+    }
+
+    /// その ID が入っているか。winget が無い・訊けないときは落とす。
+    /// 黙って「入っていない」と読むと、全部を入れ直しにかかる。
+    pub fn installed(id: &str) -> Result<bool> {
+        let out = Command::new("winget")
+            .arg("list")
+            .args(["--id", id])
+            .args(COMMON)
+            .output()
+            .context(
+                "failed to run `winget`; install App Installer from the Microsoft Store \
+                 (winget is part of it)",
+            )?;
+        let code = exit_code(&out.status);
+        match code {
+            0 => Ok(true),
+            NO_APPLICATIONS_FOUND => Ok(false),
+            _ => bail!(
+                "`winget list --id {id}` failed with {}: {}",
+                describe(code),
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+        }
+    }
+
+    fn run(args: &[&str]) -> Result<u32> {
+        let status = Command::new("winget")
+            .args(args)
+            .args(COMMON)
+            .status()
+            .context("failed to run `winget`")?;
+        Ok(exit_code(&status))
+    }
+
+    /// Windows の終了コードは 32 ビットの符号なし値。i32 で返ってくるので戻す
+    fn exit_code(status: &std::process::ExitStatus) -> u32 {
+        status.code().map(|c| c as u32).unwrap_or(u32::MAX)
+    }
+
+    fn on_path(commands: &[String]) -> Option<String> {
+        let paths = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&paths) {
+            for c in commands.iter().filter(|c| !c.is_empty()) {
+                if let Some(p) = crate::platform::find_in_dir(&dir, c) {
+                    return Some(p.display().to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,10 +407,24 @@ mod tests {
         assert!(pos(Manager::Yay) < pos(Manager::Brew));
     }
 
-    /// mise は brew で入るので brew より後。
+    /// mise は brew で入るので brew より後。Windows では winget が入れる。
     #[test]
     fn mise_runs_after_the_manager_that_installs_it() {
         assert!(pos(Manager::Brew) < pos(Manager::Mise));
+        assert!(pos(Manager::Winget) < pos(Manager::Mise));
+    }
+
+    /// 「新しい版が無い」は失敗ではない。毎回 upgrade する宣言が、最新の
+    /// マシンで毎回 sync を落とさないように。
+    #[test]
+    fn winget_reporting_no_newer_version_is_not_a_failure() {
+        assert!(winget::upgrade_succeeded(0));
+        assert!(winget::upgrade_succeeded(0x8A15_002B));
+        // PowerShell の $LASTEXITCODE で見える値と同じもの
+        assert_eq!(0x8A15_002Bu32 as i32, -1978335189);
+        assert!(!winget::upgrade_succeeded(1));
+        assert!(!winget::upgrade_succeeded(winget::NO_APPLICATIONS_FOUND));
+        assert_eq!(winget::describe(0x8A15_002B), "-1978335189 / 0x8A15002B");
     }
 
     /// cask は formula より後(unzip などの依存が formula 側にもあるため)。
