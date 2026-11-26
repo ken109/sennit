@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 /// ghostty と gitui の設定を消したとき、リンクは手で消す必要があった。
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
-    /// リポジトリルートからの相対パス。$HOME からの相対でもある
+    /// 張ったファイルの、リポジトリルートからの相対パス。
+    ///
+    /// `placed` に載っていなければ、$HOME からの相対でもある
     pub links: Vec<PathBuf>,
     /// 退避したファイル。apply の巻き戻しに使う
     #[serde(default)]
@@ -76,6 +78,10 @@ impl State {
     ///
     /// 宣言から外れたものに加え、`to` が変わって置き場所が移ったものも含む。
     /// パスだけで比べると、移った先に張り直したあと、元の場所のリンクが残る。
+    ///
+    /// 今回の項目のどれかが同じ場所に置くなら stale ではない(改名・入れ替え・
+    /// 平の項目を外して `to` で同じ場所へ置き直す)。そこは張り替えの対象で、
+    /// 先に prune すると、張り替えが消えたリンクを外しにいって落ちる。
     pub fn stale_dests(
         &self,
         home: &Path,
@@ -87,7 +93,7 @@ impl State {
                 let was = self.placed_at(home, old);
                 let still = current
                     .iter()
-                    .any(|(rel, dest)| rel == old && crate::platform::same_path(dest, &was));
+                    .any(|(_, dest)| crate::platform::same_path(dest, &was));
                 (!still).then(|| (old.clone(), was))
             })
             .collect()
@@ -141,6 +147,12 @@ mod tests {
             (PathBuf::from("b"), PathBuf::from("/docs/b")),
         ];
         assert!(st.stale_dests(&home, &same).is_empty());
+        // 別の項目がその場所を使うなら、張り替えであって prune ではない
+        let reused = vec![(PathBuf::from("c"), PathBuf::from("/docs/b"))];
+        assert_eq!(
+            st.stale_dests(&home, &reused),
+            vec![(PathBuf::from("a"), PathBuf::from("/h/a"))]
+        );
     }
 
     /// これを知らない版が書いた記録(placed が無い)も読める。

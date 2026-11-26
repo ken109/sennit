@@ -142,7 +142,8 @@ in each platform's list. Everything else — `ignore`, `[render]`, `[modes]` —
 the path in the repository. When several entries contain a file, the deepest one decides
 where it goes, and two entries that would put files at the same place are refused before
 anything is linked. Moving or removing a `to` prunes the links at the old place, which is
-recorded in the state for that purpose. `to` must name something under its folder: `{home}`, `.` or `{appdata}` alone,
+recorded in the state for that purpose; a place that another entry now uses is relinked,
+not pruned. `to` must name something under its folder: `{home}`, `.` or `{appdata}` alone,
 and `{appdata}herdr` without the `/`, are refused. sennit 0.21 and earlier refuse a
 manifest that uses the table form.
 
