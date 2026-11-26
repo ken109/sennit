@@ -142,7 +142,7 @@ impl Winget {
 }
 
 /// sync が実際に導入するパッケージ 1 件。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installable {
     /// マネージャに渡す名前(winget なら ID)
     pub name: String,
