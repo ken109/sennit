@@ -142,8 +142,16 @@ fn run() -> Result<()> {
     let home = absolute(&home).with_context(|| format!("bad --home: {}", home.display()))?;
 
     // 既知のフォルダ({documents} など)は、本物の $HOME のときだけ OS に訊く。
-    // --home を渡した試しの実行が、本物のプロファイルに張りに行かないように
-    let dirs = platform::Dirs::new(home.clone(), cli.home.is_none());
+    // --home を渡した試しの実行が、本物のプロファイルに張りに行かないように。
+    // --home に本物の $HOME を渡したなら、渡さなかったのと同じ
+    let real = match &cli.home {
+        None => true,
+        Some(_) => platform::home_dir()
+            .ok()
+            .and_then(|h| absolute(&h).ok())
+            .is_some_and(|h| platform::same_path(&h, &home)),
+    };
+    let dirs = platform::Dirs::new(home.clone(), real);
 
     let manifest = Manifest::load(&root.join("sennit.toml"))?;
     let plan = Plan::build(&root, &dirs, &manifest)?;
