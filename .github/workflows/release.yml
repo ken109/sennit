@@ -8,6 +8,10 @@ on:
       tag:
         description: "Tag to build (e.g. v0.1.0)"
         required: true
+      crate_only:
+        description: "Only publish the tag to crates.io (keep the existing GitHub Release and its binaries)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -15,6 +19,7 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.target }}
+    if: ${{ !inputs.crate_only }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -70,6 +75,7 @@ jobs:
 
   release:
     needs: build
+    if: ${{ !inputs.crate_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -91,6 +97,8 @@ jobs:
   # GitHub Release が出来てから公開する（ビルドが落ちた版を crates.io にだけ出さない。公開は取り消せない）。
   publish-crate:
     needs: release
+    # crate_only のときは release が飛ばされるので、飛ばされたときも走らせる
+    if: ${{ !cancelled() && (needs.release.result == 'success' || (inputs.crate_only && needs.release.result == 'skipped')) }}
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
