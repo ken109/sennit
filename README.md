@@ -171,6 +171,13 @@ and `sync`; `apply` does not read it. What was linked is recorded in
 default to searching upwards for `sennit.toml` and to `$HOME` (`%USERPROFILE%` on Windows). `compare` is the one
 command that does not need a repository at all.
 
+With `--home`, hooks and their `check`s are not run: they act on the real OS (a launchd or
+systemd registration lands in the real profile whatever `$HOME` is), which a trial run
+must not touch. `apply` lists each hook as `skipped` instead and leaves its fingerprint
+alone, so a later real `apply` still runs it; `verify` skips the checks and says so, rather
+than passing or failing them. Add `--run-hooks` to run them anyway. Without `--home` it
+changes nothing.
+
 `--dry-run` writes nothing — not the symlinks, and not the generated files either. It does
 not call a secret provider or a decryption command, since both can ask a person to unlock
 something, which a command that says it changes nothing has no business doing.
@@ -448,7 +455,8 @@ when-changed = [".config/bat/themes"]
 run = "bat cache --build"
 ```
 
-`apply` runs a hook after linking, and only when what it watches has changed. A hook with
+`apply` runs a hook after linking, and only when what it watches has changed (not with
+`--home`, unless `--run-hooks` is given). A hook with
 no `when-changed` runs every time. `cwd` sets where it runs, relative to the repository
 root; the default is the root itself. Hooks run in name order. A hook that exits non-zero
 fails the apply — the links are already placed and recorded by then, so `sennit rollback`
@@ -510,6 +518,7 @@ check = "bash script/register-agents.sh --check"
   could not run.
 - `--dry-run` runs checks too, so the preview matches what `apply` will do. A check must
   only look, never change anything.
+- With `--home`, checks are not run at all (see above); `--run-hooks` runs them.
 
 sennit 0.22 and earlier refuse `check`.
 
