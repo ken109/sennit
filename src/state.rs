@@ -53,17 +53,32 @@ impl State {
             Ok(text) => serde_json::from_str(&text)
                 .with_context(|| format!("failed to parse {}", p.display())),
             // 初回は空
-            Err(_) => Ok(Self::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            // 読めないだけのものを「初回」と読むと、apply がそれを空の記録で
+            // 書き潰し、退避の在り処も張ったリンクの記録も失われる
+            Err(err) => Err(anyhow::Error::new(err))
+                .with_context(|| format!("failed to read {}", p.display())),
         }
     }
 
+    /// 書き出す。一時ファイルに書いてから置き換えるので、途中で落ちても
+    /// 前の記録か新しい記録のどちらかが残る。
+    ///
+    /// 直に書くと、切り詰めたあとで落ちた記録は JSON として読めず、次の apply が
+    /// 「壊れている」で止まる。退避の在り処もそこにしか書いていない。
     pub fn save(&self, home: &Path) -> Result<()> {
         let p = Self::path(home);
         if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&p, text).with_context(|| format!("failed to write {}", p.display()))
+        let tmp = p.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(err).context(format!("failed to write {}", p.display()))
+        })
     }
 
     /// 前回そのパスを置いた場所。
@@ -176,6 +191,32 @@ mod tests {
         let st = State::load(&home).unwrap();
         assert!(st.links.is_empty());
         assert!(st.backups.is_empty());
+    }
+
+    /// 読めない記録を初回と取り違えない。空で書き潰すと退避の在り処が消える。
+    #[test]
+    fn an_unreadable_state_is_an_error_not_an_empty_one() {
+        let home = std::env::temp_dir().join("sennit-state-unreadable");
+        let _ = std::fs::remove_dir_all(&home);
+        // ファイルの代わりにディレクトリが在る: 読めるが、中身として読めない
+        std::fs::create_dir_all(State::path(&home)).unwrap();
+        let e = State::load(&home).unwrap_err();
+        assert!(format!("{e:#}").contains("failed to read"), "{e:#}");
+    }
+
+    /// 書き出しは一時ファイルを経る。終わったあとに一時ファイルが残らない。
+    #[test]
+    fn saving_leaves_no_temporary_file_behind() {
+        let home = std::env::temp_dir().join("sennit-state-atomic");
+        let _ = std::fs::remove_dir_all(&home);
+        State::default().save(&home).unwrap();
+        State::default().save(&home).unwrap();
+        let dir = State::path(&home).parent().unwrap().to_path_buf();
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["state.json".to_string()]);
     }
 
     #[test]
