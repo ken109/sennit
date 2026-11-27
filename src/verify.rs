@@ -251,7 +251,15 @@ fn verify_machine(
     // [env.windows] がユーザー環境変数と食い違っていないか
     let bad_env = crate::userenv::verify(&manifest.env, dirs)?;
 
-    if missing.is_empty() && wrong_modes.is_empty() && bad_merges == 0 && bad_env == 0 {
+    // フックの check: 走らせた結果が OS の側にあるもの(launchd・systemd への登録など)
+    let bad_hooks = crate::hooks::verify(root, &manifest.hooks);
+
+    if missing.is_empty()
+        && wrong_modes.is_empty()
+        && bad_merges == 0
+        && bad_env == 0
+        && bad_hooks == 0
+    {
         println!("\x1b[32mok\x1b[0m  everything verifiable is present");
         return Ok(());
     }
@@ -270,6 +278,9 @@ fn verify_machine(
     }
     if bad_env > 0 {
         problems.push(format!("{bad_env} environment variable(s) not as declared"));
+    }
+    if bad_hooks > 0 {
+        problems.push(format!("{bad_hooks} hook(s) whose check fails"));
     }
     bail!("{}", problems.join("; "))
 }

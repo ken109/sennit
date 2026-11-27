@@ -1012,6 +1012,65 @@ fn apply_does_not_claim_nothing_happened_after_running_a_hook() {
     );
 }
 
+/// フックの check: verify が崩れたことを言い、apply が走らせ直す。
+/// 走らせた結果が OS の側にある登録(launchd・systemd)を、外されたまま
+/// 誰も気づかない、を防ぐ。
+#[test]
+fn a_hook_check_is_verified_and_heals_on_apply() {
+    let r = Repo::new("hook-check");
+    r.manifest(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.agents]\n\
+         when-changed = [\"agent.plist\"]\n\
+         run = \"touch registered\"\n\
+         check = \"test -f registered\"\n",
+    );
+    r.write("a.conf", "repo\n");
+    r.write("agent.plist", "v1\n");
+
+    // まだ登録されていない
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success());
+    let text = both(&out);
+    assert!(
+        text.contains("agents") && text.contains("check failed"),
+        "{text}"
+    );
+    assert!(text.contains("1 hook(s) whose check fails"), "{text}");
+
+    ok(&r.run(&["apply"]));
+    ok(&r.run(&["verify"]));
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("already up to date"), "{out}");
+
+    // 誰かが登録を外した。監視対象は変わっていない
+    std::fs::remove_file(r.root_path("registered")).unwrap();
+    let out = r.run(&["verify"]);
+    assert!(!out.status.success(), "{}", both(&out));
+    let out = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(out.contains("agents  (its check failed)"), "{out}");
+    assert!(!r.root_path("registered").exists());
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("agents  (its check failed)"), "{out}");
+    assert!(r.root_path("registered").exists());
+    ok(&r.run(&["verify"]));
+}
+
+/// 走らせても check が成り立たなければ apply を落とす。
+#[test]
+fn apply_fails_when_a_hook_does_not_make_its_check_pass() {
+    let r = Repo::new("hook-check-still");
+    r.manifest(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.agents]\n\
+         run = \"true\"\n\
+         check = \"test -f registered\"\n",
+    );
+    r.write("a.conf", "repo\n");
+    let out = r.run(&["apply"]);
+    assert!(!out.status.success());
+    let text = both(&out);
+    assert!(text.contains("ran, but its check still fails"), "{text}");
+}
+
 /// 締め出すモードは preview の時点で断る。
 #[cfg(unix)]
 #[test]

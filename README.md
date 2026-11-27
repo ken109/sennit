@@ -481,6 +481,36 @@ run = "if (Get-Command bat -ErrorAction Ignore) { bat cache --build | Out-Null }
 
 sennit 0.21 and earlier refuse `os` and `shell`.
 
+### Checking that a hook's work is still in place
+
+What `when-changed` knows is that a hook ran, not that what it did is still there. When the
+result lives outside the repository — a launchd agent or a systemd user timer it
+registered — someone can unload it, or the registration can fail quietly behind a `|| true`,
+and the fingerprint never changes: `apply` does not run the hook again and nothing says so.
+`check` names a command that answers whether it is in place:
+
+```toml
+[hooks.agents]
+os = ["darwin", "linux"]
+when-changed = ["script/launchd", ".config/systemd/user", "script/register-agents.sh"]
+run = "bash script/register-agents.sh"
+check = "bash script/register-agents.sh --check"
+```
+
+`check` runs under the hook's `shell` and in its `cwd`, and exit 0 means in place.
+
+- `apply` runs the hook when what it watches changed **or** its check fails, and prints
+  `hook agents  (its check failed)` in the second case. A hook with a `check` and no
+  `when-changed` runs only when the check fails; one with neither still runs every time.
+- After running a hook, `apply` asks the check again, and fails if it still does not pass:
+  a hook that exits 0 without doing its job is a failure, not a success.
+- `verify` runs every check for this platform and reports the hooks whose check fails, or
+  could not run.
+- `--dry-run` runs checks too, so the preview matches what `apply` will do. A check must
+  only look, never change anything.
+
+sennit 0.22 and earlier refuse `check`.
+
 ## File modes
 
 
