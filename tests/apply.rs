@@ -1793,6 +1793,34 @@ fn a_link_that_leaves_the_repository_is_replaced_without_touching_its_target() {
     assert_eq!(std::fs::read_dir(&life).unwrap().count(), 1);
 }
 
+/// 退避したリンクの行き先が消えても、退避は記録から落ちない。`exists()` で見ると
+/// リンクを辿って「無い」と読み、次の apply が記録を捨て、rollback が戻せなかった。
+#[test]
+fn a_kept_link_whose_target_is_gone_is_still_rolled_back() {
+    let r = Repo::new("ancestor-outside-dangling");
+    r.manifest("[link]\ncommon = [\".claude\"]\n");
+    r.write(".claude/skills/progress/SKILL.md", "from dotfiles\n");
+    let life = r.home.parent().unwrap().join("life/skills/progress");
+    std::fs::create_dir_all(&life).unwrap();
+    std::fs::write(life.join("SKILL.md"), "from life\n").unwrap();
+    let old_link = r.home_path(".claude/skills/progress");
+    std::fs::create_dir_all(r.home_path(".claude/skills")).unwrap();
+    symlink(&life, &old_link);
+
+    ok(&r.run(&["apply"]));
+    // 別のツリーが消えた。退避したリンクは行き先を失う
+    std::fs::remove_dir_all(r.home.parent().unwrap().join("life")).unwrap();
+    // 記録を書き直す apply を挟む
+    r.write(".claude/CLAUDE.md", "top\n");
+    ok(&r.run(&["apply"]));
+
+    let out = ok(&r.run(&["list"]));
+    assert!(out.contains("progress.sennit-backup"), "{out}");
+    let out = ok(&r.run(&["rollback"]));
+    assert!(out.contains("1 file(s) restored"), "{out}");
+    assert_eq!(std::fs::read_link(&old_link).unwrap(), life);
+}
+
 /// `--no-backup` does not keep the old link; the target is still untouched.
 #[test]
 fn no_backup_drops_an_outside_link_and_still_leaves_its_target_alone() {

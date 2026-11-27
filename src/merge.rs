@@ -440,7 +440,8 @@ pub fn apply_all(
             println!("            {}", describe_keys(&prep.keys));
         }
         if dry_run {
-            let has_backup = Path::new(&format!("{}.sennit-backup", p.dest.display())).exists();
+            let has_backup =
+                crate::on_disk(Path::new(&format!("{}.sennit-backup", p.dest.display())));
             if first_touch && backup && !has_backup {
                 println!("            the existing file would be kept at <name>.sennit-backup");
             }
@@ -450,7 +451,7 @@ pub fn apply_all(
         // A backup already sitting next to it is the user's original, from an
         // earlier apply. A state that forgot about it (an older sennit rewrote
         // it) must not make the merged file the new "original".
-        let has_backup = Path::new(&format!("{}.sennit-backup", p.dest.display())).exists();
+        let has_backup = crate::on_disk(Path::new(&format!("{}.sennit-backup", p.dest.display())));
         if first_touch && backup && !has_backup {
             let to = crate::backup_path(&p.dest)?;
             std::fs::copy(&p.dest, &to).with_context(|| {

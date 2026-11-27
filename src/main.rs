@@ -725,7 +725,7 @@ fn apply(
     let mut kept: Vec<state::Backup> = previous
         .backups
         .iter()
-        .filter(|b| b.kept_at.exists())
+        .filter(|b| on_disk(&b.kept_at))
         .cloned()
         .collect();
     // 前回までの退避の数。終わりに「退避した」と言うのは、この実行で増えた分だけ。
@@ -1050,7 +1050,7 @@ fn apply(
 /// apply は、その実行で退避したものしか言わない。積み上がった退避は
 /// ここ(`list`)で見せる。在り処が消えたものは数えない。
 fn print_backups(backups: &[state::Backup], changed_only: bool) -> usize {
-    let kept: Vec<_> = backups.iter().filter(|b| b.kept_at.exists()).collect();
+    let kept: Vec<_> = backups.iter().filter(|b| on_disk(&b.kept_at)).collect();
     if !changed_only {
         for b in &kept {
             println!(
@@ -1097,7 +1097,7 @@ fn rollback(home: &Path, dry_run: bool) -> Result<()> {
         println!("  {:>8}  {}", "restore", b.dest.display());
         // 退避そのものが消えていることがある。数に入れると「戻した」と
         // 言いながら何も戻していない状態になる。
-        if !b.kept_at.exists() {
+        if !on_disk(&b.kept_at) {
             println!("            the backup is gone; nothing to put back");
             missing += 1;
             continue;
@@ -1219,16 +1219,26 @@ fn remove_dest(dest: &Path, state: &State, backup: bool) -> Result<Option<PathBu
 fn backup_path(dest: &Path) -> Result<PathBuf> {
     let base = format!("{}.sennit-backup", dest.display());
     let first = PathBuf::from(&base);
-    if !first.exists() {
+    if !on_disk(&first) {
         return Ok(first);
     }
     for n in 1..1000 {
         let p = PathBuf::from(format!("{base}.{n}"));
-        if !p.exists() {
+        if !on_disk(&p) {
             return Ok(p);
         }
     }
     bail!("too many backups next to {}", dest.display())
+}
+
+/// そのパスに何かが在るか。symlink は辿らず、リンクそのものを見る。
+///
+/// `Path::exists()` はリンクを辿るので、行き先の消えたリンクを「無い」と答える。
+/// 退避したものがリポジトリの外を指すリンク(relink-parent で退けたもの)だと、
+/// 行き先が消えただけで記録から落ち、次の退避がその名前に rename して
+/// 黙って潰していた。退避の有無はリンクそのもので見る。
+pub(crate) fn on_disk(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
 }
 
 fn print_diff(plan: &Plan, merges: &[merge::Planned], env: &merge::Env) {
@@ -1405,6 +1415,20 @@ mod tests {
         assert_eq!(
             backup_path(&dest).unwrap(),
             d.join("a.conf.sennit-backup.2")
+        );
+    }
+
+    /// 行き先の消えたリンクも退避として在る。その名前に次の退避を rename すると、
+    /// 前の退避が黙って消える。
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_that_is_a_dangling_link_is_not_overwritten() {
+        let d = scratch("backup-path-dangling");
+        let dest = d.join("skills");
+        std::os::unix::fs::symlink(d.join("gone"), d.join("skills.sennit-backup")).unwrap();
+        assert_eq!(
+            backup_path(&dest).unwrap(),
+            d.join("skills.sennit-backup.1")
         );
     }
 
