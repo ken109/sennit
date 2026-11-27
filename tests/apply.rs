@@ -210,6 +210,57 @@ fn a_backup_survives_a_later_apply() {
     );
 }
 
+/// apply が「退避した」と言うのは、その実行で退避したものだけ。前回までの
+/// 退避は `list` が見せる。記録全体を数えると、何も退避しなかった apply が
+/// 毎回同じ件数を言い続け、今まさに何かを動かしたように読める。
+#[test]
+fn apply_reports_only_what_it_moved_aside_this_time() {
+    let r = Repo::new("backup-count");
+    r.manifest("[link]\ncommon = [\"a.conf\"]\n");
+    r.write("a.conf", "repo\n");
+    r.write("b.conf", "repo b\n");
+    r.write("c.conf", "repo c\n");
+    r.write_home("a.conf", "MINE\n");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("1 file(s) moved aside;"), "{out}");
+
+    // 退避の要らない変更だけの apply は、退避について何も言わない
+    r.manifest("[link]\ncommon = [\"a.conf\", \"b.conf\"]\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(out.contains("1 link(s) updated"), "{out}");
+    assert!(!out.contains("moved aside"), "{out}");
+
+    // 新たに退避したときは、その数と、前回までの数を分けて言う
+    r.manifest("[link]\ncommon = [\"a.conf\", \"b.conf\", \"c.conf\"]\n");
+    r.write_home("c.conf", "MINE c\n");
+    let out = ok(&r.run(&["apply"]));
+    assert!(
+        out.contains("1 file(s) moved aside, 1 more from earlier applies"),
+        "{out}"
+    );
+
+    // 積み上がった退避は list で見える
+    let out = ok(&r.run(&["list"]));
+    assert!(out.contains("a.conf.sennit-backup"), "{out}");
+    assert!(out.contains("c.conf.sennit-backup"), "{out}");
+    assert!(
+        out.contains("2 file(s) moved aside by earlier applies"),
+        "{out}"
+    );
+    let out = ok(&r.run(&["list", "--changed"]));
+    assert!(!out.contains("a.conf.sennit-backup"), "{out}");
+    assert!(
+        out.contains("2 file(s) moved aside by earlier applies"),
+        "{out}"
+    );
+
+    // 戻したあとは、何も残っていない
+    ok(&r.run(&["rollback"]));
+    let out = ok(&r.run(&["list"]));
+    assert!(!out.contains("moved aside"), "{out}");
+}
+
 /// 同じ行き先に退避が 2 つあっても、古い方を消さない。
 #[test]
 fn rollback_does_not_destroy_an_older_backup() {

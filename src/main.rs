@@ -188,8 +188,9 @@ fn run() -> Result<()> {
         Command::Audit { history } => audit::audit(&root, history),
         Command::List { changed } => {
             let merges = merge::plan(&root, &home, &manifest)?;
-            let env = merge::Env::new(&root, &home, &manifest, &plan, &state::State::load(&home)?);
-            print_list(&plan, &merges, &env, changed);
+            let st = state::State::load(&home)?;
+            let env = merge::Env::new(&root, &home, &manifest, &plan, &st);
+            print_list(&plan, &merges, &env, &st.backups, changed);
             Ok(())
         }
     }
@@ -727,6 +728,9 @@ fn apply(
         .filter(|b| b.kept_at.exists())
         .cloned()
         .collect();
+    // 前回までの退避の数。終わりに「退避した」と言うのは、この実行で増えた分だけ。
+    // 記録全体を数えると、何も退避しなかった apply が毎回同じ件数を言い続ける
+    let kept_before = kept.len();
     let mut pruned = 0usize;
 
     // 途中で落ちても記録できるよう、張れたものを順に積む。既に正しく
@@ -1027,13 +1031,36 @@ fn apply(
             env_set.previewed
         );
     }
-    if !kept.is_empty() {
-        println!(
-            "{} file(s) moved aside; `sennit rollback` puts them back",
-            kept.len()
-        );
+    let moved_now = kept.len() - kept_before;
+    if moved_now > 0 {
+        if kept_before > 0 {
+            println!(
+                "{moved_now} file(s) moved aside, {kept_before} more from earlier applies; \
+                 `sennit rollback` puts them back"
+            );
+        } else {
+            println!("{moved_now} file(s) moved aside; `sennit rollback` puts them back");
+        }
     }
     Ok(())
+}
+
+/// 前回までの apply が退避し、まだ戻していないもの。
+///
+/// apply は、その実行で退避したものしか言わない。積み上がった退避は
+/// ここ(`list`)で見せる。在り処が消えたものは数えない。
+fn print_backups(backups: &[state::Backup], changed_only: bool) -> usize {
+    let kept: Vec<_> = backups.iter().filter(|b| b.kept_at.exists()).collect();
+    if !changed_only {
+        for b in &kept {
+            println!(
+                "\x1b[36mbk\x1b[0m  {}  (kept at {})",
+                b.dest.display(),
+                b.kept_at.display()
+            );
+        }
+    }
+    kept.len()
 }
 
 /// 直前の apply が退避したファイルを元に戻す。
@@ -1263,7 +1290,13 @@ fn merge_line(out: &str, st: &merge::Status) -> String {
     }
 }
 
-fn print_list(plan: &Plan, merges: &[merge::Planned], env: &merge::Env, changed_only: bool) {
+fn print_list(
+    plan: &Plan,
+    merges: &[merge::Planned],
+    env: &merge::Env,
+    backups: &[state::Backup],
+    changed_only: bool,
+) {
     let width = plan
         .entries
         .iter()
@@ -1310,6 +1343,8 @@ fn print_list(plan: &Plan, merges: &[merge::Planned], env: &merge::Env, changed_
         println!("{}", merge_line(&m.out, &st));
     }
 
+    let kept = print_backups(backups, changed_only);
+
     let n = plan.entries.len();
     let c = plan.changes().count();
     if merges.is_empty() {
@@ -1318,6 +1353,12 @@ fn print_list(plan: &Plan, merges: &[merge::Planned], env: &merge::Env, changed_
         println!(
             "\n{n} link(s), {c} need change; {} merge(s), {merge_changes} need change",
             merges.len()
+        );
+    }
+    if kept > 0 {
+        println!(
+            "{kept} file(s) moved aside by earlier applies are still kept; \
+             `sennit rollback` puts them back"
         );
     }
 }

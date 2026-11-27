@@ -159,7 +159,7 @@ and `sync`; `apply` does not read it. What was linked is recorded in
 | `sennit apply` | Render templates, then place symlinks. Only touches what needs changing. `--dry-run`, `--secrets`, `--no-backup`. |
 | `sennit rollback` | Put back files that an apply moved aside. `--dry-run`. |
 | `sennit diff` | Show what an apply would change, before it happens. |
-| `sennit list` | Show the current state of every managed path. `--changed`. |
+| `sennit list` | Show the current state of every managed path, and the files earlier applies moved aside. `--changed`. |
 | `sennit render` | Expand templates and decrypt encrypted files. `--secrets`. |
 | `sennit check` | Verify that every dependency your configs reference is declared. |
 | `sennit verify` | Verify that everything declared actually resolves on this machine. `--export`, `--secrets`. |
@@ -220,7 +220,9 @@ Two kinds of link are left alone:
 where a link should go, it is moved to `<name>.sennit-backup` rather than deleted, and
 `sennit rollback` puts it back. The record is written the
 moment a file is moved, and accumulates across applies, so neither a later apply nor a
-failure partway through can strand a file you can no longer find.
+failure partway through can strand a file you can no longer find. `apply` counts only what
+it moved aside in that run; `sennit list` shows every copy still kept from earlier ones,
+and where it is.
 
 If the same path was moved aside more than once, `rollback` restores the most recent and
 tells you where the older copies are, rather than renaming each over the last. It is
