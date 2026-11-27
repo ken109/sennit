@@ -85,3 +85,46 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/*
           generate_release_notes: true
+
+  # crates.io への公開。Trusted Publishing（GitHub の OIDC）で短命のトークンを受け取るので、秘密は置かない。
+  # crates.io の sennit の Settings > Trusted Publishing に、このレポと release.yml を登録してある前提。
+  # GitHub Release が出来てから公開する（ビルドが落ちた版を crates.io にだけ出さない。公開は取り消せない）。
+  publish-crate:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      # タグと Cargo.toml の版がずれていたら止める。既に公開済みの版なら飛ばす（workflow_dispatch の再実行で落ちないように）
+      - name: Check version
+        id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sennit") | .version')"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::タグ $TAG と Cargo.toml の版 $version がずれている"
+            exit 1
+          fi
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A 'sennit-release (github.com/ken109/sennit)' "https://crates.io/api/v1/crates/sennit/$version")"
+          if [ "$code" = 200 ]; then
+            echo "sennit $version は crates.io に公開済み。飛ばす"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.version.outputs.skip != 'true'
+        id: auth
+
+      - name: Publish
+        if: steps.version.outputs.skip != 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
