@@ -38,6 +38,13 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
+    /// Run hooks and their checks even with --home.
+    ///
+    /// Hooks act on the real OS (launchd, systemd, ...), not on --home, so a
+    /// trial run with --home only lists them. Without --home this does nothing.
+    #[arg(long, global = true)]
+    run_hooks: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -153,6 +160,9 @@ fn run() -> Result<()> {
     };
     let dirs = platform::Dirs::new(home.clone(), real);
 
+    // フックは OS の側に作用し、--home では隔離できない。試しの実行では走らせない
+    let run_hooks = dirs.is_real() || cli.run_hooks;
+
     let manifest = Manifest::load(&root.join("sennit.toml"))?;
     let plan = Plan::build(&root, &dirs, &manifest)?;
 
@@ -168,7 +178,7 @@ fn run() -> Result<()> {
             let produced = render_all(&root, &manifest, secrets, dry_run)?;
             let plan = Plan::build(&root, &dirs, &manifest)?;
             apply(
-                &plan, &merges, &root, &dirs, &manifest, dry_run, !no_backup, &produced,
+                &plan, &merges, &root, &dirs, &manifest, dry_run, !no_backup, &produced, run_hooks,
             )
         }
         Command::Rollback { dry_run } => rollback(&home, dry_run),
@@ -182,7 +192,9 @@ fn run() -> Result<()> {
         Command::Check => check(&root),
         Command::Render { secrets } => render_all(&root, &manifest, secrets, false).map(|_| ()),
         Command::Sync { dry_run } => sync::sync(&root, dry_run),
-        Command::Verify { export, secrets } => verify::verify(&root, &dirs, export, secrets),
+        Command::Verify { export, secrets } => {
+            verify::verify(&root, &dirs, export, secrets, run_hooks)
+        }
         // 先に捌いてある
         Command::Compare { .. } => unreachable!(),
         Command::Audit { history } => audit::audit(&root, history),
@@ -676,6 +688,8 @@ fn apply(
     // この実行で作られる生成物。--dry-run では実際には書かれていないので、
     // 「まだ無い」と「これから作られる」を取り違えないために要る。
     produced: &std::collections::BTreeSet<PathBuf>,
+    // false なら、フックとその check は走らせず、対象を出すだけ(--home の試しの実行)
+    run_hooks: bool,
 ) -> Result<()> {
     let home = dirs.home.as_path();
     let previous = state::State::load(home)?;
@@ -910,7 +924,11 @@ fn apply(
         // 環境変数は書かず、何を書くかだけ出す
         let env_set = userenv::apply(&manifest.env, dirs, true)?.previewed;
         // フックは実際には走らせず、何が走るかだけ出す
-        hooks::run_each(root, &manifest.hooks, &mut previous.hooks.clone(), true)?;
+        if run_hooks {
+            hooks::run_each(root, &manifest.hooks, &mut previous.hooks.clone(), true)?;
+        } else {
+            hooks::skip_each(&manifest.hooks);
+        }
         // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
         // 締め出すような宣言をここで断らないと、preview だけ通って apply が
         // 落ちる。README は diff と --dry-run から始めろと書いてある。
@@ -986,8 +1004,17 @@ fn apply(
     // 監視対象の無いフックは毎回走るので指紋が動かない。指紋の比較だけでは
     // 「何かした」を取りこぼし、実際にコマンドを走らせた回に「最新です」と
     // 出てしまう。走った本数を見る。
+    //
+    // --home の試しの実行では走らせない。指紋も動かさないので、あとで本番の
+    // apply が走らせられる。
     let mut hooks = previous.hooks.clone();
-    let ran = match hooks::run_each(root, &manifest.hooks, &mut hooks, false) {
+    let ran = if run_hooks {
+        hooks::run_each(root, &manifest.hooks, &mut hooks, false)
+    } else {
+        hooks::skip_each(&manifest.hooks);
+        Ok(0)
+    };
+    let ran = match ran {
         Ok(n) => n,
         Err(err) => {
             // 走り終えたフックの指紋は記録する。記録しないと、次の apply が

@@ -212,6 +212,30 @@ pub fn run_each(
     Ok(count)
 }
 
+/// `--home` を渡した試しの実行で、フックを走らせない代わりに、何が対象かを出す。
+/// 出した本数を返す。
+///
+/// フックは OS の側(launchd・systemd への登録など)に作用し、HOME を替えても
+/// 本物の環境に届く。`check` も同じシェルで走るので、ここでは訊かない。
+/// 訊かない以上、走る・走らないは決められないので、このマシン向けのフックを
+/// すべて並べる。指紋は触らない(走っていないので、あとの本番の apply が
+/// 走らせられるように)。
+pub fn skip_each(hooks: &BTreeMap<String, Hook>) -> usize {
+    let mut count = 0usize;
+    for name in hooks
+        .iter()
+        .filter(|(_, hook)| crate::manifest::on_this_os(&hook.os))
+        .map(|(name, _)| name)
+    {
+        println!(
+            "  {:>8}  {name}  (hooks skipped with --home; --run-hooks runs them)",
+            "skipped"
+        );
+        count += 1;
+    }
+    count
+}
+
 /// このマシン向けのフックのうち、`check` が崩れていると答えたものを出す。
 /// 戻り値はその数。
 ///

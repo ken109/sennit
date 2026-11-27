@@ -123,8 +123,9 @@ pub fn verify(
     dirs: &crate::platform::Dirs,
     export: Option<PathBuf>,
     secrets: bool,
+    run_hooks: bool,
 ) -> Result<()> {
-    let machine = verify_machine(root, dirs, export);
+    let machine = verify_machine(root, dirs, export, run_hooks);
     if !secrets {
         return machine;
     }
@@ -144,6 +145,7 @@ fn verify_machine(
     root: &Path,
     dirs: &crate::platform::Dirs,
     export: Option<PathBuf>,
+    run_hooks: bool,
 ) -> Result<()> {
     let home = dirs.home.as_path();
     let packages = Packages::load(&root.join("packages.toml"))?;
@@ -252,7 +254,22 @@ fn verify_machine(
     let bad_env = crate::userenv::verify(&manifest.env, dirs)?;
 
     // フックの check: 走らせた結果が OS の側にあるもの(launchd・systemd への登録など)
-    let bad_hooks = crate::hooks::verify(root, &manifest.hooks);
+    // --home の試しの実行では走らせない(OS の側に届くので)。落ちとも通りとも言わない
+    let bad_hooks = if run_hooks {
+        crate::hooks::verify(root, &manifest.hooks)
+    } else {
+        let n = manifest
+            .hooks
+            .values()
+            .filter(|h| h.check.is_some() && crate::manifest::on_this_os(&h.os))
+            .count();
+        if n > 0 {
+            println!(
+                "  note: hook checks skipped with --home ({n} check(s); --run-hooks runs them)"
+            );
+        }
+        0
+    };
 
     if missing.is_empty()
         && wrong_modes.is_empty()

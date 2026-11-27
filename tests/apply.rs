@@ -65,6 +65,20 @@ impl Repo {
             .unwrap()
     }
 
+    /// `--run-hooks` を足して走らせる。--home ではフックは既定で走らないので、
+    /// フックが走ることを前提にするテストはこちらを使う。
+    fn run_with_hooks(&self, args: &[&str]) -> Output {
+        Command::new(bin())
+            .arg("--root")
+            .arg(&self.root)
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--run-hooks")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     /// カレントディャレクトリをリポジトリに置いたまま、相対の --root で走らせる
     fn run_relative(&self, args: &[&str]) -> Output {
         Command::new(bin())
@@ -299,10 +313,10 @@ fn a_hook_that_finished_before_a_failure_does_not_run_again() {
          [hooks.b-boom]\nwhen-changed = [\"a.conf\"]\nrun = \"test -f fixed\"\n",
     );
     r.write("a.conf", "repo\n");
-    assert!(!r.run(&["apply"]).status.success());
+    assert!(!r.run_with_hooks(&["apply"]).status.success());
 
     r.write("fixed", "");
-    ok(&r.run(&["apply"]));
+    ok(&r.run_with_hooks(&["apply"]));
     assert_eq!(read(&r.root_path("ran.txt")).lines().count(), 1);
 }
 
@@ -314,10 +328,10 @@ fn a_failing_hook_does_not_strand_a_backup() {
     r.write("a.conf", "repo\n");
     r.write_home("a.conf", "MINE\n");
 
-    let out = r.run(&["apply"]);
+    let out = r.run_with_hooks(&["apply"]);
     assert!(!out.status.success(), "the failing hook should fail apply");
 
-    ok(&r.run(&["rollback"]));
+    ok(&r.run_with_hooks(&["rollback"]));
     assert_eq!(
         std::fs::read_to_string(r.home_path("a.conf")).unwrap(),
         "MINE\n"
@@ -1019,9 +1033,9 @@ fn apply_does_not_claim_nothing_happened_after_running_a_hook() {
     let r = Repo::new("hook-ran");
     r.manifest("[link]\ncommon = [\"a.conf\"]\n\n[hooks.always]\nrun = \"true\"\n");
     r.write("a.conf", "repo\n");
-    ok(&r.run(&["apply"]));
+    ok(&r.run_with_hooks(&["apply"]));
 
-    let out = ok(&r.run(&["apply"]));
+    let out = ok(&r.run_with_hooks(&["apply"]));
     assert!(out.contains("hook"), "{out}");
     assert!(
         !out.contains("already up to date"),
@@ -1045,7 +1059,7 @@ fn a_hook_check_is_verified_and_heals_on_apply() {
     r.write("agent.plist", "v1\n");
 
     // まだ登録されていない
-    let out = r.run(&["verify"]);
+    let out = r.run_with_hooks(&["verify"]);
     assert!(!out.status.success());
     let text = both(&out);
     assert!(
@@ -1054,22 +1068,22 @@ fn a_hook_check_is_verified_and_heals_on_apply() {
     );
     assert!(text.contains("1 hook(s) whose check fails"), "{text}");
 
-    ok(&r.run(&["apply"]));
-    ok(&r.run(&["verify"]));
-    let out = ok(&r.run(&["apply"]));
+    ok(&r.run_with_hooks(&["apply"]));
+    ok(&r.run_with_hooks(&["verify"]));
+    let out = ok(&r.run_with_hooks(&["apply"]));
     assert!(out.contains("already up to date"), "{out}");
 
     // 誰かが登録を外した。監視対象は変わっていない
     std::fs::remove_file(r.root_path("registered")).unwrap();
-    let out = r.run(&["verify"]);
+    let out = r.run_with_hooks(&["verify"]);
     assert!(!out.status.success(), "{}", both(&out));
-    let out = ok(&r.run(&["apply", "--dry-run"]));
+    let out = ok(&r.run_with_hooks(&["apply", "--dry-run"]));
     assert!(out.contains("agents  (its check failed)"), "{out}");
     assert!(!r.root_path("registered").exists());
-    let out = ok(&r.run(&["apply"]));
+    let out = ok(&r.run_with_hooks(&["apply"]));
     assert!(out.contains("agents  (its check failed)"), "{out}");
     assert!(r.root_path("registered").exists());
-    ok(&r.run(&["verify"]));
+    ok(&r.run_with_hooks(&["verify"]));
 }
 
 /// 走らせても check が成り立たなければ apply を落とす。
@@ -1082,10 +1096,146 @@ fn apply_fails_when_a_hook_does_not_make_its_check_pass() {
          check = \"test -f registered\"\n",
     );
     r.write("a.conf", "repo\n");
-    let out = r.run(&["apply"]);
+    let out = r.run_with_hooks(&["apply"]);
     assert!(!out.status.success());
     let text = both(&out);
     assert!(text.contains("ran, but its check still fails"), "{text}");
+}
+
+/// A hook acts on the real OS whatever `--home` says, so a trial run with
+/// `--home` lists hooks instead of running them.
+#[test]
+fn apply_with_home_does_not_run_hooks() {
+    let r = Repo::new("hooks-skipped-home");
+    let marker = r.home.parent().unwrap().join("marker");
+    r.manifest(&format!(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.reg]\nrun = \"echo ran > '{}'\"\n",
+        tp(&marker)
+    ));
+    r.write("a.conf", "repo\n");
+
+    let out = ok(&r.run(&["apply"]));
+    assert!(!marker.exists(), "the hook ran under --home:\n{out}");
+    assert!(out.contains("skipped") && out.contains("reg"), "{out}");
+    assert!(out.contains("--run-hooks"), "{out}");
+    // the links are still placed
+    assert!(r.home_path("a.conf").exists());
+
+    // the preview lists them too, and does not run anything either
+    let out = ok(&r.run(&["apply", "--dry-run"]));
+    assert!(!marker.exists(), "{out}");
+    assert!(out.contains("skipped") && out.contains("reg"), "{out}");
+}
+
+#[test]
+fn apply_with_home_and_run_hooks_runs_hooks() {
+    let r = Repo::new("hooks-run-home");
+    let marker = r.home.parent().unwrap().join("marker");
+    r.manifest(&format!(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.reg]\nrun = \"echo ran > '{}'\"\n",
+        tp(&marker)
+    ));
+    r.write("a.conf", "repo\n");
+
+    let out = ok(&r.run_with_hooks(&["apply"]));
+    assert!(marker.exists(), "{out}");
+    assert!(!out.contains("skipped"), "{out}");
+}
+
+/// Hooks that were skipped are not recorded as having run, so the real apply
+/// that follows still runs them (and, with a check, the check is not asked).
+#[test]
+fn skipped_hooks_are_not_recorded_as_run() {
+    let r = Repo::new("hooks-skipped-state");
+    let ran = r.home.parent().unwrap().join("ran");
+    let asked = r.home.parent().unwrap().join("asked");
+    r.manifest(&format!(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.reg]\nwhen-changed = [\"a.conf\"]\n\
+         run = \"echo ran >> '{}'\"\ncheck = \"echo asked >> '{}'; false\"\n",
+        tp(&ran),
+        tp(&asked)
+    ));
+    r.write("a.conf", "repo\n");
+
+    ok(&r.run(&["apply"]));
+    ok(&r.run(&["apply", "--dry-run"]));
+    assert!(!ran.exists());
+    assert!(!asked.exists(), "the check ran under --home");
+
+    // the hook's check keeps failing, so the real run fails; it did run
+    let out = r.run_with_hooks(&["apply"]);
+    assert!(!out.status.success());
+    assert_eq!(read(&ran).lines().count(), 1);
+    assert!(asked.exists());
+}
+
+#[test]
+fn skipped_hooks_leave_the_fingerprint_alone() {
+    let r = Repo::new("hooks-skipped-fingerprint");
+    let ran = r.home.parent().unwrap().join("ran");
+    r.manifest(&format!(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.reg]\nwhen-changed = [\"a.conf\"]\n\
+         run = \"echo ran >> '{}'\"\n",
+        tp(&ran)
+    ));
+    r.write("a.conf", "repo\n");
+
+    ok(&r.run(&["apply"]));
+    assert!(!ran.exists());
+    ok(&r.run_with_hooks(&["apply"]));
+    assert_eq!(read(&ran).lines().count(), 1);
+    // now it is recorded: nothing changed, so it does not run again
+    ok(&r.run_with_hooks(&["apply"]));
+    assert_eq!(read(&ran).lines().count(), 1);
+}
+
+/// `verify --home` neither runs a hook's check nor calls it a failure.
+#[test]
+fn verify_with_home_skips_hook_checks() {
+    let r = Repo::new("hooks-verify-home");
+    let asked = r.home.parent().unwrap().join("asked");
+    r.manifest(&format!(
+        "[link]\ncommon = [\"a.conf\"]\n\n[hooks.agents]\nrun = \"true\"\n\
+         check = \"echo asked >> '{}'; false\"\n",
+        tp(&asked)
+    ));
+    r.write("a.conf", "repo\n");
+    ok(&r.run(&["apply"]));
+
+    let out = ok(&r.run(&["verify"]));
+    assert!(!asked.exists(), "the check ran under --home:\n{out}");
+    assert!(out.contains("hook checks skipped"), "{out}");
+    assert!(!out.contains("check failed"), "{out}");
+
+    // with --run-hooks the check runs and, failing, fails verify
+    let out = r.run_with_hooks(&["verify"]);
+    assert!(asked.exists());
+    assert!(!out.status.success(), "{}", both(&out));
+}
+
+/// Without `--home`, hooks run as before, and `--run-hooks` changes nothing.
+#[test]
+fn hooks_run_without_home_and_run_hooks_is_then_a_no_op() {
+    for (name, flag) in [("hooks-no-home", false), ("hooks-no-home-flag", true)] {
+        let r = Repo::new(name);
+        let marker = r.home.parent().unwrap().join("marker");
+        r.manifest(&format!(
+            "[link]\ncommon = [\"a.conf\"]\n\n[hooks.reg]\nrun = \"echo ran > '{}'\"\n",
+            tp(&marker)
+        ));
+        r.write("a.conf", "repo\n");
+        let mut cmd = Command::new(bin());
+        cmd.arg("--root")
+            .arg(&r.root)
+            .env("HOME", &r.home)
+            .env("USERPROFILE", &r.home);
+        if flag {
+            cmd.arg("--run-hooks");
+        }
+        let out = cmd.arg("apply").output().unwrap();
+        ok(&out);
+        assert!(marker.exists(), "{}", both(&out));
+    }
 }
 
 /// 締め出すモードは preview の時点で断る。
@@ -2269,7 +2419,7 @@ fn a_merge_runs_after_the_links_and_before_the_hooks() {
     ));
     r.write(".claude/CLAUDE.md", "top\n");
     r.write(".claude/settings.shared.json", SHARED);
-    ok(&r.run(&["apply"]));
+    ok(&r.run_with_hooks(&["apply"]));
     assert_eq!(json(&seen)["model"], "opus");
 }
 
@@ -2805,7 +2955,7 @@ run = "echo ran > here.txt"
         other_os(),
         this_os()
     ));
-    ok(&r.run(&["apply"]));
+    ok(&r.run_with_hooks(&["apply"]));
     assert!(r.root_path("here.txt").exists());
     assert!(!r.root_path("elsewhere.txt").exists());
     if cfg!(windows) {
