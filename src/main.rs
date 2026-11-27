@@ -129,7 +129,7 @@ fn run() -> Result<()> {
 
     let root = match &cli.root {
         Some(p) => p.clone(),
-        None => find_root().context("could not locate sennit.toml")?,
+        None => find_root()?,
     };
     let home = match &cli.home {
         Some(p) => p.clone(),
@@ -211,14 +211,26 @@ fn absolute(p: &Path) -> Result<PathBuf> {
 }
 
 /// カレントディレクトリから上方向に sennit.toml を探す。
+///
+/// 見つからないときは、どこから探したかと、どうすればよいかを言う。
+/// 「見つからない」だけでは、別の場所で打ったのか、名前を間違えたのかが分からない。
 fn find_root() -> Result<PathBuf> {
-    let mut dir = std::env::current_dir()?;
+    let start = std::env::current_dir()?;
+    find_root_from(&start)
+}
+
+fn find_root_from(start: &Path) -> Result<PathBuf> {
+    let mut dir = start.to_path_buf();
     loop {
         if dir.join("sennit.toml").is_file() {
             return Ok(dir);
         }
         if !dir.pop() {
-            bail!("sennit.toml not found in any parent directory");
+            bail!(
+                "no sennit.toml in {} or any directory above it; \
+                 run sennit inside your dotfiles repository, or pass --root",
+                start.display()
+            );
         }
     }
 }
@@ -1405,6 +1417,19 @@ mod tests {
         // 相対のままだと .zshrc -> ./.zshrc という自分を指すリンクになる
         let p = absolute(Path::new(".")).unwrap();
         assert!(p.is_absolute(), "{}", p.display());
+    }
+
+    /// 見つからないときは、どこから探したかと、--root を言う。
+    #[test]
+    fn a_missing_manifest_says_where_it_looked_and_what_to_do() {
+        let d = scratch("find-root-none");
+        let e = format!("{:#}", find_root_from(&d).unwrap_err());
+        assert!(e.contains(&d.display().to_string()), "{e}");
+        assert!(e.contains("--root"), "{e}");
+        // 上の階層にあれば、そこが root
+        std::fs::write(d.join("sennit.toml"), "").unwrap();
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        assert_eq!(find_root_from(&d.join("a/b")).unwrap(), d);
     }
 
     #[test]
