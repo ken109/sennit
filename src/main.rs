@@ -898,7 +898,7 @@ fn apply(
         // 環境変数は書かず、何を書くかだけ出す
         let env_set = userenv::apply(&manifest.env, dirs, true)?.previewed;
         // フックは実際には走らせず、何が走るかだけ出す
-        hooks::run_all(root, &manifest.hooks, &previous.hooks, true)?;
+        hooks::run_each(root, &manifest.hooks, &mut previous.hooks.clone(), true)?;
         // モードも実際には変えないが、掛けられるかは見ておく。ディレクトリを
         // 締め出すような宣言をここで断らないと、preview だけ通って apply が
         // 落ちる。README は diff と --dry-run から始めろと書いてある。
@@ -974,8 +974,23 @@ fn apply(
     // 監視対象の無いフックは毎回走るので指紋が動かない。指紋の比較だけでは
     // 「何かした」を取りこぼし、実際にコマンドを走らせた回に「最新です」と
     // 出てしまう。走った本数を見る。
-    let ran = hooks::run_all(root, &manifest.hooks, &previous.hooks, false)?;
-    let hooks = ran.fingerprints;
+    let mut hooks = previous.hooks.clone();
+    let ran = match hooks::run_each(root, &manifest.hooks, &mut hooks, false) {
+        Ok(n) => n,
+        Err(err) => {
+            // 走り終えたフックの指紋は記録する。記録しないと、次の apply が
+            // 落ちたフックより前のものまで走らせ直す
+            state::State {
+                links: current,
+                backups: kept,
+                hooks,
+                merged,
+                placed: placed_elsewhere,
+            }
+            .save(home)?;
+            return Err(err);
+        }
+    };
 
     // 記録は毎回書く。「変更なし」で書かずに抜けると、手で張られた環境や
     // state を消した環境で links が空のままになり、prune が永久に効かない。
@@ -991,7 +1006,7 @@ fn apply(
     if changes.is_empty()
         && pruned == 0
         && fixed == 0
-        && ran.count == 0
+        && ran == 0
         && merging == 0
         // --home で書かなかったものは would set と出してある。何も書いていない
         && env_set.written == 0

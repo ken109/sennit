@@ -136,18 +136,12 @@ fn collect(path: &Path, root: &Path, out: &mut Vec<(String, u64)>, depth: usize)
     out.push((key, stamp ^ (meta.len() << 20)));
 }
 
-/// run_all の結果。
+/// 走らせる必要のあるフックだけを走らせ、走らせた本数を返す。
+/// 新しい指紋は `next` に、走り終えたものから書き込む。
 ///
-/// 指紋だけでは「何かした」が分からない。監視対象の無いフックは毎回走るが
-/// 指紋は動かないので、実際にコマンドを走らせた回に apply が「最新です」と
-/// 出てしまっていた。走った本数も返す。
-#[derive(Debug)]
-pub struct Ran {
-    pub fingerprints: BTreeMap<String, String>,
-    pub count: usize,
-}
-
-/// 走らせる必要のあるフックだけを走らせ、新しい指紋を返す。
+/// 本数も返すのは、指紋だけでは「何かした」が分からないから。監視対象の無い
+/// フックは毎回走るが指紋は動かないので、実際にコマンドを走らせた回に apply が
+/// 「最新です」と出てしまっていた。
 ///
 /// 走らせるのは、監視対象が変わったとき、または `check` が崩れていると
 /// 答えたとき。`when-changed` も `check` も無いフックは毎回走る。
@@ -156,13 +150,17 @@ pub struct Ran {
 ///
 /// `check` は --dry-run でも走らせる。状態を訊くだけのコマンドとして宣言する
 /// もので、訊かなければ preview が本番と食い違う。
-pub fn run_all(
+///
+/// 途中のフックが落ちても、それより前に走り終えたものの指紋は `next` に
+/// 残る。apply はそれを記録してから失敗を返すので、次の apply が走り終えた
+/// フックまで走らせ直さない(外部へのインストールや登録のやり直しになる)。
+pub fn run_each(
     root: &Path,
     hooks: &BTreeMap<String, Hook>,
-    previous: &BTreeMap<String, String>,
+    next: &mut BTreeMap<String, String>,
     dry_run: bool,
-) -> Result<Ran> {
-    let mut next = previous.clone();
+) -> Result<usize> {
+    let previous = next.clone();
     let mut count = 0usize;
 
     for (name, hook) in hooks {
@@ -211,10 +209,7 @@ pub fn run_all(
         }
         next.insert(name.clone(), fp);
     }
-    Ok(Ran {
-        fingerprints: next,
-        count,
-    })
+    Ok(count)
 }
 
 /// このマシン向けのフックのうち、`check` が崩れていると答えたものを出す。
@@ -272,6 +267,27 @@ fn describe_failure(status: std::process::ExitStatus, run: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用: 前回の指紋から走らせ、新しい指紋と本数を返す。
+    #[derive(Debug)]
+    struct Ran {
+        fingerprints: BTreeMap<String, String>,
+        count: usize,
+    }
+
+    fn run_all(
+        root: &Path,
+        hooks: &BTreeMap<String, Hook>,
+        previous: &BTreeMap<String, String>,
+        dry_run: bool,
+    ) -> Result<Ran> {
+        let mut next = previous.clone();
+        let count = run_each(root, hooks, &mut next, dry_run)?;
+        Ok(Ran {
+            fingerprints: next,
+            count,
+        })
+    }
 
     /// 監視対象が無いフックは毎回走る。「常に実行」を表現する手段が要る。
     #[test]
@@ -385,6 +401,31 @@ mod tests {
             run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap_err()
         );
         assert!(e.contains("exit status 4 (its `run` has 2 lines)"), "{e}");
+    }
+
+    /// 途中のフックが落ちても、走り終えたものの指紋は残る。
+    #[test]
+    fn a_failing_hook_keeps_the_fingerprints_of_the_ones_before_it() {
+        let dir = std::env::temp_dir().join("sennit-hook-partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("watched"), "one").unwrap();
+        let hook = |run: &str| Hook {
+            when_changed: vec!["watched".to_string()],
+            run: run.to_string(),
+            cwd: None,
+            os: vec![],
+            shell: None,
+            check: None,
+        };
+        let mut hooks = BTreeMap::new();
+        hooks.insert("a-first".to_string(), hook("true"));
+        hooks.insert("b-boom".to_string(), hook("exit 1"));
+
+        let mut next = BTreeMap::new();
+        assert!(run_each(&dir, &hooks, &mut next, false).is_err());
+        assert!(next.contains_key("a-first"), "{next:?}");
+        assert!(!next.contains_key("b-boom"), "{next:?}");
     }
 
     /// ほかの OS 向けのフックは走らず、前回の指紋も消えない。

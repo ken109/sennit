@@ -450,8 +450,10 @@ run = "bat cache --build"
 
 `apply` runs a hook after linking, and only when what it watches has changed. A hook with
 no `when-changed` runs every time. `cwd` sets where it runs, relative to the repository
-root; the default is the root itself. A hook that exits non-zero fails the apply — the
-links are already placed and recorded by then, so `sennit rollback` still works.
+root; the default is the root itself. Hooks run in name order. A hook that exits non-zero
+fails the apply — the links are already placed and recorded by then, so `sennit rollback`
+still works, and so are the hooks that finished before it, which the next `apply` does not
+run again unless what they watch changes.
 
 Hooks run under `sh -c`. Windows has no `sh`; see [Windows](#windows) for which shell is
 used there.

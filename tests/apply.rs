@@ -289,6 +289,23 @@ fn rollback_does_not_destroy_an_older_backup() {
     assert!(first, "the older backup was destroyed");
 }
 
+/// 落ちたフックより前に走り終えたフックは、次の apply で走らせ直さない。
+#[test]
+fn a_hook_that_finished_before_a_failure_does_not_run_again() {
+    let r = Repo::new("hook-partial");
+    r.manifest(
+        "[link]\ncommon = [\"a.conf\"]\n\n\
+         [hooks.a-install]\nwhen-changed = [\"a.conf\"]\nrun = \"echo ran >> ran.txt\"\n\n\
+         [hooks.b-boom]\nwhen-changed = [\"a.conf\"]\nrun = \"test -f fixed\"\n",
+    );
+    r.write("a.conf", "repo\n");
+    assert!(!r.run(&["apply"]).status.success());
+
+    r.write("fixed", "");
+    ok(&r.run(&["apply"]));
+    assert_eq!(read(&r.root_path("ran.txt")).lines().count(), 1);
+}
+
 /// フックが落ちても、退避したファイルの在り処は失われない。
 #[test]
 fn a_failing_hook_does_not_strand_a_backup() {
