@@ -145,7 +145,10 @@ pub fn run_all(
             .status()
             .with_context(|| format!("hook `{name}`: failed to run"))?;
         if !status.success() {
-            bail!("hook `{name}` failed: {}", hook.run);
+            bail!(
+                "hook `{name}` failed {}",
+                describe_failure(status, &hook.run)
+            );
         }
         next.insert(name.clone(), fp);
     }
@@ -153,6 +156,25 @@ pub fn run_all(
         fingerprints: next,
         count,
     })
+}
+
+/// 失敗したフックの、終了コードと何を走らせたか。
+///
+/// 終了コードが無いと、スクリプトのどこで落ちたのか当たりが付かない。
+/// 複数行のスクリプト(PowerShell のフックに多い)を丸ごとエラーに載せると
+/// 読めなくなるので、1 行のときだけ載せる。
+fn describe_failure(status: std::process::ExitStatus, run: &str) -> String {
+    let how = match status.code() {
+        Some(code) => format!("with exit status {code}"),
+        // Unix でシグナルで止まった
+        None => format!("({status})"),
+    };
+    let run = run.trim();
+    if run.lines().count() == 1 {
+        format!("{how}: {run}")
+    } else {
+        format!("{how} (its `run` has {} lines)", run.lines().count())
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +264,31 @@ mod tests {
         );
         let e = run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap_err();
         assert!(format!("{e:#}").contains("boom"), "{e:#}");
+        // どれだけで終わったか、何を走らせたか
+        assert!(format!("{e:#}").contains("exit status 3: exit 3"), "{e:#}");
+    }
+
+    /// 複数行のスクリプトはエラーに丸ごと載せない。
+    #[test]
+    fn a_failing_multi_line_hook_names_its_exit_status_only() {
+        let dir = std::env::temp_dir().join("sennit-hook-fail-lines");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "boom".to_string(),
+            Hook {
+                when_changed: vec![],
+                run: "true\nexit 4\n".to_string(),
+                cwd: None,
+                os: vec![],
+                shell: None,
+            },
+        );
+        let e = format!(
+            "{:#}",
+            run_all(&dir, &hooks, &BTreeMap::new(), false).unwrap_err()
+        );
+        assert!(e.contains("exit status 4 (its `run` has 2 lines)"), "{e}");
     }
 
     /// ほかの OS 向けのフックは走らず、前回の指紋も消えない。
